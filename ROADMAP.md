@@ -113,8 +113,36 @@ taproot input needs the full prevout set. `verify-input` takes `:prevouts` (a
 vector of (amount . scriptPubKey) for every input) for this; `connect-block`
 supplies it from the UTXO set. Verified: keypath sighash + end-to-end schnorr
 for all 7 BIP341 keypath vectors (hashtypes 0/1/2/3 + ANYONECANPAY). Tapscript
-(script-path): commitment check + BIP342 interpreter implemented; needs vector
-verification + the rarer opcodes.
+(script-path): commitment check + the common CHECKSIG/CHECKSIGADD path verified
+(constructed key-path + tapscript spends diff 0 vs Core's libbitcoinkernel).
+
+### BIP342 tapscript — known gaps (surfaced by script_assets_test.json)
+Running Core's generated `script_assets_test.json` (~5.2k cases here) through
+the FFI harness (`core-diff:assets`) found **2176 divergences**, all from
+BIP342 surface `run-tapscript` doesn't implement yet (the constructed fuzzer +
+`script_tests.json` pass because they only hit the common CHECKSIG path). This
+corpus is INFORMATIONAL / non-gated in `core-diff:ci`. Breakdown:
+
+- **OP_SUCCESSx (~700: `opsuccess/*`)** — in tapscript, opcodes 80/98/126-129/
+  131-134/137-138/141-142/149-153/187-254 make the script succeed immediately
+  (unless DISCOURAGE). We delegate them to the base interpreter and reject.
+- **Unknown tapleaf versions (756: `unkver/*`)** — `verify-tapscript` always
+  executes the leaf script; BIP341 says an unknown leaf version (≠ 0xc0) is
+  anyone-can-spend (don't execute), unless DISCOURAGE_UPGRADABLE_TAPROOT_VERSION.
+- **Tapscript sigops budget (`tapscript/sigopsratio_*`)** — not implemented at
+  all. BIP342: a per-input budget of 50 + total witness weight; each executed
+  CHECKSIG/CHECKSIGADD that verifies a non-empty sig costs 50.
+- **CODESEPARATOR in tapscript (`sighash/codesep*`)** — `run-tapscript` doesn't
+  track the last-executed codeseparator position fed into the tapscript sighash
+  (`codesep-pos` is always 0xffffffff).
+- **Tapscript siglen rules (`siglen/*_neg`)** — BIP342 signature-length /
+  empty-sig validation for CHECKSIG vs CHECKSIGADD (we accept some Core rejects).
+- **`legacy/pk-wrongkey`, `legacy/pkh-sighashflip`** — legacy (non-taproot)
+  success cases; likely the asset-splice harness rather than the interpreter —
+  needs a closer look (our legacy conformance is 100% on script_tests.json).
+
+Implementing these is the next correctness push; `run-tapscript` is the single
+function to extend (plus a sigops-budget counter threaded through it).
 
 ### Big remaining infra: disk-backed UTXO + full IBD
 The in-memory UTXO set won't hold the tip (~180M coins). To validate to the tip

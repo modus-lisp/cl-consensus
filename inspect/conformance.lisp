@@ -10,22 +10,25 @@
 ;;;;   FALSE-POSITIVE         — we ACCEPT what Core REJECTS (unenforced rule: gap)
 ;;;;   FALSE-NEGATIVE         — we REJECT what Core ACCEPTS (interpreter bug)
 ;;;;
-;;;; Compile the vectors first:  python3 /tmp/parse_scripts.py  ->  script_tests_hex.json
+;;;; Reads Core's raw script_tests.json directly — the assembly mini-language is
+;;;; compiled to bytes in Lisp by btc-vectors (inspect/vectors.lisp), no external
+;;;; tooling:
 ;;;;
-;;;;   sbcl --load shared/bitcoind/inspect/conformance.lisp \
-;;;;        --eval '(btc-conf:run "/tmp/script_tests_hex.json")'
+;;;;   sbcl --load inspect/conformance.lisp \
+;;;;        --eval '(btc-conf:run "inspect/vectors/script_tests.json")'
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
   (pushnew (uiop:pathname-parent-directory-pathname (uiop:pathname-directory-pathname (or *load-truename* *compile-file-truename*)))
            asdf:*central-registry* :test #'equal)
   (ql:quickload '(:com.inuoe.jzon) :silent t)
-  (asdf:load-system "cl-consensus"))
+  (asdf:load-system "cl-consensus")
+  (load (merge-pathnames "vectors.lisp" (or *load-truename* *compile-file-truename*))))
 
 (defpackage #:btc-conf
   (:use #:cl)
   (:local-nicknames (#:w #:cl-consensus.wire) (#:tx #:cl-consensus.tx)
-                    (#:s #:cl-consensus.script) (#:jzon #:com.inuoe.jzon))
+                    (#:s #:cl-consensus.script) (#:bv #:btc-vectors))
   (:export #:run #:ci))
 
 (in-package #:btc-conf)
@@ -77,7 +80,7 @@
     (when witness (setf (tx:tx-witnesses txn) (list witness)))
     (tx:finalize-tx txn)))
 
-(defun ci (&optional (path "/tmp/script_tests_hex.json") (min-agree 0.99) (max-fn 1))
+(defun ci (&optional (path "inspect/vectors/script_tests.json") (min-agree 0.99) (max-fn 1))
   "Run conformance and exit nonzero if agreement < MIN-AGREE or false-negatives
    exceed MAX-FN (a regression).  For scripting."
   (multiple-value-bind (agree fn) (run path)
@@ -86,20 +89,15 @@
               (if ok "PASS" "FAIL") (* 100 agree) fn (* 100 min-agree) max-fn)
       (sb-ext:exit :code (if ok 0 1)))))
 
-(defun run (&optional (path "/tmp/script_tests_hex.json"))
-  (let ((cases (with-open-file (f path) (jzon:parse f)))
+(defun run (&optional (path "inspect/vectors/script_tests.json"))
+  (let ((cases (bv:load-script-tests path))
         (agree-ok 0) (agree-fail 0) (fp 0) (fn 0)
         (fp-flags (make-hash-table :test 'equal))
         (fp-ex (make-hash-table :test 'equal))
         (fn-examples '()))
     (loop for c across cases do
-      (let* ((sig (w:hex->bytes (aref c 0)))
-             (pk (w:hex->bytes (aref c 1)))
-             (flags (aref c 2))
-             (expected (aref c 3))
-             (wit (map 'list #'w:hex->bytes (aref c 4)))
-             (amount (truncate (aref c 5)))
-             (core-ok (string= expected "OK"))
+      (destructuring-bind (sig pk flags expected wit amount) c
+       (let* ((core-ok (string= expected "OK"))
              (credit (build-credit pk amount))
              (spend (build-spend credit sig wit amount))
              (prevouts (vector (cons amount pk)))
@@ -116,11 +114,11 @@
            (incf fp)
            (incf (gethash expected fp-flags 0))   ; expected = Core's error code
            (when (< (length (gethash expected fp-ex)) 3)
-             (push (list (aref c 0) (aref c 1) flags) (gethash expected fp-ex))))
+             (push (list (w:bytes->hex sig) (w:bytes->hex pk) flags) (gethash expected fp-ex))))
           (t                                 ; we reject, Core accepts -> bug
            (incf fn)
            (when (< (length fn-examples) 12)
-             (push (list (aref c 0) (aref c 1) flags expected) fn-examples))))))
+             (push (list (w:bytes->hex sig) (w:bytes->hex pk) flags expected) fn-examples)))))))
     (let ((total (+ agree-ok agree-fail fp fn)))
       (format t "~&==== script_tests.json conformance (~d cases) ====~%" total)
       (format t "  agree OK    : ~d~%" agree-ok)

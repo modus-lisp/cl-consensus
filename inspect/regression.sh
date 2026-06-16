@@ -6,7 +6,9 @@
 #
 #   inspect/regression.sh
 #
-# 1. Fetches Core's script_tests.json (cached) and compiles it to hex.
+# 1. Fetches Core's script_tests.json (cached).  The assembly mini-language is
+#    compiled to bytes in Lisp by btc-vectors (inspect/vectors.lisp) — no
+#    external tooling.
 # 2. Runs the static conformance harness (vs Core's vectors) — fails if
 #    agreement drops below the threshold or false-negatives appear.
 # 3. Runs the stable live block sweep (block 900000 self-contained spends) —
@@ -27,14 +29,12 @@ if [ ! -s "$VDIR/script_tests.json" ]; then
   curl -sL https://raw.githubusercontent.com/bitcoin/bitcoin/master/src/test/data/script_tests.json \
        -o "$VDIR/script_tests.json" || { echo "fetch failed"; exit 2; }
 fi
-python3 inspect/compile-vectors.py \
-        "$VDIR/script_tests.json" "$VDIR/script_tests_hex.json" || exit 2
 
 echo "[regression] (1/2) static conformance vs Core vectors ..."
 # max-fn 0: a false-negative means we'd reject a script Core accepts (could
 # reject a valid block) — never tolerated.
 $SBCL --load inspect/conformance.lisp \
-      --eval "(btc-conf:ci \"$VDIR/script_tests_hex.json\" $MIN_AGREE 0)" 2>&1 \
+      --eval "(btc-conf:ci \"$VDIR/script_tests.json\" $MIN_AGREE 0)" 2>&1 \
   | grep -E "AGREE total|FALSE-|CONFORMANCE:"
 conf=${PIPESTATUS[0]}
 
