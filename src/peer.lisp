@@ -1,0 +1,217 @@
+;;;; shared/bitcoind/peer.lisp
+;;;;
+;;;; Phase 1 — a single P2P peer connection: TCP, the version/verack handshake,
+;;;; ping/pong keepalive, and a message read loop that dispatches to handlers.
+;;;;
+;;;; A PEER owns one socket and one reader thread.  Higher layers register
+;;;; handlers on message commands ("headers", "block", "inv", ...) and send
+;;;; requests via SEND.  The handshake is synchronous; everything after is the
+;;;; async read loop.
+
+
+(defpackage #:cl-consensus.peer
+  (:use #:cl)
+  (:nicknames #:btc-peer)
+  (:local-nicknames (#:w #:cl-consensus.wire) (#:bt #:bordeaux-threads))
+  (:export
+   #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
+   #:peer-services #:peer-alive-p #:peer-connected-at
+   #:connect-peer #:disconnect #:send #:on #:peer-log
+   #:*default-user-agent* #:*protocol-version*))
+
+(in-package #:cl-consensus.peer)
+
+(defparameter *protocol-version* 70016)
+(defparameter *default-user-agent* "/battle-btc:0.1/")
+
+(defstruct peer
+  host port socket stream
+  (lock (bt:make-lock "peer-send"))
+  thread
+  (handlers (make-hash-table :test 'equal))   ; command string -> function (peer payload-bytes)
+  (alive t)
+  ;; peer-reported handshake info
+  version services subver height
+  (connected-at 0)
+  (verbose nil))
+
+(defun peer-addr (p) (format nil "~a:~d" (peer-host p) (peer-port p)))
+(defun peer-alive-p (p) (peer-alive p))
+
+(defun peer-log (p fmt &rest args)
+  (when (peer-verbose p)
+    (format t "~&[peer ~a] ~a~%" (peer-addr p) (apply #'format nil fmt args))
+    (force-output)))
+
+;;; ----------------------------------------------------------------------------
+;;; Low-level socket I/O
+;;; ----------------------------------------------------------------------------
+
+(defun read-fully (stream n)
+  "Read exactly N bytes or signal end-of-file."
+  (let ((buf (make-array n :element-type '(unsigned-byte 8)))
+        (got 0))
+    (loop while (< got n) do
+      (let ((r (read-sequence buf stream :start got :end n)))
+        (when (= r got) (error 'end-of-file :stream stream))
+        (setf got r)))
+    buf))
+
+(defun read-message (p)
+  "Read one framed message off the peer socket.  Returns (values command-string
+   payload-bytes), or NIL on clean EOF.  Verifies the magic and checksum."
+  (let ((stream (peer-stream p)))
+    (let* ((hdr (handler-case (read-fully stream 24)
+                  (end-of-file () (return-from read-message nil))))
+           (r (w:make-reader hdr))
+           (magic (w:r-u32 r)))
+      (unless (= magic (w:net-magic w:*network*))
+        (error "bad magic ~x from ~a" magic (peer-addr p)))
+      (let* ((cmd-bytes (w:r-bytes r 12))
+             (command (string-right-trim '(#\Nul)
+                                         (map 'string #'code-char cmd-bytes)))
+             (len (w:r-u32 r))
+             (checksum (w:r-bytes r 4))
+             (payload (if (plusp len) (read-fully stream len)
+                          (make-array 0 :element-type '(unsigned-byte 8)))))
+        (unless (equalp checksum (w:checksum payload))
+          (error "bad checksum on ~a message from ~a" command (peer-addr p)))
+        (values command payload)))))
+
+(defun send (p command payload)
+  "Frame and send a message.  PAYLOAD is a byte vector (often a writer's bytes)."
+  (let ((bytes (w:encode-message command payload)))
+    (bt:with-lock-held ((peer-lock p))
+      (write-sequence bytes (peer-stream p))
+      (force-output (peer-stream p)))
+    (peer-log p "-> ~a (~d bytes)" command (length payload))
+    p))
+
+;;; ----------------------------------------------------------------------------
+;;; version message
+;;; ----------------------------------------------------------------------------
+
+(defun build-version-payload (&key (services (logior w:+services-witness+))
+                                   (start-height 0)
+                                   (user-agent *default-user-agent*)
+                                   (peer-ip #(0 0 0 0)) (peer-port 0))
+  (let ((wr (w:make-writer)))
+    (w:w-i32 wr *protocol-version*)
+    (w:w-u64 wr services)
+    (w:w-i64 wr (- (get-universal-time) 2208988800)) ; CL epoch 1900 -> unix epoch
+    ;; addr_recv (the peer), no time field in version
+    (w:w-netaddr wr services peer-ip peer-port)
+    ;; addr_from (us) — zeros are fine
+    (w:w-netaddr wr services #(0 0 0 0) 0)
+    (w:w-u64 wr (logand (get-internal-real-time) #xffffffffffffffff)) ; nonce
+    (w:w-varstr wr user-agent)
+    (w:w-i32 wr start-height)
+    (w:w-bool wr nil)              ; relay=false: don't flood us with mempool txs yet
+    (w:writer-bytes wr)))
+
+(defun parse-version-payload (payload)
+  "Pull the fields we care about out of a peer's version message."
+  (let ((r (w:make-reader payload)))
+    (let ((version (w:r-i32 r))
+          (services (w:r-u64 r)))
+      (w:r-i64 r)                  ; timestamp
+      ;; addr_recv: services(8) ip(16) port(2)
+      (w:r-bytes r 26)
+      ;; addr_from
+      (w:r-bytes r 26)
+      (w:r-u64 r)                  ; nonce
+      (let ((subver (w:r-varstr r))
+            (height (w:r-i32 r)))
+        (values version services subver height)))))
+
+;;; ----------------------------------------------------------------------------
+;;; handler registry + read loop
+;;; ----------------------------------------------------------------------------
+
+(defun on (p command fn)
+  "Register FN (peer payload-bytes) as the handler for COMMAND."
+  (setf (gethash command (peer-handlers p)) fn)
+  p)
+
+(defun dispatch (p command payload)
+  (let ((fn (gethash command (peer-handlers p))))
+    (when fn
+      (handler-case (funcall fn p payload)
+        (serious-condition (c)
+          (format t "~&[peer ~a] handler ~a error: ~a~%" (peer-addr p) command c)
+          (force-output))))))
+
+(defun handle-builtin (p command payload)
+  "Protocol housekeeping common to every node: pings and sendheaders/feefilter
+   noise.  Returns T if fully handled here."
+  (cond
+    ((string= command "ping")
+     (send p "pong" payload) t)          ; echo the nonce
+    ((member command '("alert" "feefilter" "sendheaders" "sendcmpct"
+                       "addr" "addrv2" "getheaders" "wtxidrelay")
+             :test #'string=)
+     t)                                   ; ignore for now
+    (t nil)))
+
+(defun read-loop (p)
+  (handler-case
+      (loop while (peer-alive p) do
+        (multiple-value-bind (command payload) (read-message p)
+          (unless command (return))      ; clean EOF
+          (peer-log p "<- ~a (~d bytes)" command (length payload))
+          (unless (handle-builtin p command payload)
+            (dispatch p command payload))))
+    (serious-condition (c)
+      (when (peer-alive p)
+        (format t "~&[peer ~a] read loop ended: ~a~%" (peer-addr p) c)
+        (force-output))))
+  (setf (peer-alive p) nil))
+
+;;; ----------------------------------------------------------------------------
+;;; connect + handshake
+;;; ----------------------------------------------------------------------------
+
+(defun connect-peer (host &key (port (w:net-port w:*network*))
+                               (start-height 0) (verbose nil)
+                               (timeout 15))
+  "Open a TCP connection to HOST:PORT and complete the version/verack handshake.
+   Returns a live PEER with its read loop running, or signals on failure."
+  (let* ((sock (usocket:socket-connect host port
+                                        :element-type '(unsigned-byte 8)
+                                        :timeout timeout))
+         (p (make-peer :host host :port port :socket sock
+                       :stream (usocket:socket-stream sock)
+                       :verbose verbose
+                       :connected-at (get-universal-time))))
+    ;; --- handshake (synchronous) ---
+    (send p "version" (build-version-payload :start-height start-height))
+    (let ((got-version nil) (got-verack nil))
+      (loop until (and got-version got-verack) do
+        (multiple-value-bind (command payload) (read-message p)
+          (unless command (error "peer ~a closed during handshake" (peer-addr p)))
+          (peer-log p "<- ~a (~d bytes)" command (length payload))
+          (cond
+            ((string= command "version")
+             (multiple-value-bind (v s sv h) (parse-version-payload payload)
+               (setf (peer-version p) v (peer-services p) s
+                     (peer-subver p) sv (peer-height p) h)
+               (setf got-version t)
+               ;; modern protocol: ack, and accept wtxid relay / sendaddrv2 noise
+               (send p "verack" #())))
+            ((string= command "verack") (setf got-verack t))
+            ((string= command "wtxidrelay") nil)
+            ((string= command "sendaddrv2") nil)
+            (t nil)))))
+    ;; --- go async ---
+    (setf (peer-thread p)
+          (bt:make-thread (lambda () (read-loop p))
+                          :name (format nil "btc-peer ~a" (peer-addr p))))
+    p))
+
+(defun disconnect (p)
+  (setf (peer-alive p) nil)
+  (ignore-errors (usocket:socket-close (peer-socket p)))
+  (when (and (peer-thread p) (bt:thread-alive-p (peer-thread p))
+             (not (eq (peer-thread p) (bt:current-thread))))
+    (ignore-errors (bt:join-thread (peer-thread p))))
+  p)
