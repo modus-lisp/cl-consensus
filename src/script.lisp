@@ -274,16 +274,22 @@
   "Verify an ECDSA signature element under the active *FLAGS*.  Encoding
    violations (SIG_DER/HASHTYPE/PUBKEYTYPE/HIGH_S/WITNESS_PUBKEYTYPE) HARD-FAIL
    the script; a cryptographically-invalid-but-well-formed sig just returns NIL."
-  (when (zerop (length sig)) (return-from ecdsa-check nil))
-  (when (and (or (flag? :dersig) (flag? :low-s) (flag? :strictenc))
-             (not (valid-der-sig-p sig)))
-    (serr "SIG_DER"))
+  ;; Core checks signature encoding then pubkey encoding BEFORE the actual
+  ;; verification — and the pubkey/witness-pubkey checks happen even for an
+  ;; EMPTY signature (CheckPubKeyEncoding runs regardless).  Sig-encoding checks
+  ;; (DER / hashtype) only apply to a non-empty sig.
+  (when (plusp (length sig))
+    (when (and (or (flag? :dersig) (flag? :low-s) (flag? :strictenc))
+               (not (valid-der-sig-p sig)))
+      (serr "SIG_DER"))
+    (when (flag? :strictenc)
+      (unless (valid-hashtype-p (aref sig (1- (length sig)))) (serr "SIG_HASHTYPE"))))
   (when (flag? :strictenc)
-    (unless (valid-hashtype-p (aref sig (1- (length sig)))) (serr "SIG_HASHTYPE"))
     (unless (valid-pubkey-encoding-p pubkey-bytes) (serr "PUBKEYTYPE")))
   (when (and (flag? :witness-pubkeytype) (ctx-segwit-version ctx)
              (not (compressed-pubkey-p pubkey-bytes)))
     (serr "WITNESS_PUBKEYTYPE"))
+  (when (zerop (length sig)) (return-from ecdsa-check nil))
   (let ((rs (handler-case (parse-der-sig (subseq sig 0 (1- (length sig)))) (error () nil))))
     (when (and rs (flag? :low-s) (> (cdr rs) (floor ec:*secp256k1-n* 2))) (serr "SIG_HIGH_S"))
     (if (null rs) nil
@@ -620,25 +626,24 @@
                (psh (bool->bytes ok)))))
         ((or (= op +op-checkmultisig+) (= op +op-checkmultisigverify+))
          (check-multisig popn popnum push* need ctx scriptcode op))
-        ;; absolute timelock (BIP65).  When the flag is off it's a NOP (subject
-        ;; to DISCOURAGE_UPGRADABLE_NOPS); on, it enforces the locktime.  VERIFY
-        ;; semantics: inspects the top item, does not pop it.
+        ;; absolute timelock (BIP65).  When the flag is off it's a plain NOP2 —
+        ;; NOT subject to DISCOURAGE_UPGRADABLE_NOPS (Core excludes CLTV/CSV from
+        ;; that; only NOP1/NOP4-NOP10 are discouraged).  VERIFY semantics: inspect
+        ;; the top item, don't pop it.
         ((= op +op-checklocktimeverify+)
-         (if (flag? :cltv)
-             (progn (req 1)
-                    (let ((lt (bytes->num (car (s)) 5 (flag? :minimaldata))))
-                      (when (< lt 0) (serr "NEGATIVE_LOCKTIME"))
-                      (unless (check-locktime ctx lt) (serr "UNSATISFIED_LOCKTIME"))))
-             (when (flag? :discourage-nops) (serr "DISCOURAGE_UPGRADABLE_NOPS"))))
-        ;; relative timelock (BIP112)
+         (when (flag? :cltv)
+           (req 1)
+           (let ((lt (bytes->num (car (s)) 5 (flag? :minimaldata))))
+             (when (< lt 0) (serr "NEGATIVE_LOCKTIME"))
+             (unless (check-locktime ctx lt) (serr "UNSATISFIED_LOCKTIME")))))
+        ;; relative timelock (BIP112) — likewise a plain NOP3 when the flag is off
         ((= op +op-checksequenceverify+)
-         (if (flag? :csv)
-             (progn (req 1)
-                    (let ((sq (bytes->num (car (s)) 5 (flag? :minimaldata))))
-                      (when (< sq 0) (serr "NEGATIVE_LOCKTIME"))
-                      (when (zerop (logand sq +seq-disable+))   ; disable bit -> skip check
-                        (unless (check-sequence ctx sq) (serr "UNSATISFIED_LOCKTIME")))))
-             (when (flag? :discourage-nops) (serr "DISCOURAGE_UPGRADABLE_NOPS"))))
+         (when (flag? :csv)
+           (req 1)
+           (let ((sq (bytes->num (car (s)) 5 (flag? :minimaldata))))
+             (when (< sq 0) (serr "NEGATIVE_LOCKTIME"))
+             (when (zerop (logand sq +seq-disable+))   ; disable bit -> skip check
+               (unless (check-sequence ctx sq) (serr "UNSATISFIED_LOCKTIME"))))))
         ;; disabled opcodes
         ((member op (list +op-cat+ +op-substr+ +op-left+ +op-right+ +op-invert+
                           +op-and+ +op-or+ +op-xor+ +op-2mul+ +op-2div+ +op-mul+

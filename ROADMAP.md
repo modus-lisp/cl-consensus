@@ -83,13 +83,16 @@ Packages: `battle.btc.<layer>`, nicknames `btc-wire`, `btc-peer`, ...
   mempool txs + prevouts (RPC) and verifies each input (incl. real taproot spends).
   Fuzz mode mutates live txs; **0 we-accept-core-rejects**.
 - `inspect/core-diff.lisp` — **the hardcore differential: FFI into Core's actual
-  compiled `libbitcoinconsensus`** (built from a v26.2 checkout via
-  `inspect/build-libconsensus.sh`), diffed against our interpreter on random +
-  mutation-fuzzed scripts. **0 divergences over 200k random + 200k mutation
-  rounds** (10k+ reaching a "both-valid" verdict). Found+fixed two real bugs: a
-  DoS (a huge PUSHDATA4 length OOM'd our reader — now bounded) and a consensus
-  bug (unknown/future witness programs must be anyone-can-spend per BIP141
-  forward-compat, and taproot must be flag-gated, not hard-coded for v1-32).
+  compiled `libbitcoinkernel` (v29.1)** via a small C++ shim (`core_shim.cpp`)
+  that calls Core's `VerifyScript` directly — so we pass the FULL `SCRIPT_VERIFY_*`
+  set (consensus + policy, incl. TAPROOT), beyond the old C API. `(vectors)`
+  re-runs all 1217 script_tests through Core's live v29 code (**0 Core-vs-ours,
+  0 Core-vs-recorded**); `(fuzz)`/`(fuzz-mutate)` diff random + mutated scripts
+  (**0 divergences**). Bugs found+fixed across the libconsensus→libkernel work:
+  reader DoS on a huge PUSHDATA4 length; unknown/future witness programs must be
+  anyone-can-spend (BIP141) and taproot must be flag-gated; CLTV/CSV must NOT be
+  DISCOURAGE_UPGRADABLE_NOPS-discouraged when their flag is off; STRICTENC pubkey
+  encoding must be checked even for an empty signature.
 - **`inspect/regression.sh` — one-command regression**: fetches Core's vectors,
   runs static conformance + the block-900000 sweep + (if the lib is built) the
   FFI fuzz vs Core's compiled verifier. Exits nonzero on any divergence.

@@ -65,15 +65,19 @@ inspect/regression.sh        # conformance vs vectors + confirmed-block sweep + 
 ```
 
 For the **hardcore** gate — diffing against Core's *actual compiled code* — build
-`libbitcoinconsensus` once and fuzz against it:
+`libbitcoinkernel` (v29.1) + the C shim once, then fuzz against it:
 
 ```sh
-inspect/build-libconsensus.sh                       # checks out bitcoin v26.2, builds the lib
+inspect/build-libkernel.sh                          # checks out v29.1, builds libbitcoinkernel + core_shim.so
 sbcl --load inspect/core-diff.lisp \
-     --eval '(in-package :core-diff)' --eval '(fuzz-mutate 200000)'
+     --eval '(in-package :core-diff)' \
+     --eval '(vectors)' --eval '(fuzz-mutate 200000)'
 ```
 
-This FFIs into Core's real `interpreter.cpp` and runs random + mutated scripts
+`core_shim.cpp` calls Core's `VerifyScript` directly, so we pass the FULL
+`SCRIPT_VERIFY_*` flag set (consensus + policy, incl. TAPROOT) — `(vectors)`
+re-runs all of Core's `script_tests` through its live v29 code, and the fuzzers run
+random + mutated scripts
 through both Core and us, flagging any divergence with a reproducer. (0 so far.)
 
 The live tools (`oracle.lisp`, `difftest.lisp`) expect a reachable Bitcoin Core
