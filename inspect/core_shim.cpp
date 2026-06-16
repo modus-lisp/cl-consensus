@@ -20,6 +20,39 @@
 #include <cstddef>
 #include <cstdint>
 
+// Verify input `input_index` of a tx given ALL spent outputs (needed for taproot,
+// whose sighash commits to every prevout).  `spents` is a concatenation of
+// serialized CTxOut (value || varint-len || scriptPubKey), one per input.
+extern "C" int core_verify_tx(
+    const unsigned char* txto, std::size_t txto_len,
+    const unsigned char* spents, std::size_t spents_len,
+    unsigned int input_index, unsigned int flags)
+{
+    try {
+        DataStream ss{std::span<const unsigned char>{txto, txto_len}};
+        CMutableTransaction mtx;
+        ss >> TX_WITH_WITNESS(mtx);
+        const CTransaction tx{mtx};
+
+        std::vector<CTxOut> spent;
+        DataStream ps{std::span<const unsigned char>{spents, spents_len}};
+        while (!ps.empty()) { CTxOut o; ps >> o; spent.push_back(o); }
+        if (input_index >= tx.vin.size() || input_index >= spent.size()) return -1;
+
+        PrecomputedTransactionData txdata;
+        txdata.Init(tx, std::vector<CTxOut>(spent), /*force=*/true);
+        const CTxOut& utxo = spent[input_index];
+        TransactionSignatureChecker checker(&tx, input_index, utxo.nValue, txdata,
+                                            MissingDataBehavior::FAIL);
+        ScriptError err;
+        bool ok = VerifyScript(tx.vin[input_index].scriptSig, utxo.scriptPubKey,
+                               &tx.vin[input_index].scriptWitness, flags, checker, &err);
+        return ok ? 1 : 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 extern "C" int core_verify_script(
     const unsigned char* spk, std::size_t spk_len,
     std::int64_t amount,

@@ -25,8 +25,10 @@
 (defpackage #:core-diff
   (:use #:cl)
   (:local-nicknames (#:w #:cl-consensus.wire) (#:tx #:cl-consensus.tx)
-                    (#:s #:cl-consensus.script) (#:jzon #:com.inuoe.jzon))
-  (:export #:core-verify #:diff-one #:vectors #:fuzz #:fuzz-mutate #:load-corpus #:ci #:*lib-path*))
+                    (#:s #:cl-consensus.script) (#:jzon #:com.inuoe.jzon)
+                    (#:ec #:cl-consensus.crypto.secp256k1) (#:sch #:cl-consensus.crypto.schnorr))
+  (:export #:core-verify #:diff-one #:vectors #:fuzz #:fuzz-mutate #:load-corpus #:ci
+           #:taproot-fuzz #:assets #:*lib-path*))
 
 (in-package #:core-diff)
 
@@ -38,6 +40,11 @@
   (amount :int64)
   (tx-to :pointer) (tx-to-len :unsigned-long)
   (n-in :uint) (flags :uint))
+
+(cffi:defcfun ("core_verify_tx" %core-verify-tx) :int
+  (tx-to :pointer) (tx-to-len :unsigned-long)
+  (spents :pointer) (spents-len :unsigned-long)
+  (input-index :uint) (flags :uint))
 
 ;;; our flag keyword -> Core SCRIPT_VERIFY_* bit (v29 src/script/interpreter.h)
 (defparameter *core-flag-bits*
@@ -246,10 +253,216 @@
     (fz-report fz "mutation fuzz" rounds)))
 
 (defun ci (&optional (rounds 50000))
-  "Full corpus cross-check + random + mutation fuzz vs Core's compiled code."
+  "Corpus cross-check + random/mutation/taproot fuzz vs Core's compiled code.
+   Also runs Core's generated script_assets_test.json if present."
   (let ((d 0))
     (incf d (vectors))
     (incf d (fuzz rounds))
     (incf d (fuzz-mutate rounds))
+    (incf d (taproot-fuzz 1500))                 ; pure-Lisp schnorr is slow; keep modest
+    (when (probe-file "/mnt/lisp/script_assets_test.json")
+      (incf d (assets)))
     (format t "~&CORE-DIFF: ~a (~d total divergences)~%" (if (zerop d) "PASS" "FAIL") d)
     (sb-ext:exit :code (if (zerop d) 0 1))))
+
+;;; ----------------------------------------------------------------------------
+;;; (3) Taproot witness fuzzing — construct REAL taproot spends (key-path and
+;;; tapscript), diff against Core's libbitcoinkernel via core_verify_tx, then
+;;; mutate the witness and check both still agree.  This exercises the segwit-v1
+;;; verification path (commitment, BIP341 sighash, schnorr) end to end.
+;;; ----------------------------------------------------------------------------
+
+(defun core-verify-tx (txto spents idx flags)
+  (multiple-value-bind (tp tpn) (bytes->foreign txto)
+    (multiple-value-bind (sp spn) (bytes->foreign spents)
+      (unwind-protect
+           (case (%core-verify-tx tp tpn sp spn idx (core-flags (valid-flags flags)))
+             (1 :valid) (0 :invalid) (t :err))
+        (cffi:foreign-free tp) (cffi:foreign-free sp)))))
+
+(defun serialize-txout (amount script)
+  (let ((wr (w:make-writer)))
+    (w:w-i64 wr amount) (w:w-varint wr (length script)) (w:w-bytes wr script)
+    (w:writer-bytes wr)))
+
+(defun random-priv () (1+ (random (1- ec:*secp256k1-n*))))
+(defun even-y-priv (d) (if (evenp (cdr (ec:secp-pubkey d))) d (- ec:*secp256k1-n* d)))
+(defun bvec (&rest xs) (coerce xs '(simple-array (unsigned-byte 8) (*))))
+
+(defun spend-tx-for (spk amount)
+  (tx:make-tx :version 2 :locktime 0 :segwit-p t
+    :inputs (list (tx:make-txin :prev-hash (w:hash256 (ironclad:ascii-string-to-byte-array "tp"))
+                   :prev-index 0 :script (bvec) :sequence #xffffffff))
+    :outputs (list (tx:make-txout :value (max 0 (- amount 1000)) :script (bvec #x6a)))))
+
+(defun build-keypath ()
+  "Build a valid taproot key-path spend.  Returns (values spend spk amount)."
+  (let* ((d (even-y-priv (random-priv)))
+         (px (ec:int-to-bytes32 (car (ec:secp-pubkey d))))
+         (tweak (ec:bytes-to-int (sch:tagged-hash "TapTweak" px)))   ; key-path: no script tree
+         (out-priv (mod (+ d tweak) ec:*secp256k1-n*))
+         (qx (ec:int-to-bytes32 (car (ec:secp-pubkey out-priv))))
+         (spk (concatenate '(simple-array (unsigned-byte 8) (*)) (bvec #x51 #x20) qx))
+         (amount (1+ (random 1000000000)))
+         (spend (spend-tx-for spk amount))
+         (digest (s:taproot-sighash spend 0 (vector (cons amount spk)) 0 :ext-flag 0))
+         (sig (sch:schnorr-sign out-priv digest)))
+    (setf (tx:tx-witnesses spend) (list (list sig)))
+    (tx:finalize-tx spend)
+    (values spend spk amount)))
+
+(defun build-tapscript ()
+  "Build a valid taproot script-path spend: a single <pk> CHECKSIG tapleaf."
+  (let* ((leaf-priv (even-y-priv (random-priv)))
+         (leaf-px (ec:int-to-bytes32 (car (ec:secp-pubkey leaf-priv))))
+         (leaf-script (concatenate '(simple-array (unsigned-byte 8) (*)) (bvec #x20) leaf-px (bvec #xac)))
+         (leaf (s:tapleaf-hash #xc0 leaf-script))
+         (d (even-y-priv (random-priv)))
+         (px (ec:int-to-bytes32 (car (ec:secp-pubkey d))))
+         (tweak (ec:bytes-to-int (sch:tagged-hash "TapTweak"
+                  (concatenate '(simple-array (unsigned-byte 8) (*)) px leaf))))
+         (qpt (ec:secp-add-points (ec:secp-pubkey d) (ec:secp-mul-point tweak (ec:secp-generator))))
+         (qx (ec:int-to-bytes32 (car qpt)))
+         (parity (logand (cdr qpt) 1))
+         (spk (concatenate '(simple-array (unsigned-byte 8) (*)) (bvec #x51 #x20) qx))
+         (amount (1+ (random 1000000000)))
+         (spend (spend-tx-for spk amount))
+         (digest (s:taproot-sighash spend 0 (vector (cons amount spk)) 0 :ext-flag 1 :tapleaf-hash leaf))
+         (sig (sch:schnorr-sign leaf-priv digest))
+         (control (concatenate '(simple-array (unsigned-byte 8) (*)) (bvec (logior #xc0 parity)) px)))
+    (setf (tx:tx-witnesses spend) (list (list sig leaf-script control)))
+    (tx:finalize-tx spend)
+    (values spend spk amount)))
+
+(defun diff-taproot (spend spk amount)
+  "Core (libbitcoinkernel) vs ours on a taproot spend.  Returns (values core ours)."
+  (let* ((flags '(:p2sh :witness :taproot :dersig :nulldummy :cltv :csv))
+         (txto (tx:serialize-tx spend :witness t))
+         (spents (serialize-txout amount spk))
+         (core (core-verify-tx txto spents 0 flags))
+         (ours (handler-case (if (s:verify-input spend 0 spk amount
+                                                 :flags flags :prevouts (vector (cons amount spk)))
+                                 :valid :invalid)
+                 (error () :invalid))))
+    (values (if (eq core :err) :invalid core) ours)))
+
+(defun mutate-witness (spend)
+  "Flip a random byte in a random witness item of input 0 (returns a copy-spend)."
+  (let* ((wit (mapcar #'copy-seq (first (tx:tx-witnesses spend))))
+         (item (nth (random (length wit)) wit)))
+    (when (plusp (length item))
+      (let ((j (random (length item)))) (setf (aref item j) (logxor (aref item j) #x01))))
+    (setf (tx:tx-witnesses spend) (list wit))
+    (tx:finalize-tx spend)
+    spend))
+
+(defun taproot-fuzz (&optional (rounds 4000))
+  "Construct valid key-path/tapscript spends + byte-mutated variants; diff each
+   against Core's libbitcoinkernel."
+  (setf *random-state* (make-random-state t))
+  (let ((fz (make-fz)) (kp-valid 0) (ts-valid 0))
+    (dotimes (i rounds)
+      (handler-case
+          (multiple-value-bind (spend spk amount)
+              (if (zerop (random 2)) (build-keypath) (build-tapscript))
+            ;; valid spend: expect both :valid
+            (multiple-value-bind (core ours) (diff-taproot spend spk amount)
+              (if (eq core ours)
+                  (progn (incf (fz-agree fz)) (when (eq core :valid) (incf (fz-valid fz))))
+                  (progn (incf (fz-diverge fz))
+                         (when (< (length (fz-examples fz)) 15)
+                           (push (list "valid" (w:bytes->hex spk) core ours) (fz-examples fz)))))
+              (when (eq core :valid)
+                (if (zerop (random 2)) (incf kp-valid) (incf ts-valid))))
+            ;; mutated witness: expect both :invalid
+            (let ((m (mutate-witness spend)))
+              (multiple-value-bind (core ours) (diff-taproot m spk amount)
+                (if (eq core ours) (incf (fz-agree fz))
+                    (progn (incf (fz-diverge fz))
+                           (when (< (length (fz-examples fz)) 15)
+                             (push (list "mutated" (w:bytes->hex spk) core ours) (fz-examples fz))))))))
+        (error () (incf (fz-errs fz))))
+      (when (and (plusp i) (zerop (mod i 1000)))
+        (format t "~&[taproot] ~d/~d agree ~d both-valid ~d diverge ~d~%"
+                i rounds (fz-agree fz) (fz-valid fz) (fz-diverge fz)) (force-output)))
+    (format t "~%==== taproot fuzz: ~d rounds (key-path + tapscript, +mutations) ====~%" rounds)
+    (format t "  agree ~d (constructed-valid accepted by both ~d)~%  DIVERGE ~d~%  harness-err ~d~%"
+            (fz-agree fz) (fz-valid fz) (fz-diverge fz) (fz-errs fz))
+    (dolist (e (reverse (fz-examples fz)))
+      (format t "    ~a spk=~a core=~a ours=~a~%" (first e) (second e) (third e) (fourth e)))
+    (fz-diverge fz)))
+
+;;; ----------------------------------------------------------------------------
+;;; (4) Core's generated script_assets_test.json — ~100k taproot/tapscript spend
+;;; cases produced by feature_taproot.py --dumptests (see inspect/dumptests.sh).
+;;; Each case: a full spending tx, all prevouts (serialized CTxOuts), the input
+;;; index, flags, and a success (and maybe failure) scriptSig+witness to splice in.
+;;; ----------------------------------------------------------------------------
+
+(defun deserialize-txout (hex)
+  "Serialized CTxOut hex -> (amount . scriptPubKey-bytes)."
+  (let* ((r (w:make-reader (w:hex->bytes hex)))
+         (amount (w:r-i64 r)) (len (w:r-varint r)))
+    (cons amount (w:r-bytes r len))))
+
+(defun asset-flags (flags-field)
+  "script_assets flags (a JSON array of names, or a comma string) -> our keywords."
+  (let ((names (if (stringp flags-field) (uiop:split-string flags-field :separator ",")
+                   (coerce flags-field 'list))))
+    (loop for nm in names for kw = (cdr (assoc (string-trim " " nm) *flag-map* :test #'string=))
+          when kw collect kw)))
+
+(defun run-asset (tx-hex prevout-hexes idx flags wit)
+  "WIT = (scriptSig-hex . list-of-witness-hex).  Returns (values core ours)."
+  (let* ((tx (tx:parse-tx (w:make-reader (w:hex->bytes tx-hex))))
+         (prevouts (map 'vector #'deserialize-txout prevout-hexes))
+         (spents (let ((wr (w:make-writer)))
+                   (loop for h across prevout-hexes do (w:w-bytes wr (w:hex->bytes h)))
+                   (w:writer-bytes wr)))
+         (our-flags (asset-flags flags)))
+    ;; splice the success/failure scriptSig + witness onto input IDX
+    (setf (tx:txin-script (nth idx (tx:tx-inputs tx))) (w:hex->bytes (car wit)))
+    (setf (tx:tx-segwit-p tx) t)
+    (let ((ws (loop for i below (length (tx:tx-inputs tx))
+                    collect (if (= i idx) (mapcar #'w:hex->bytes (cdr wit))
+                                (and (tx:tx-witnesses tx) (nth i (tx:tx-witnesses tx)))))))
+      (setf (tx:tx-witnesses tx) ws))
+    (tx:finalize-tx tx)
+    (let* ((txto (tx:serialize-tx tx :witness t))
+           (core (core-verify-tx txto spents idx our-flags))
+           (ours (handler-case
+                     (if (s:verify-input tx idx (cdr (aref prevouts idx)) (car (aref prevouts idx))
+                                         :flags our-flags :prevouts prevouts)
+                         :valid :invalid)
+                   (error () :invalid))))
+      (values (if (eq core :err) :invalid core) ours))))
+
+(defun assets (&optional (path "/mnt/lisp/script_assets_test.json") (limit most-positive-fixnum))
+  (let ((cases (with-open-file (f path) (jzon:parse f)))
+        (n 0) (cvo 0) (cve 0) (ex '()))
+    (loop for c across cases while (< n limit) do
+      (when (and (hash-table-p c) (gethash "tx" c))
+        (let ((txh (gethash "tx" c)) (pv (gethash "prevouts" c))
+              (idx (truncate (gethash "index" c))) (flags (gethash "flags" c)))
+          (dolist (kind '("success" "failure"))
+            (let ((wd (gethash kind c)))
+              (when wd
+                (incf n)
+                (let ((wit (cons (gethash "scriptSig" wd) (coerce (gethash "witness" wd) 'list)))
+                      (expected (if (string= kind "success") :valid :invalid)))
+                  (handler-case
+                      (multiple-value-bind (core ours) (run-asset txh pv idx flags wit)
+                        (unless (eq core ours)
+                          (incf cvo)
+                          (when (<= cvo 15)
+                            (push (list kind core ours (gethash "comment" c)) ex)))
+                        (unless (eq core expected) (incf cve)))
+                    (error () (incf cve))))
+                (when (zerop (mod n 20000))
+                  (format t "~&[assets] ~d  core-vs-ours ~d~%" n cvo) (force-output))))))))
+    (format t "~&==== script_assets_test.json through Core's libbitcoinkernel (~d cases) ====~%" n)
+    (format t "  Core vs ours      : ~d disagreements~%" cvo)
+    (format t "  Core vs expected  : ~d (success->valid / failure->invalid)~%" cve)
+    (dolist (e (reverse ex))
+      (format t "    ~a core=~a ours=~a  ~a~%" (first e) (second e) (third e) (fourth e)))
+    cvo))
