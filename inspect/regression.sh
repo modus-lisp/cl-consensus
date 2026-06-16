@@ -44,16 +44,17 @@ $SBCL --load inspect/block-sweep.lisp \
   | grep -E "self-contained sweep|REGRESSION:"
 sweep=${PIPESTATUS[0]}
 
-# (3/3) optional: fuzz against Core's *compiled* verifier (libbitcoinconsensus).
-LIB=/mnt/lisp/bitcoin-core/src/.libs/libbitcoinconsensus.so
+# (3/3) optional: diff against Core's *compiled* libbitcoinkernel (full flags +
+# all 1217 vectors through live v29 code + fuzz).
+LIB=/mnt/lisp/bitcoin-kernel/build/lib/core_shim.so
 if [ -e "$LIB" ]; then
-  echo "[regression] (3/3) FFI fuzz vs Core's compiled verifier ..."
+  echo "[regression] (3/3) FFI diff vs Core's compiled libbitcoinkernel ..."
   $SBCL --load inspect/core-diff.lisp \
         --eval "(core-diff:ci ${COREDIFF_ROUNDS:-50000})" 2>&1 \
-    | grep -E "core-diff (random|mutation)|DIVERGE|CORE-DIFF:"
+    | grep -E "Core vs|core-diff (random|mutation)|DIVERGE|CORE-DIFF:"
   cdiff=${PIPESTATUS[0]}
 else
-  echo "[regression] (3/3) skipped — libbitcoinconsensus not built (inspect/build-libconsensus.sh)"
+  echo "[regression] (3/3) skipped — libbitcoinkernel not built (inspect/build-libkernel.sh)"
   cdiff=0
 fi
 
