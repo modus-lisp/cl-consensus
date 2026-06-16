@@ -64,7 +64,8 @@
   (loop for i from 0 below (length (tx:tx-inputs txn))
         always (handler-case
                    (s:verify-input txn i (cdr (aref prevouts i)) (car (aref prevouts i))
-                                   :p2sh t :segwit t :prevouts prevouts)
+                                   :flags '(:p2sh :witness :taproot :dersig :nulldummy :cltv :csv)
+                                   :prevouts prevouts)
                  (error () nil))))
 
 (defun diff-mempool (&key (limit 80))

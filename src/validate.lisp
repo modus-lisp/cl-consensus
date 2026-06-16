@@ -72,6 +72,7 @@
     (when (>= height +cltv-height+) (push :cltv f))
     (when (>= height +csv-height+) (push :csv f))
     (when (>= height +segwit-height+) (push :witness f) (push :nulldummy f))
+    (when (>= height +taproot-height+) (push :taproot f))
     f))
 
 (defun block-subsidy (height)

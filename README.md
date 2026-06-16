@@ -61,8 +61,20 @@ sbcl --load bin/cl-consensus.lisp
 Differential regression against Bitcoin Core (after any change to the interpreter):
 
 ```sh
-inspect/regression.sh        # fetches Core's vectors, runs conformance + block sweep
+inspect/regression.sh        # conformance vs vectors + confirmed-block sweep + (if built) FFI fuzz
 ```
+
+For the **hardcore** gate — diffing against Core's *actual compiled code* — build
+`libbitcoinconsensus` once and fuzz against it:
+
+```sh
+inspect/build-libconsensus.sh                       # checks out bitcoin v26.2, builds the lib
+sbcl --load inspect/core-diff.lisp \
+     --eval '(in-package :core-diff)' --eval '(fuzz-mutate 200000)'
+```
+
+This FFIs into Core's real `interpreter.cpp` and runs random + mutated scripts
+through both Core and us, flagging any divergence with a reproducer. (0 so far.)
 
 The live tools (`oracle.lisp`, `difftest.lisp`) expect a reachable Bitcoin Core
 node for P2P (sync from) and JSON-RPC (ground-truth oracle); set the host/cookie

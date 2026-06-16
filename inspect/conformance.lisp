@@ -41,6 +41,7 @@
     ("CLEANSTACK" . :cleanstack) ("MINIMALIF" . :minimalif) ("NULLFAIL" . :nullfail)
     ("WITNESS_PUBKEYTYPE" . :witness-pubkeytype) ("TAPROOT" . :taproot)
     ("DISCOURAGE_UPGRADABLE_NOPS" . :discourage-nops)
+    ("DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" . :discourage-upgradable-witness)
     ("CHECKLOCKTIMEVERIFY" . :cltv) ("CHECKSEQUENCEVERIFY" . :csv)))
 
 (defun parse-flags (flags)

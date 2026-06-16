@@ -82,9 +82,17 @@ Packages: `battle.btc.<layer>`, nicknames `btc-wire`, `btc-peer`, ...
 - `inspect/difftest.lisp` — live differential vs the epyc node: pulls Core's
   mempool txs + prevouts (RPC) and verifies each input (incl. real taproot spends).
   Fuzz mode mutates live txs; **0 we-accept-core-rejects**.
+- `inspect/core-diff.lisp` — **the hardcore differential: FFI into Core's actual
+  compiled `libbitcoinconsensus`** (built from a v26.2 checkout via
+  `inspect/build-libconsensus.sh`), diffed against our interpreter on random +
+  mutation-fuzzed scripts. **0 divergences over 200k random + 200k mutation
+  rounds** (10k+ reaching a "both-valid" verdict). Found+fixed two real bugs: a
+  DoS (a huge PUSHDATA4 length OOM'd our reader — now bounded) and a consensus
+  bug (unknown/future witness programs must be anyone-can-spend per BIP141
+  forward-compat, and taproot must be flag-gated, not hard-coded for v1-32).
 - **`inspect/regression.sh` — one-command regression**: fetches Core's vectors,
-  compiles them (`compile-vectors.py`), runs static conformance + the stable
-  block-900000 sweep, and exits nonzero on any divergence. Run after every change.
+  runs static conformance + the block-900000 sweep + (if the lib is built) the
+  FFI fuzz vs Core's compiled verifier. Exits nonzero on any divergence.
 - Latent bug the block-sweep caught: `parse-pubkey` read secp256k1 constants that
   are set lazily by `secp-init` (only called inside `ecdsa-verify`, which runs
   *after* parse-pubkey) — so a verify before any prior ECDSA call silently failed.

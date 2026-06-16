@@ -733,12 +733,18 @@
          (setf (ctx-witness-script ctx) witness-script)
          (let ((result (eval-script witness-script stack ctx)))
            (and result (truthy (car result))))))
-      ((and (= version 1) (= (length program) 32))         ; taproot
+      ((= version 0)                                       ; v0 must be 20 or 32 bytes
+       (serr "WITNESS_PROGRAM_WRONG_LENGTH (v0 len ~d)" (length program)))
+      ((and (= version 1) (= (length program) 32) (flag? :taproot))   ; taproot
        (when (null witness) (serr "taproot empty witness"))
        (unless prevouts (serr "taproot verification requires all prevouts"))
        (verify-taproot program witness prevouts ctx))
-      ((>= version 2) t)                                    ; future witness versions: anyone-can-spend
-      (t (serr "unknown witness program (v~d len ~d)" version (length program))))))
+      ;; any other witness program — unknown version, or v1 without the taproot
+      ;; soft fork active — is anyone-can-spend (BIP141 forward-compatibility),
+      ;; unless policy DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM is set (not consensus).
+      (t (when (flag? :discourage-upgradable-witness)
+           (serr "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"))
+         t))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Sighash — BIP341 taproot (commits to ALL spent outputs; needs every prevout)

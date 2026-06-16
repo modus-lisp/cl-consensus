@@ -213,6 +213,10 @@
 (defun r-i64 (r) (unsigned->signed (r-le r 8) 64))
 
 (defun r-bytes (r n)
+  ;; Bound the read to what's actually left — a malformed length (e.g. a bogus
+  ;; PUSHDATA4 claiming gigabytes) must error, not try to allocate it (DoS).
+  (when (> n (reader-remaining r))
+    (error "read of ~d bytes exceeds ~d remaining" n (reader-remaining r)))
   (let ((out (make-array n :element-type '(unsigned-byte 8))))
     (dotimes (i n out)
       (setf (aref out i) (r-u8 r)))))
