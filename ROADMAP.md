@@ -162,10 +162,18 @@ pending: sqlite vs a custom on-disk KV.
 
 ## Notes / decisions
 
-- **IBD tractability.** Full script verification of the entire chain in pure Lisp
-  is very slow. Plan: support `assumevalid` (skip script checks below a known-good
-  block hash, still do everything else) and checkpoints, like Core, so the node
-  can actually reach the tip. Full-verify mode stays available for correctness runs.
+- **IBD tractability / crypto performance.** Signature verification dominates IBD
+  (measured: `inspect/bench.lisp`). The EC layer uses **Jacobian projective
+  coordinates** — one modular inverse per scalar mult instead of ~384 in affine —
+  giving ECDSA verify ~325/s and Schnorr ~305/s per core (a ~7.5× speedup over the
+  original affine code), validated bit-for-bit by the full Core differential.
+  Full-verify-everything is then ~89 days single-core / ~22 hours across this box's
+  116 cores. Two further levers remain: (1) `assumevalid` + checkpoints (skip script
+  checks below a known-good hash; already supported) — the practical path to tip;
+  (2) more per-core crypto speed — Strauss-Shamir joint `u1·G+u2·Q`, a precomputed
+  generator comb, fast Solinas reduction (pure-Lisp), and ultimately an optional FFI
+  to libsecp256k1 (~234k verify/s/core measured here) for a non-clean-room fast path.
+  Reference Core comparison and the full analysis: bench numbers in `bench.lisp`.
 - **Coin DB.** Start correctness-first (sqlite) for the UTXO set; the set is
   ~100M+ entries so writes during IBD will be the bottleneck — revisit with a
   custom on-disk structure once the rules are proven correct.

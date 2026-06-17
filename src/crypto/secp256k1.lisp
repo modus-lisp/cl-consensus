@@ -139,18 +139,82 @@
                  (y3 (secp-sub (secp-mul lam (secp-sub x1 x3)) y1)))
             (cons x3 y3))))))))
 
+;;; -----------------------------------------------------------------------
+;;; Jacobian projective coordinates for the scalar-multiplication hot path.
+;;;
+;;; In affine coordinates every point add/double needs a modular inverse, and a
+;;; scalar mult does ~384 of them — inversion is ~96% of verify time.  Jacobian
+;;; coordinates (x = X/Z², y = Y/Z³) defer all of that to ONE inverse at the very
+;;; end.  A Jacobian point is (X Y Z); the point at infinity is NIL.  Formulas:
+;;; "dbl-2009-l" (a=0 doubling) and "madd-2007-bl" (mixed Jacobian+affine add).
+;;; -----------------------------------------------------------------------
+
+(declaim (inline jac-double jac-add-affine))
+
+(defun jac-double (jp)
+  "Double a Jacobian point (a=0 curve).  NIL (infinity) doubles to NIL."
+  (when (null jp) (return-from jac-double nil))
+  (destructuring-bind (x y z) jp
+    (if (zerop y)
+        nil
+        (let* ((a (secp-sq x))
+               (b (secp-sq y))
+               (c (secp-sq b))
+               (d (secp-mul 2 (secp-sub (secp-sub (secp-sq (secp-add x b)) a) c)))
+               (e (secp-mul 3 a))
+               (f (secp-sq e))
+               (x3 (secp-sub f (secp-mul 2 d)))
+               (y3 (secp-sub (secp-mul e (secp-sub d x3)) (secp-mul 8 c)))
+               (z3 (secp-mul 2 (secp-mul y z))))
+          (list x3 y3 z3)))))
+
+(defun jac-add-affine (jp ax ay)
+  "Add the affine point (AX . AY) to the Jacobian point JP (mixed addition)."
+  (when (null jp) (return-from jac-add-affine (list ax ay 1)))
+  (destructuring-bind (x1 y1 z1) jp
+    (let* ((z1z1 (secp-sq z1))
+           (u2 (secp-mul ax z1z1))
+           (s2 (secp-mul ay (secp-mul z1 z1z1)))
+           (h (secp-sub u2 x1))
+           (rr (secp-sub s2 y1)))
+      (cond
+        ((zerop h) (if (zerop rr) (jac-double jp) nil))   ; same point → double; opposite → ∞
+        (t (let* ((hh (secp-sq h))
+                  (i (secp-mul 4 hh))
+                  (j (secp-mul h i))
+                  (r (secp-mul 2 rr))
+                  (v (secp-mul x1 i))
+                  (x3 (secp-sub (secp-sub (secp-sq r) j) (secp-mul 2 v)))
+                  (y3 (secp-sub (secp-mul r (secp-sub v x3)) (secp-mul 2 (secp-mul y1 j))))
+                  (z3 (secp-sub (secp-sub (secp-sq (secp-add z1 h)) z1z1) hh)))
+             (list x3 y3 z3)))))))
+
+(defun jac->affine (jp)
+  "Convert a Jacobian point back to affine — the single inverse per scalar mult."
+  (if (null jp)
+      *secp256k1-infinity*
+      (destructuring-bind (x y z) jp
+        (if (zerop z)
+            *secp256k1-infinity*
+            (let* ((zinv (secp-inv z))
+                   (zinv2 (secp-sq zinv)))
+              (cons (secp-mul x zinv2) (secp-mul y (secp-mul zinv2 zinv))))))))
+
 (defun secp-mul-point (k p)
-  "Scalar multiplication k*P via double-and-add."
+  "Scalar multiplication k*P.  MSB-first double-and-add in Jacobian coordinates
+   (base stays affine → mixed adds), with one inverse converting back at the end."
   (secp-init)
-  (let ((result *secp256k1-infinity*)
-        (temp p)
-        (n (mod k *secp256k1-n*)))
-    (loop while (> n 0) do
-      (when (oddp n)
-        (setf result (secp-add-points result temp)))
-      (setf temp (secp-double temp))
-      (setf n (ash n -1)))
-    result))
+  (if (secp-inf-p p)
+      *secp256k1-infinity*
+      (let ((n (mod k *secp256k1-n*)))
+        (if (zerop n)
+            *secp256k1-infinity*
+            (let ((ax (secp-x p)) (ay (secp-y p)) (r nil))
+              (loop for i fixnum from (1- (integer-length n)) downto 0 do
+                (setf r (jac-double r))
+                (when (logbitp i n)
+                  (setf r (jac-add-affine r ax ay))))
+              (jac->affine r))))))
 
 (defun secp-generator ()
   "Return generator point G."
