@@ -55,7 +55,10 @@
     (:minimaldata . #.(ash 1 6)) (:discourage-nops . #.(ash 1 7)) (:cleanstack . #.(ash 1 8))
     (:cltv . #.(ash 1 9)) (:csv . #.(ash 1 10)) (:witness . #.(ash 1 11))
     (:discourage-upgradable-witness . #.(ash 1 12)) (:minimalif . #.(ash 1 13))
-    (:nullfail . #.(ash 1 14)) (:witness-pubkeytype . #.(ash 1 15)) (:taproot . #.(ash 1 17))))
+    (:nullfail . #.(ash 1 14)) (:witness-pubkeytype . #.(ash 1 15)) (:taproot . #.(ash 1 17))
+    (:discourage-upgradable-taproot-version . #.(ash 1 18))
+    (:discourage-op-success . #.(ash 1 19))
+    (:discourage-upgradable-pubkeytype . #.(ash 1 20))))
 (defparameter *supported-flags* (mapcar #'car *core-flag-bits*))
 
 (defun core-flags (our-flags)
@@ -254,23 +257,19 @@
 
 (defun ci (&optional (rounds 50000))
   "Corpus cross-check + random/mutation/taproot fuzz vs Core's compiled code.
-   These are the GATED differentials (validated scope).  If the optional
-   script_assets_test.json is present it is run too, but its result is
-   INFORMATIONAL only — that corpus exercises BIP342 features cl-consensus
-   doesn't implement yet (OP_SUCCESS, unknown tapleaf versions, the tapscript
-   sigops budget, CODESEPARATOR/siglen-in-tapscript), so it would otherwise
-   fail the gate on known-missing functionality.  See ROADMAP.md."
+   If the optional script_assets_test.json is present (bring-your-own; Core's
+   Python framework generates it — see ROADMAP), its ~5.2k full taproot/tapscript
+   spend cases are GATED too: the BIP342 surface (OP_SUCCESS, unknown tapleaf
+   versions, sigops budget, CODESEPARATOR/siglen-in-tapscript) is now implemented
+   and diffs 0 vs Core."
   (let ((d 0))
     (incf d (vectors))
     (incf d (fuzz rounds))
     (incf d (fuzz-mutate rounds))
     (incf d (taproot-fuzz 1500))                 ; pure-Lisp schnorr is slow; keep modest
     (when (probe-file "/mnt/lisp/script_assets_test.json")
-      (let ((a (assets)))
-        (format t "~&NOTE: script_assets_test.json (optional, NOT gated): ~d divergences — ~
-                   known BIP342 gaps (OP_SUCCESS / unknown tapleaf versions / tapscript ~
-                   sigops budget / CODESEPARATOR+siglen in tapscript). See ROADMAP.md.~%" a)))
-    (format t "~&CORE-DIFF: ~a (~d gated divergences)~%" (if (zerop d) "PASS" "FAIL") d)
+      (incf d (assets)))
+    (format t "~&CORE-DIFF: ~a (~d divergences)~%" (if (zerop d) "PASS" "FAIL") d)
     (sb-ext:exit :code (if (zerop d) 0 1))))
 
 ;;; ----------------------------------------------------------------------------
@@ -434,13 +433,18 @@
          (our-flags (asset-flags flags)))
     ;; splice the success/failure scriptSig + witness onto input IDX
     (setf (tx:txin-script (nth idx (tx:tx-inputs tx))) (w:hex->bytes (car wit)))
-    (setf (tx:tx-segwit-p tx) t)
     (let ((ws (loop for i below (length (tx:tx-inputs tx))
                     collect (if (= i idx) (mapcar #'w:hex->bytes (cdr wit))
                                 (and (tx:tx-witnesses tx) (nth i (tx:tx-witnesses tx)))))))
-      (setf (tx:tx-witnesses tx) ws))
+      (setf (tx:tx-witnesses tx) ws)
+      ;; Serialize WITH a witness only if some input actually carries one.  Core's
+      ;; tx deserializer throws "Superfluous witness record" on a witness marker
+      ;; with HasWitness()==false — which happens when the tested input is legacy
+      ;; and no other input has witness data (multi-input legacy-among-taproot).
+      (setf (tx:tx-segwit-p tx)
+            (and (some (lambda (w) (some (lambda (item) (plusp (length item))) w)) ws) t)))
     (tx:finalize-tx tx)
-    (let* ((txto (tx:serialize-tx tx :witness t))
+    (let* ((txto (tx:serialize-tx tx :witness (tx:tx-segwit-p tx)))
            (core (core-verify-tx txto spents idx our-flags))
            (ours (handler-case
                      (if (s:verify-input tx idx (cdr (aref prevouts idx)) (car (aref prevouts idx))

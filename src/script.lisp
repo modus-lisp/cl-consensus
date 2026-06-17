@@ -65,6 +65,41 @@
   (and (integerp op) (or (member op +disabled-ops+) (= op 101) (= op 102))))
 
 ;;; ----------------------------------------------------------------------------
+;;; BIP342 tapscript constants + OP_SUCCESS (Core: script.cpp IsOpSuccess).
+;;; In a tapscript, an OP_SUCCESSx opcode anywhere in the (decodable-up-to-it)
+;;; script makes the spend succeed immediately — unless DISCOURAGE_OP_SUCCESS.
+;;; ----------------------------------------------------------------------------
+(defconstant +validation-weight-per-sigop+ 50)   ; Core VALIDATION_WEIGHT_PER_SIGOP_PASSED
+(defconstant +validation-weight-offset+ 50)       ; Core VALIDATION_WEIGHT_OFFSET
+(defconstant +taproot-leaf-mask+ #xfe)
+(defconstant +taproot-leaf-tapscript+ #xc0)
+(defconstant +annex-tag+ #x50)
+(defconstant +max-stack-size+ 1000)
+
+(defun op-success-p (op)
+  (and (integerp op)
+       (or (= op 80) (= op 98) (<= 126 op 129) (<= 131 op 134)
+           (<= 137 op 138) (<= 141 op 142) (<= 149 op 153) (<= 187 op 254))))
+
+(defun scan-op-success (script)
+  "BIP342 pre-scan (Core ExecuteWitnessScript): walk SCRIPT's opcodes the way
+   Core's GetOp does — NO element-size limit.  Returns :op-success if any
+   OP_SUCCESSx is reached, :bad-opcode if a push runs past the end before any
+   OP_SUCCESS, or NIL if it decodes cleanly with none present."
+  (let ((r (w:make-reader script)))
+    (loop until (w:reader-eof-p r) do
+      (let ((op (w:r-u8 r)))
+        (when (op-success-p op) (return-from scan-op-success :op-success))
+        (let ((n (cond ((<= 1 op 75) op)
+                       ((= op +op-pushdata1+) (if (>= (w:reader-remaining r) 1) (w:r-u8 r) (return-from scan-op-success :bad-opcode)))
+                       ((= op +op-pushdata2+) (if (>= (w:reader-remaining r) 2) (w:r-u16 r) (return-from scan-op-success :bad-opcode)))
+                       ((= op +op-pushdata4+) (if (>= (w:reader-remaining r) 4) (w:r-u32 r) (return-from scan-op-success :bad-opcode)))
+                       (t 0))))
+          (when (> n (w:reader-remaining r)) (return-from scan-op-success :bad-opcode))
+          (when (plusp n) (w:r-bytes r n)))))
+    nil))
+
+;;; ----------------------------------------------------------------------------
 ;;; Opcodes
 ;;; ----------------------------------------------------------------------------
 
@@ -430,7 +465,14 @@
 (defstruct ctx
   transaction in-index amount
   (segwit-version nil)          ; nil legacy, 0 segwit v0, 1 taproot
-  (witness-script nil))         ; the scriptCode used for BIP143
+  (witness-script nil)          ; the scriptCode used for BIP143
+  ;; BIP342 tapscript execution data (Core's ScriptExecutionData)
+  (tapscript-p nil)             ; T when executing a tapscript leaf (SigVersion::TAPSCRIPT)
+  (prevouts nil)                ; all-inputs (amount . spk) vector — for the schnorr sighash
+  (tapleaf-hash nil)            ; this leaf's TapLeaf hash
+  (annex nil)                   ; the annex bytes if present (committed to by the sighash)
+  (validation-weight 0)         ; remaining sigops budget (50 + serialized witness size)
+  (codesep-pos #xffffffff))     ; last-executed OP_CODESEPARATOR position
 
 (defun checker-sighash (ctx script-code hashtype)
   "Pick the right sighash scheme for the spend being verified."
@@ -476,10 +518,13 @@
   "Execute SCRIPT over STACK (a list, top = first).  Returns the resulting
    stack.  CTX carries the tx/amount for CHECKSIG.  Signals SCRIPT-ERROR on
    a consensus failure."
-  (when (> (length script) 10000) (serr "SCRIPT_SIZE"))
+  ;; tapscript has no 10000-byte script-size limit and no 201-opcode limit.
+  (unless (ctx-tapscript-p ctx)
+    (when (> (length script) 10000) (serr "SCRIPT_SIZE")))
   (let ((*opcount* 0)
         (ops (parse-script script))
         (exec '())                     ; IF/ELSE execution flags (true = executing)
+        (opcode-pos 0)                 ; Core's opcode_pos (for OP_CODESEPARATOR)
         (codeseparator-script script)) ; subscript after last CODESEPARATOR
     (declare (ignorable codeseparator-script))
     (labels ((executing-p () (every #'identity exec))
@@ -489,19 +534,21 @@
              (push* (x) (push x stack))
              (pop-cond ()                ; pop the IF/NOTIF condition (MINIMALIF)
                (let ((v (popn)))
-                 ;; MINIMALIF only applies in witness execution (segwit v0 /
-                 ;; tapscript), not in base or P2SH script evaluation.
-                 (when (and (flag? :minimalif) (ctx-segwit-version ctx))
+                 ;; tapscript enforces minimal IF/NOTIF args as a CONSENSUS rule;
+                 ;; under witness-v0 it's policy (SCRIPT_VERIFY_MINIMALIF); base
+                 ;; / P2SH never enforce it.
+                 (when (or (ctx-tapscript-p ctx)
+                           (and (flag? :minimalif) (eql (ctx-segwit-version ctx) 0)))
                    (unless (or (zerop (length v)) (and (= (length v) 1) (= (aref v 0) 1)))
                      (serr "MINIMALIF")))
                  (truthy v))))
       (dolist (op ops stack)
         (let ((is-push (and (consp op) (eq (car op) :push))))
-          ;; always-on (even in unexecuted branches): disabled opcodes fail, and
-          ;; the opcode-count limit applies.
+          ;; always-on (even in unexecuted branches): disabled opcodes fail.  The
+          ;; opcode-count limit applies to base / witness-v0 only (not tapscript).
           (unless is-push
             (when (disabled-op-p op) (serr "DISABLED_OPCODE ~d" op))
-            (when (> op +op-16+)
+            (when (and (not (ctx-tapscript-p ctx)) (> op +op-16+))
               (when (> (incf *opcount*) 201) (serr "OP_COUNT"))))
           ;; flow-control opcodes run even when not executing
           (cond
@@ -518,12 +565,16 @@
             ((not (executing-p)) nil)   ; skip everything else in a dead branch
             (is-push
              (push* (check-minimal-push (push-data op) (push-opcode op))))
+            ;; OP_CODESEPARATOR: record its position for the tapscript sighash
+            ((and (not is-push) (= op +op-codeseparator+))
+             (setf (ctx-codesep-pos ctx) opcode-pos))
             (t (run-op op #'popn #'popnum #'push* #'need ctx
                        (lambda () alt) (lambda (v) (setf alt v))
                        (lambda () stack) (lambda (v) (setf stack v))
                        codeseparator-script)))
           ;; stack-size limit applies after each step (main + alt)
-          (when (> (+ (length stack) (length alt)) 1000) (serr "STACK_SIZE"))))
+          (when (> (+ (length stack) (length alt)) +max-stack-size+) (serr "STACK_SIZE")))
+        (incf opcode-pos))             ; Core increments per GetOp, unconditionally
       (when exec (serr "UNBALANCED_CONDITIONAL"))   ; every IF needs an ENDIF
       stack)))
 
@@ -617,14 +668,26 @@
         ((or (= op +op-checksig+) (= op +op-checksigverify+))
          (req 2)
          (let* ((pubkey (pop!)) (sig (pop!))
-                (ok (ecdsa-check pubkey sig
-                                 (lambda (ht) (checker-sighash ctx scriptcode ht)) ctx)))
-           ;; NULLFAIL: a failing signature must be empty
-           (when (and (not ok) (flag? :nullfail) (plusp (length sig))) (serr "NULLFAIL"))
+                (ok (if (ctx-tapscript-p ctx)
+                        (eval-checksig-tapscript sig pubkey ctx)
+                        (let ((ok (ecdsa-check pubkey sig
+                                    (lambda (ht) (checker-sighash ctx scriptcode ht)) ctx)))
+                          ;; NULLFAIL: a failing ECDSA signature must be empty
+                          (when (and (not ok) (flag? :nullfail) (plusp (length sig)))
+                            (serr "NULLFAIL"))
+                          ok))))
            (if (= op +op-checksigverify+)
                (unless ok (serr "CHECKSIGVERIFY failed"))
                (psh (bool->bytes ok)))))
+        ;; CHECKSIGADD — tapscript only (BIP342): (sig num pubkey -- num+success)
+        ((= op +op-checksigadd+)
+         (unless (ctx-tapscript-p ctx) (serr "BAD_OPCODE (CHECKSIGADD outside tapscript)"))
+         (req 3)
+         (let* ((pubkey (pop!)) (n (popi)) (sig (pop!))
+                (ok (eval-checksig-tapscript sig pubkey ctx)))
+           (psh (num->bytes (+ n (if ok 1 0))))))
         ((or (= op +op-checkmultisig+) (= op +op-checkmultisigverify+))
+         (when (ctx-tapscript-p ctx) (serr "TAPSCRIPT_CHECKMULTISIG"))
          (check-multisig popn popnum push* need ctx scriptcode op))
         ;; absolute timelock (BIP65).  When the flag is off it's a plain NOP2 —
         ;; NOT subject to DISCOURAGE_UPGRADABLE_NOPS (Core excludes CLTV/CSV from
@@ -815,16 +878,48 @@
 
 (defun schnorr-check (xonly-pubkey sig prevouts ctx ext-flag tapleaf)
   "Verify a BIP340 schnorr signature element under taproot rules.  SIG is 64
-   bytes (SIGHASH_DEFAULT) or 65 (last byte explicit hashtype)."
+   bytes (SIGHASH_DEFAULT) or 65 (last byte explicit hashtype).  For tapscript
+   (EXT-FLAG 1) the sighash commits to the codeseparator position and the annex
+   (Core's SignatureHashSchnorr reads them from ScriptExecutionData)."
   (let ((len (length sig)))
     (when (or (< len 64) (> len 65)) (return-from schnorr-check nil))
     (let ((hashtype (if (= len 65) (aref sig 64) 0))
           (sig64 (subseq sig 0 64)))
       (when (and (= len 65) (= hashtype 0)) (return-from schnorr-check nil))
+      ;; BIP341: a schnorr sighash type must be 0x00..0x03 or 0x81..0x83 (Core's
+      ;; SignatureHashSchnorr returns false otherwise → SCHNORR_SIG_HASHTYPE).
+      (unless (or (<= hashtype #x03) (<= #x81 hashtype #x83))
+        (return-from schnorr-check nil))
       (let ((digest (taproot-sighash (ctx-transaction ctx) (ctx-in-index ctx)
                                      prevouts hashtype
-                                     :ext-flag ext-flag :tapleaf-hash tapleaf)))
+                                     :ext-flag ext-flag :tapleaf-hash tapleaf
+                                     :annex (ctx-annex ctx)
+                                     :codesep-pos (if (= ext-flag 1)
+                                                      (ctx-codesep-pos ctx)
+                                                      #xffffffff))))
         (sch:schnorr-verify xonly-pubkey digest sig64)))))
+
+(defun eval-checksig-tapscript (sig pubkey ctx)
+  "BIP342 CHECKSIG / CHECKSIGADD signature check (Core's EvalChecksigTapscript).
+   Returns the success flag (T iff the signature verified); signals SCRIPT-ERROR
+   on a script-aborting condition.  Consensus-critical ordering: the sigops
+   budget is charged for ANY non-empty sig (even an upgradable pubkey); an empty
+   sig fails the check without aborting; a non-empty sig that fails verification
+   aborts the whole script."
+  (let ((success (plusp (length sig))))
+    (when success
+      (decf (ctx-validation-weight ctx) +validation-weight-per-sigop+)
+      (when (< (ctx-validation-weight ctx) 0) (serr "TAPSCRIPT_VALIDATION_WEIGHT")))
+    (cond
+      ((zerop (length pubkey)) (serr "PUBKEYTYPE (empty tapscript pubkey)"))
+      ((= (length pubkey) 32)
+       (when (and success
+                  (not (schnorr-check pubkey sig (ctx-prevouts ctx) ctx 1 (ctx-tapleaf-hash ctx))))
+         (serr "SCHNORR_SIG (invalid tapscript signature)")))
+      (t                                ; upgradable pubkey type: no verification
+       (when (flag? :discourage-upgradable-pubkeytype)
+         (serr "DISCOURAGE_UPGRADABLE_PUBKEYTYPE"))))
+    success))
 
 (defun tapleaf-hash (leaf-version script)
   (sch:tagged-hash "TapLeaf"
@@ -833,43 +928,48 @@
 (defun push-varint (n)
   (let ((wr (w:make-writer))) (w:w-varint wr n) (w:writer-bytes wr)))
 
+(defun witness-serialize-size (witness)
+  "Core GetSerializeSize(witness.stack): compactsize(count) + per item
+   compactsize(len)+len.  Seeds the tapscript sigops budget."
+  (let ((wr (w:make-writer)))
+    (w:w-varint wr (length witness))
+    (dolist (item witness) (w:w-varint wr (length item)) (w:w-bytes wr item))
+    (length (w:writer-bytes wr))))
+
 (defun verify-taproot (program witness prevouts ctx)
   "Verify a segwit-v1 (taproot) spend.  PROGRAM is the 32-byte output key.
    PREVOUTS is the all-inputs (amount . script) vector.  Handles key-path and
    tapscript (script-path); annex (0x50 prefix) is stripped per BIP341."
-  (let ((stack (copy-list witness)))
+  (setf (ctx-prevouts ctx) prevouts)
+  (let ((stack (copy-list witness)) (annex nil))
     ;; strip annex if present (>=2 items and last starts with 0x50)
-    (let ((annex nil))
-      (when (and (>= (length stack) 2)
-                 (plusp (length (car (last stack))))
-                 (= (aref (car (last stack)) 0) #x50))
-        (setf annex (car (last stack)) stack (butlast stack)))
-      (cond
-        ;; key path: single element = signature
-        ((= (length stack) 1)
-         (let ((sig (first stack)))
-           (when annex
-             ;; recompute with annex flag — re-run sighash through schnorr-check path
-             (let* ((len (length sig))
-                    (hashtype (if (= len 65) (aref sig 64) 0))
-                    (digest (taproot-sighash (ctx-transaction ctx) (ctx-in-index ctx)
-                                             prevouts hashtype :annex annex)))
-               (return-from verify-taproot
-                 (sch:schnorr-verify program digest (subseq sig 0 64)))))
-           (schnorr-check program sig prevouts ctx 0 nil)))
-        ;; script path: [...inputs...] script control-block
-        ((>= (length stack) 2)
-         (let* ((control (car (last stack)))
-                (script (car (last (butlast stack))))
-                (inputs (butlast stack 2)))
-           (verify-tapscript program script control inputs prevouts ctx annex)))
-        (t nil)))))
+    (when (and (>= (length stack) 2)
+               (plusp (length (car (last stack))))
+               (= (aref (car (last stack)) 0) +annex-tag+))
+      (setf annex (car (last stack)) stack (butlast stack)))
+    (setf (ctx-annex ctx) annex)
+    (cond
+      ((null stack) (serr "WITNESS_PROGRAM_WITNESS_EMPTY"))
+      ;; key path: single element = signature
+      ((= (length stack) 1)
+       (schnorr-check program (first stack) prevouts ctx 0 nil))
+      ;; script path: [...inputs...] script control-block
+      (t
+       (let* ((control (car (last stack)))
+              (script (car (last (butlast stack))))
+              (inputs (butlast stack 2)))
+         (verify-tapscript program script control inputs prevouts ctx
+                           (witness-serialize-size witness)))))))
 
-(defun verify-tapscript (program script control inputs prevouts ctx annex)
-  "Verify the taproot commitment for a script-path spend, then run the tapscript."
-  (declare (ignore annex))
-  (when (< (length control) 33) (serr "taproot control block too short"))
-  (let* ((leaf-version (logand (aref control 0) #xfe))
+(defun verify-tapscript (program script control inputs prevouts ctx wit-size)
+  "Verify the taproot commitment for a script-path spend, then — for the known
+   tapscript leaf version 0xc0 — execute the leaf.  An UNKNOWN leaf version is
+   anyone-can-spend (BIP341): the commitment is still checked but the script is
+   NOT run, unless DISCOURAGE_UPGRADABLE_TAPROOT_VERSION is set."
+  (let ((clen (length control)))
+    (when (or (< clen 33) (> clen (+ 33 (* 128 32))) (/= 0 (mod (- clen 33) 32)))
+      (serr "TAPROOT_WRONG_CONTROL_SIZE")))
+  (let* ((leaf-version (logand (aref control 0) +taproot-leaf-mask+))
          (internal-key (subseq control 1 33))
          (leaf (tapleaf-hash leaf-version script))
          (k leaf)
@@ -881,11 +981,42 @@
                     (sch:tagged-hash "TapBranch" (bytes k e))
                     (sch:tagged-hash "TapBranch" (bytes e k))))))
     ;; tweak: Q = P + int(TapTweak(P||k))*G ; check x(Q)=program & parity
-    (let* ((tweak (sch:tagged-hash "TapTweak" (bytes internal-key k))))
+    (let ((tweak (sch:tagged-hash "TapTweak" (bytes internal-key k))))
       (unless (taproot-commit-ok internal-key tweak program (logand (aref control 0) 1))
-        (serr "taproot commitment mismatch")))
-    ;; run tapscript (BIP342): schnorr CHECKSIG, CHECKSIGADD, no CHECKMULTISIG
-    (run-tapscript script inputs prevouts ctx leaf)))
+        (serr "WITNESS_PROGRAM_MISMATCH (taproot commitment)")))
+    (cond
+      ((= leaf-version +taproot-leaf-tapscript+)
+       (execute-tapscript script inputs prevouts ctx leaf wit-size))
+      ;; unknown leaf version — anyone-can-spend unless discouraged
+      ((flag? :discourage-upgradable-taproot-version)
+       (serr "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"))
+      (t t))))
+
+(defun execute-tapscript (script inputs prevouts ctx leaf wit-size)
+  "Core's ExecuteWitnessScript for SigVersion::TAPSCRIPT: OP_SUCCESS pre-scan,
+   stack-size / element-size limits, then EVAL-SCRIPT under tapscript rules
+   (sigops budget, schnorr CHECKSIG/CHECKSIGADD, consensus MINIMALIF), then the
+   implicit cleanstack + non-false top requirement."
+  ;; OP_SUCCESSx overrides everything (including element-size limits): scan first.
+  (case (scan-op-success script)
+    (:op-success (if (flag? :discourage-op-success)
+                     (serr "DISCOURAGE_OP_SUCCESS")
+                     (return-from execute-tapscript t)))
+    (:bad-opcode (serr "BAD_OPCODE (undecodable tapscript)")))
+  ;; tapscript initial-stack limits
+  (when (> (length inputs) +max-stack-size+) (serr "STACK_SIZE"))
+  (dolist (e inputs) (when (> (length e) 520) (serr "PUSH_SIZE")))
+  ;; set up the tapscript ScriptExecutionData and run the shared interpreter
+  (setf (ctx-tapscript-p ctx) t
+        (ctx-tapleaf-hash ctx) leaf
+        (ctx-prevouts ctx) prevouts
+        (ctx-validation-weight ctx) (+ wit-size +validation-weight-offset+)
+        (ctx-codesep-pos ctx) #xffffffff)
+  (let ((result (eval-script script (reverse inputs) ctx)))
+    ;; witness scripts implicitly require cleanstack + a non-false top element
+    (cond ((/= (length result) 1) (serr "CLEANSTACK"))
+          ((not (truthy (car result))) (serr "EVAL_FALSE"))
+          (t t))))
 
 (defun lex<= (a b)
   (let ((n (min (length a) (length b))))
@@ -911,36 +1042,6 @@
          (y (expt-mod y2 (/ (1+ p) 4) p)))
     (when (oddp y) (setf y (- p y)))
     (cons x y)))
-
-(defun run-tapscript (script inputs prevouts ctx leaf)
-  "Execute a BIP342 tapscript.  CHECKSIG/CHECKSIGVERIFY use schnorr + the
-   tapscript sighash; CHECKSIGADD is supported; CHECKMULTISIG is disabled."
-  (let ((stack (reverse inputs)))
-    (labels ((schnorr-tap (pk sig)
-               (and (plusp (length pk))
-                    (schnorr-check pk sig prevouts ctx 1 leaf))))
-      ;; a focused interpreter pass for tapscript's signature opcodes; other
-      ;; opcodes reuse the base machine via EVAL-SCRIPT semantics.
-      (let ((ops (parse-script script)))
-        (dolist (op ops)
-          (cond
-            ((and (consp op) (eq (car op) :push)) (push (push-data op) stack))
-            ((= op +op-checksig+)
-             (let ((pk (pop stack)) (sig (pop stack)))
-               (push (bool->bytes (and (plusp (length sig)) (schnorr-tap pk sig))) stack)))
-            ((= op +op-checksigverify+)
-             (let ((pk (pop stack)) (sig (pop stack)))
-               (unless (and (plusp (length sig)) (schnorr-tap pk sig)) (serr "tapscript CHECKSIGVERIFY"))))
-            ((= op +op-checksigadd+)
-             (let ((pk (pop stack)) (nn (bytes->num (pop stack))) (sig (pop stack)))
-               (push (num->bytes (if (and (plusp (length sig)) (schnorr-tap pk sig)) (1+ nn) nn)) stack)))
-            ((= op +op-checkmultisig+) (serr "CHECKMULTISIG disabled in tapscript"))
-            ((= op +op-checkmultisigverify+) (serr "CHECKMULTISIGVERIFY disabled in tapscript"))
-            (t
-             ;; delegate the rest to a one-off base-script execution
-             (setf stack (eval-script (let ((wr (w:make-writer))) (w:w-u8 wr op) (w:writer-bytes wr))
-                                      stack ctx)))))
-        (and stack (truthy (car stack)))))))
 
 (defun push-only-p (script)
   "True iff SCRIPT contains only push opcodes (every opcode <= OP_16)."

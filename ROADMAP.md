@@ -116,33 +116,38 @@ for all 7 BIP341 keypath vectors (hashtypes 0/1/2/3 + ANYONECANPAY). Tapscript
 (script-path): commitment check + the common CHECKSIG/CHECKSIGADD path verified
 (constructed key-path + tapscript spends diff 0 vs Core's libbitcoinkernel).
 
-### BIP342 tapscript — known gaps (surfaced by script_assets_test.json)
-Running Core's generated `script_assets_test.json` (~5.2k cases here) through
-the FFI harness (`core-diff:assets`) found **2176 divergences**, all from
-BIP342 surface `run-tapscript` doesn't implement yet (the constructed fuzzer +
-`script_tests.json` pass because they only hit the common CHECKSIG path). This
-corpus is INFORMATIONAL / non-gated in `core-diff:ci`. Breakdown:
+### BIP342 tapscript — COMPLETE (0 divergence vs Core on script_assets)
+Core's generated `script_assets_test.json` (~5.2k full taproot/tapscript spend
+cases) now runs through the FFI harness (`core-diff:assets`) at **0 divergences**
+vs Core's compiled libbitcoinkernel — up from 2176. The fix replaced the old
+special-cased `run-tapscript` with a real `SigVersion::TAPSCRIPT` threaded
+through the shared `eval-script` (mirrors Core's interpreter.cpp). Implemented:
 
-- **OP_SUCCESSx (~700: `opsuccess/*`)** — in tapscript, opcodes 80/98/126-129/
-  131-134/137-138/141-142/149-153/187-254 make the script succeed immediately
-  (unless DISCOURAGE). We delegate them to the base interpreter and reject.
-- **Unknown tapleaf versions (756: `unkver/*`)** — `verify-tapscript` always
-  executes the leaf script; BIP341 says an unknown leaf version (≠ 0xc0) is
-  anyone-can-spend (don't execute), unless DISCOURAGE_UPGRADABLE_TAPROOT_VERSION.
-- **Tapscript sigops budget (`tapscript/sigopsratio_*`)** — not implemented at
-  all. BIP342: a per-input budget of 50 + total witness weight; each executed
-  CHECKSIG/CHECKSIGADD that verifies a non-empty sig costs 50.
-- **CODESEPARATOR in tapscript (`sighash/codesep*`)** — `run-tapscript` doesn't
-  track the last-executed codeseparator position fed into the tapscript sighash
-  (`codesep-pos` is always 0xffffffff).
-- **Tapscript siglen rules (`siglen/*_neg`)** — BIP342 signature-length /
-  empty-sig validation for CHECKSIG vs CHECKSIGADD (we accept some Core rejects).
-- **`legacy/pk-wrongkey`, `legacy/pkh-sighashflip`** — legacy (non-taproot)
-  success cases; likely the asset-splice harness rather than the interpreter —
-  needs a closer look (our legacy conformance is 100% on script_tests.json).
+- **OP_SUCCESSx** (`script.lisp` `scan-op-success` + `execute-tapscript`) — a
+  pre-scan (Core's GetOp semantics, no element-size limit) succeeds immediately
+  on opcodes 80/98/126-129/131-134/137-138/141-142/149-153/187-254 (unless
+  SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS); an undecodable push before any OP_SUCCESS
+  is BAD_OPCODE.
+- **Unknown tapleaf versions** (`verify-tapscript`) — the commitment is still
+  checked, but a leaf version ≠ 0xc0 is anyone-can-spend (script NOT executed),
+  unless DISCOURAGE_UPGRADABLE_TAPROOT_VERSION.
+- **Tapscript sigops budget** (`eval-checksig-tapscript`) — per-input budget of
+  50 + serialized witness size (`witness-serialize-size`); each non-empty-sig
+  CHECKSIG/CHECKSIGADD costs 50; underflow → TAPSCRIPT_VALIDATION_WEIGHT.
+- **Tapscript CHECKSIG/CHECKSIGADD semantics** — empty sig = soft fail (no abort);
+  non-empty invalid sig aborts the whole script; empty pubkey → PUBKEYTYPE;
+  upgradable (non-32-byte) pubkey succeeds without verifying (unless discouraged).
+- **CODESEPARATOR position** — `eval-script` tracks `opcode-pos`; OP_CODESEPARATOR
+  records it into the ctx for the tapscript sighash (`codesep-pos`).
+- **Unknown sighash type** (`schnorr-check`) — BIP341 rejects any schnorr hashtype
+  not in {0x00..0x03, 0x81..0x83}.
+- **Consensus MINIMALIF**, no opcount/script-size limits, CHECKMULTISIG disabled,
+  implicit cleanstack — all gated on the tapscript sigversion in `eval-script`.
 
-Implementing these is the next correctness push; `run-tapscript` is the single
-function to extend (plus a sigops-budget counter threaded through it).
+(The ~80 `legacy/pk-wrongkey` / `compat/nocsa` residue was a harness bug, not the
+interpreter: `run-asset` serialized a witness marker for an all-empty witness, so
+Core's deserializer threw "Superfluous witness record" → fixed to serialize a
+witness only when the tx actually has one.)
 
 ### Big remaining infra: disk-backed UTXO + full IBD
 The in-memory UTXO set won't hold the tip (~180M coins). To validate to the tip
