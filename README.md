@@ -29,6 +29,9 @@ Bitcoin Core's `script_tests.json` (1217/1217)**.
   CLTV/CSV, witness-commitment, height-gated soft-fork activation, resumable IBD.
 - **Node** — mempool acceptance, JSON-RPC daemon, control socket, live chain-follow.
 
+For the full inventory of how correctness is validated — every layer, every
+harness, every number — see **[VERIFICATIONS.md](VERIFICATIONS.md)**.
+
 ## Layout
 
 ```
@@ -41,8 +44,10 @@ inspect/
   conformance.lisp      run Core's script_tests.json through our interpreter
   block-sweep.lisp      stable regression: verify a confirmed block's in-block spends
   difftest.lisp         live differential vs a Core node's mempool (RPC oracle)
+  core-diff.lisp        differential vs Core's compiled libbitcoinkernel (FFI)
   oracle.lisp           ground-truth cross-check vs Core RPC
-  regression.sh         one-command: fetch vectors, run both gates, PASS/FAIL
+  regression.sh         one-command: fetch vectors, run the gates, PASS/FAIL
+VERIFICATIONS.md        the full correctness-validation inventory
 bin/cl-consensus.lisp   run the daemon
 ```
 
