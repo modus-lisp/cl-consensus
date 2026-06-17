@@ -26,7 +26,7 @@
            #:bytes-to-int #:int-to-bytes32
            ;; field & curve ops (re-exported for callers building on top)
            #:secp-mod #:secp-add #:secp-sub #:secp-mul #:secp-sq #:secp-neg
-           #:secp-inv #:secp-double #:secp-add-points #:secp-mul-point
+           #:secp-inv #:secp-double #:secp-add-points #:secp-mul-point #:secp-mul-2
            #:secp-on-curve-p #:secp-pubkey
            ;; ECDSA
            #:ecdsa-sign-raw #:ecdsa-verify
@@ -216,6 +216,32 @@
                   (setf r (jac-add-affine r ax ay))))
               (jac->affine r))))))
 
+(defun secp-mul-2 (k1 p1 k2 p2)
+  "Affine k1*P1 + k2*P2 via Shamir's trick: ONE shared chain of doublings serves
+   both scalars (Jacobian internal, single final inverse).  Halves the doubling
+   work vs two independent scalar mults — the ECDSA/Schnorr verify pattern
+   (u1*G + u2*Q).  Bases must be finite; falls back otherwise."
+  (secp-init)
+  (when (or (secp-inf-p p1) (secp-inf-p p2))
+    (return-from secp-mul-2
+      (secp-add-points (secp-mul-point k1 p1) (secp-mul-point k2 p2))))
+  (let* ((n1 (mod k1 *secp256k1-n*))
+         (n2 (mod k2 *secp256k1-n*))
+         (x1 (secp-x p1)) (y1 (secp-y p1))
+         (x2 (secp-x p2)) (y2 (secp-y p2))
+         (sum (secp-add-points p1 p2))          ; precomputed P1+P2 for both-bits-set
+         (sum-inf (secp-inf-p sum))
+         (sx (unless sum-inf (secp-x sum)))
+         (sy (unless sum-inf (secp-y sum)))
+         (r nil))
+    (loop for i fixnum from (1- (max (integer-length n1) (integer-length n2))) downto 0 do
+      (setf r (jac-double r))
+      (let ((b1 (logbitp i n1)) (b2 (logbitp i n2)))
+        (cond ((and b1 b2) (unless sum-inf (setf r (jac-add-affine r sx sy))))  ; +O is a no-op
+              (b1 (setf r (jac-add-affine r x1 y1)))
+              (b2 (setf r (jac-add-affine r x2 y2))))))
+    (jac->affine r)))
+
 (defun secp-generator ()
   "Return generator point G."
   (secp-init)
@@ -348,8 +374,6 @@
               (s-inv (secp-inv-mod s n))
               (u1 (mod (* z s-inv) n))
               (u2 (mod (* r s-inv) n))
-              (p1 (secp-mul-point u1 (secp-generator)))
-              (p2 (secp-mul-point u2 pubkey-pt))
-              (sum (secp-add-points p1 p2)))
+              (sum (secp-mul-2 u1 (secp-generator) u2 pubkey-pt)))   ; Shamir's trick
          (and (not (secp-inf-p sum))
               (= r (mod (secp-x sum) n))))))))

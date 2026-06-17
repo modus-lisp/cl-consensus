@@ -164,16 +164,17 @@ pending: sqlite vs a custom on-disk KV.
 
 - **IBD tractability / crypto performance.** Signature verification dominates IBD
   (measured: `inspect/bench.lisp`). The EC layer uses **Jacobian projective
-  coordinates** — one modular inverse per scalar mult instead of ~384 in affine —
-  giving ECDSA verify ~325/s and Schnorr ~305/s per core (a ~7.5× speedup over the
-  original affine code), validated bit-for-bit by the full Core differential.
-  Full-verify-everything is then ~89 days single-core / ~22 hours across this box's
-  116 cores. Two further levers remain: (1) `assumevalid` + checkpoints (skip script
-  checks below a known-good hash; already supported) — the practical path to tip;
-  (2) more per-core crypto speed — Strauss-Shamir joint `u1·G+u2·Q`, a precomputed
-  generator comb, fast Solinas reduction (pure-Lisp), and ultimately an optional FFI
-  to libsecp256k1 (~234k verify/s/core measured here) for a non-clean-room fast path.
-  Reference Core comparison and the full analysis: bench numbers in `bench.lisp`.
+  coordinates** (one modular inverse per scalar mult instead of ~384 in affine)
+  plus **Shamir's trick** for the verify pattern `u1·G + u2·Q` (one shared chain of
+  doublings for both scalars, `secp-mul-2`). Together: ECDSA verify ~505/s, Schnorr
+  ~466/s per core — an ~11.6× speedup over the original affine code, validated
+  bit-for-bit by the full Core differential. Full-verify-everything is then ~57 days
+  single-core / ~14 hours across this box's 116 cores. Further levers: (1) `assumevalid`
+  + checkpoints (skip script checks below a known-good hash; already supported) — the
+  practical path to tip; (2) more per-core crypto speed — a precomputed generator comb
+  for the fixed `u1·G`, wNAF on the variable base, fast Solinas reduction (all pure
+  Lisp), and ultimately an optional FFI to libsecp256k1 (~234k verify/s/core measured
+  here) for a non-clean-room fast path. Bench + Core comparison: `inspect/bench.lisp`.
 - **Coin DB.** Start correctness-first (sqlite) for the UTXO set; the set is
   ~100M+ entries so writes during IBD will be the bottleneck — revisit with a
   custom on-disk structure once the rules are proven correct.

@@ -59,9 +59,8 @@
                               (tagged-hash "BIP0340/challenge"
                                            (cat (subseq sig64 0 32) pubkey32 msg32)))
                              (n)))
-                     (sg (secp:secp-mul-point s (secp:secp-generator)))
-                     (ep (secp:secp-mul-point (mod (- (n) e) (n)) pt))
-                     (rr (secp:secp-add-points sg ep)))
+                     ;; R = s*G + (n-e)*P  via Shamir's trick (shared doublings)
+                     (rr (secp:secp-mul-2 s (secp:secp-generator) (mod (- (n) e) (n)) pt)))
                 (and (not (infp rr)) (evenp (pty rr)) (= (ptx rr) r)))))))
     (error () nil)))
 
