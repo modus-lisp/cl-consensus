@@ -353,7 +353,8 @@
    skipped.  Checkpoints (every SAVE-EVERY) drain to a fully-verified height
    first.  Returns the last verified height."
   (let ((vq (make-vqueue :maxq maxq :workers workers))
-        (sink nil) (height from) (t0 (get-internal-real-time)) (last (1- from)))
+        (sink nil) (height from) (t0 (get-internal-real-time)) (last (1- from))
+        (dl 0) (cn 0))                 ; cumulative download vs serial-pass time
     (setf sink (vq-sink vq))
     (flet ((fail-check ()
              (when (vqueue-failed vq)
@@ -366,19 +367,25 @@
             (fail-check)
             (let* ((hi (min to (+ height batch -1)))
                    (hashes (loop for h from height to hi collect (c:header-hash (c:header-at-height h))))
+                   (dl0 (get-internal-real-time))
                    (blocks (blk:get-blocks peer hashes)))
+              (incf dl (- (get-internal-real-time) dl0))
               (loop for b across blocks for h from height do
                 (unless b (cerr h "peer did not return block"))
-                (connect-block b h utxo
-                               :verify-scripts (>= h assumevalid-below)
-                               :check-sink sink)
+                (let ((cn0 (get-internal-real-time)))
+                  (connect-block b h utxo
+                                 :verify-scripts (>= h assumevalid-below)
+                                 :check-sink sink)
+                  (incf cn (- (get-internal-real-time) cn0)))
                 (setf last h)
                 (when (zerop (mod h progress-every))
                   (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
-                    (format t "~&[ibd] height ~d  verified ~d  utxos ~d  total ~,4f BTC  ~,0f blk/s~%"
+                    (format t "~&[ibd] height ~d  verified ~d  utxos ~d  total ~,4f BTC  ~,0f blk/s  [dl ~,1fs cn ~,1fs lag ~d]~%"
                             h (vqueue-verified vq) (u:utxo-count utxo)
                             (/ (u:utxo-set-total-value utxo) 1d8)
-                            (if (plusp secs) (/ (- h from -1) secs) 0))
+                            (if (plusp secs) (/ (- h from -1) secs) 0)
+                            (/ dl internal-time-units-per-second) (/ cn internal-time-units-per-second)
+                            (- h (vqueue-verified vq)))
                     (force-output)))
                 (when (and save-every (zerop (mod h save-every)))
                   (loop until (vq-drained-p vq h) do (sleep 0.02))   ; verify catches up
@@ -472,9 +479,13 @@
       (loop for out in (tx:tx-outputs txn)
             for vout from 0 do
         (unless (unspendable-p (tx:txout-script out))
-          ;; BIP30: must not overwrite an existing unspent coin
-          (when (and (u:utxo-get utxo (tx:tx-txid txn) vout)
-                     (not (member height *bip30-exceptions*)))
+          ;; BIP30: must not overwrite an existing unspent coin.  BIP34 (height
+          ;; in coinbase) makes duplicate txids impossible above its activation,
+          ;; so — like Core — skip the per-output lookup there (the two
+          ;; pre-BIP34 duplicate-coinbase blocks are the *-exceptions*).
+          (when (and (< height +bip34-height+)
+                     (not (member height *bip30-exceptions*))
+                     (u:utxo-get utxo (tx:tx-txid txn) vout))
             (cerr height "BIP30: duplicate unspent outpoint ~a:~d"
                   (w:hash->hex (tx:tx-txid txn)) vout))
           (u:utxo-add utxo (tx:tx-txid txn) vout

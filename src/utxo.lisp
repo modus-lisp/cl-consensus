@@ -29,16 +29,20 @@
   coinbase-p)    ; t if from a coinbase tx (for maturity rule)
 
 (defstruct (utxo-set (:constructor %make-utxo-set))
-  (map (make-hash-table :test 'equal :size 1024))
+  ;; EQUALP map keyed by (txid-bytes . index): compares the 32 txid bytes by
+  ;; content + the integer index.  (Was a per-op `format`ed hex STRING key — the
+  ;; format/hex-encode dominated connect-block at ~16us/op and bloated memory.)
+  (map (make-hash-table :test 'equalp :size 1024))
   (total-value 0))
 
 (defun make-utxo-set () (%make-utxo-set))
 
 (declaim (inline utxo-key))
 (defun utxo-key (txid-bytes index)
-  "Outpoint key: txid hex (display order) + ':' + index.  String keys keep the
-   set easy to inspect and dump; revisit for the disk backend."
-  (format nil "~a:~d" (w:hash->hex txid-bytes) index))
+  "Outpoint key: a cons of the txid bytes (compared by content under EQUALP) and
+   the index.  Reuses the caller's existing txid vector — no allocation beyond
+   the cons, no string formatting."
+  (cons txid-bytes index))
 
 (defun utxo-count (set) (hash-table-count (utxo-set-map set)))
 
@@ -69,9 +73,9 @@
 ;;; ----------------------------------------------------------------------------
 
 (defun coin-commitment (key coin)
-  (let ((wr (w:make-writer))
-        (kb (ironclad:ascii-string-to-byte-array key)))
-    (w:w-bytes wr kb)
+  (let ((wr (w:make-writer)))
+    (w:w-bytes wr (car key))            ; txid bytes
+    (w:w-u32 wr (cdr key))              ; index
     (w:w-i64 wr (coin-value coin))
     (w:w-u32 wr (coin-height coin))
     (w:w-bool wr (coin-coinbase-p coin))
@@ -104,8 +108,9 @@
     (maphash
      (lambda (key coin)
        (let ((wr (w:make-writer))
-             (kb (ironclad:ascii-string-to-byte-array key)))
+             (kb (car key)))            ; txid bytes; index stored separately
          (w:w-varint wr (length kb)) (w:w-bytes wr kb)
+         (w:w-u32 wr (cdr key))
          (w:w-i64 wr (coin-value coin))
          (w:w-u32 wr (coin-height coin))
          (w:w-bool wr (coin-coinbase-p coin))
@@ -127,7 +132,9 @@
            (set (make-utxo-set)))
       (dotimes (i n)
         (let* ((klen (w:r-varint r))
-               (key (map 'string #'code-char (w:r-bytes r klen)))
+               (txid (w:r-bytes r klen))
+               (index (w:r-u32 r))
+               (key (cons txid index))
                (value (w:r-i64 r))
                (h (w:r-u32 r))
                (cb (w:r-bool r))
