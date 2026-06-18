@@ -364,6 +364,69 @@
           (t (w:w-u8 wr op)))))
     (w:writer-bytes wr)))
 
+(defun serialize-push (data)
+  "Minimal push encoding of DATA, matching Core's `CScript() << vchData`
+   (an empty vector encodes as a single 0x00 byte).  Used as the FindAndDelete
+   pattern for a pushed signature."
+  (let* ((n (length data))
+         (hdr (cond ((< n 76) (list n))
+                    ((< n 256) (list +op-pushdata1+ n))
+                    ((< n 65536) (list +op-pushdata2+ (logand n #xff) (logand (ash n -8) #xff)))
+                    (t (list +op-pushdata4+ (logand n #xff) (logand (ash n -8) #xff)
+                             (logand (ash n -16) #xff) (logand (ash n -24) #xff)))))
+         (out (make-array (+ (length hdr) n) :element-type '(unsigned-byte 8))))
+    (loop for b in hdr for i from 0 do (setf (aref out i) b))
+    (replace out data :start1 (length hdr))
+    out))
+
+(defun %script-op-len (script pc)
+  "Bytes consumed by the opcode at PC (Core's GetOp), or NIL if a full opcode
+   can't be read there (GetOp would return false → FindAndDelete stops walking)."
+  (let ((n (length script)))
+    (when (>= pc n) (return-from %script-op-len nil))
+    (let ((op (aref script pc)))
+      (cond
+        ((< op 76) (let ((e (+ pc 1 op))) (and (<= e n) (- e pc))))
+        ((= op +op-pushdata1+) (and (<= (+ pc 2) n)
+                                    (let ((l (aref script (1+ pc)))) (and (<= (+ pc 2 l) n) (- (+ pc 2 l) pc)))))
+        ((= op +op-pushdata2+) (and (<= (+ pc 3) n)
+                                    (let ((l (logior (aref script (+ pc 1)) (ash (aref script (+ pc 2)) 8))))
+                                      (and (<= (+ pc 3 l) n) (- (+ pc 3 l) pc)))))
+        ((= op +op-pushdata4+) (and (<= (+ pc 5) n)
+                                    (let ((l (logior (aref script (+ pc 1)) (ash (aref script (+ pc 2)) 8)
+                                                     (ash (aref script (+ pc 3)) 16) (ash (aref script (+ pc 4)) 24))))
+                                      (and (<= (+ pc 5 l) n) (- (+ pc 5 l) pc)))))
+        (t 1)))))
+
+(defun find-and-delete (script pattern)
+  "Core's CScript::FindAndDelete — remove every occurrence of PATTERN (a
+   serialized push) from SCRIPT at opcode boundaries.  Consensus-critical for
+   the LEGACY sighash only (segwit v0 / tapscript never call it): a pushed
+   signature that also appears verbatim in the scriptCode (e.g. a sig embedded
+   in a P2SH redeemscript) must be stripped before hashing."
+  (let ((plen (length pattern)) (n (length script)))
+    (if (or (zerop plen) (zerop n))
+        script
+        (let ((out (make-array n :element-type '(unsigned-byte 8) :fill-pointer 0 :adjustable t))
+              (pc 0))
+          (loop
+            (loop while (and (<= (+ pc plen) n)
+                             (not (mismatch script pattern :start1 pc :end1 (+ pc plen))))
+                  do (incf pc plen))                       ; delete consecutive matches
+            (let ((adv (%script-op-len script pc)))
+              (cond (adv (loop for i from pc below (+ pc adv) do (vector-push-extend (aref script i) out))
+                         (incf pc adv))
+                    (t (loop for i from pc below n do (vector-push-extend (aref script i) out))
+                       (return)))))
+          (coerce out '(simple-array (unsigned-byte 8) (*)))))))
+
+(defun maybe-find-and-delete (ctx scriptcode sig)
+  "FindAndDelete SIG's push from SCRIPTCODE when verifying under the legacy
+   (non-segwit) sighash; a no-op for segwit v0 / tapscript."
+  (if (null (ctx-segwit-version ctx))
+      (find-and-delete scriptcode (serialize-push sig))
+      scriptcode))
+
 (defun legacy-sighash (transaction in-index script-code hashtype)
   "BIP-less legacy signature hash.  SCRIPT-CODE is the subscript (prevout
    scriptPubKey with code-separators removed)."
@@ -688,8 +751,9 @@
          (let* ((pubkey (pop!)) (sig (pop!))
                 (ok (if (ctx-tapscript-p ctx)
                         (eval-checksig-tapscript sig pubkey ctx)
-                        (let ((ok (ecdsa-check pubkey sig
-                                    (lambda (ht) (checker-sighash ctx scriptcode ht)) ctx)))
+                        (let* ((sc (maybe-find-and-delete ctx scriptcode sig))
+                               (ok (ecdsa-check pubkey sig
+                                    (lambda (ht) (checker-sighash ctx sc ht)) ctx)))
                           ;; NULLFAIL: a failing ECDSA signature must be empty
                           (when (and (not ok) (flag? :nullfail) (plusp (length sig)))
                             (serr "NULLFAIL"))
@@ -750,13 +814,19 @@
           (let ((sigs (loop repeat nsigs collect (pop!)))
                 (dummy (pop!)))          ; the off-by-one dummy element (consensus quirk)
             (when (and (flag? :nulldummy) (plusp (length dummy))) (serr "SIG_NULLDUMMY"))
+            ;; legacy FindAndDelete: strip every provided signature from the
+            ;; scriptCode before hashing (Core removes all sigs first, then
+            ;; matches).  No-op under segwit/tapscript.
+            (let ((sc scriptcode))
+              (when (null (ctx-segwit-version ctx))
+                (dolist (s sigs) (setf sc (find-and-delete sc (serialize-push s)))))
             ;; greedily match each sig to keys in order (Core's algorithm)
             (let ((si 0) (ki 0) (ok t)
                   (sigv (coerce sigs 'vector)) (keyv (coerce keys 'vector)))
               (loop while (< si nsigs) do
                 (when (< (- nkeys ki) (- nsigs si)) (setf ok nil) (return))
                 (if (ecdsa-check (aref keyv ki) (aref sigv si)
-                                 (lambda (ht) (checker-sighash ctx scriptcode ht)) ctx)
+                                 (lambda (ht) (checker-sighash ctx sc ht)) ctx)
                     (progn (incf si) (incf ki))
                     (incf ki)))
               ;; NULLFAIL: on failure, every provided signature must be empty
@@ -764,7 +834,7 @@
                 (serr "NULLFAIL"))
               (if (= op +op-checkmultisigverify+)
                   (unless ok (serr "CHECKMULTISIGVERIFY failed"))
-                  (psh (bool->bytes ok))))))))))
+                  (psh (bool->bytes ok)))))))))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; verify-input — the per-input verification entry point
