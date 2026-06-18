@@ -156,11 +156,19 @@
 (defun read-loop (p)
   (handler-case
       (loop while (peer-alive p) do
-        (multiple-value-bind (command payload) (read-message p)
-          (unless command (return))      ; clean EOF
-          (peer-log p "<- ~a (~d bytes)" command (length payload))
-          (unless (handle-builtin p command payload)
-            (dispatch p command payload))))
+        ;; An idle read past the socket timeout must NOT kill the loop: during
+        ;; IBD the consumer can pause requesting (backpressure) for a while, so a
+        ;; P2P read loop blocks indefinitely for the next message and just retries
+        ;; on a timeout.  (The stream's input timeout is also cleared at connect.)
+        (block one
+          (handler-case
+              (multiple-value-bind (command payload) (read-message p)
+                (unless command (return))    ; clean EOF
+                (peer-log p "<- ~a (~d bytes)" command (length payload))
+                (unless (handle-builtin p command payload)
+                  (dispatch p command payload)))
+            (#+sbcl sb-sys:io-timeout #-sbcl error () (return-from one))
+            #+sbcl (sb-sys:deadline-timeout () (return-from one)))))
     (serious-condition (c)
       (when (peer-alive p)
         (format t "~&[peer ~a] read loop ended: ~a~%" (peer-addr p) c)
@@ -203,6 +211,10 @@
             ((string= command "sendaddrv2") nil)
             (t nil)))))
     ;; --- go async ---
+    ;; usocket set a 15s INPUT timeout on the stream (from the connect :timeout);
+    ;; clear it so the steady-state read loop blocks indefinitely for the next
+    ;; message instead of dying on an idle gap (e.g. while IBD is backpressured).
+    #+sbcl (ignore-errors (setf (sb-impl::fd-stream-timeout (peer-stream p)) nil))
     (setf (peer-thread p)
           (bt:make-thread (lambda () (read-loop p))
                           :name (format nil "btc-peer ~a" (peer-addr p))))
