@@ -18,7 +18,8 @@
   (:local-nicknames (#:w #:cl-consensus.wire) (#:p #:cl-consensus.peer)
                     (#:c #:cl-consensus.chain) (#:tx #:cl-consensus.tx)
                     (#:blk #:cl-consensus.block) (#:s #:cl-consensus.script)
-                    (#:u #:cl-consensus.utxo))
+                    (#:u #:cl-consensus.utxo)
+                    (#:bt #:bordeaux-threads) (#:secp #:secp256k1-fast))
   (:export
    #:block-subsidy #:connect-block #:disconnect-block #:consensus-error
    #:run-ibd #:resume-ibd #:chainstate-path #:consensus-flags
@@ -196,6 +197,60 @@
         (has-witness
          (cerr height "block has witness data but no coinbase commitment"))))))
 
+;;; ----------------------------------------------------------------------------
+;;; Parallel script verification.  Script checks are pure functions of (tx,
+;;; input, prevout-script, value, flags) and don't touch the UTXO set, so — like
+;;; Core's CCheckQueue — connect-block runs the sequential UTXO pass inline but
+;;; defers every CHECKSIG-bearing input to a thread pool that fans the ECDSA /
+;;; Schnorr work across cores.  Each worker binds its own secp scratch.
+;;; ----------------------------------------------------------------------------
+
+(defvar *verify-workers* 64
+  "Max threads to fan a block's script checks across (capped by job count).")
+(defvar *parallel-verify-threshold* 16
+  "Below this many script checks, verify inline (thread spawn isn't worth it).")
+
+(defun %run-checks (checks flags lo hi abort fail lock)
+  "Worker: verify CHECKS[lo,hi) in this thread's own secp scratch, stopping
+   early if another worker has already failed (ABORT)."
+  (secp:with-fresh-scratch
+    (loop for i from lo below hi until (car abort) do
+      (destructuring-bind (txn in-i script value tx-i) (aref checks i)
+        (let ((bad (handler-case
+                       (unless (s:verify-input txn in-i script value :flags flags)
+                         "script verification failed")
+                     (s:script-error (e) (princ-to-string e))
+                     (error (e) (princ-to-string e)))))
+          (when bad
+            (setf (car abort) t)
+            (bt:with-lock-held (lock)
+              (unless (car fail) (setf (car fail) bad (cdr fail) (list tx-i in-i))))))))))
+
+(defun verify-block-scripts (checks flags &optional (workers *verify-workers*))
+  "Run all script CHECKS (vector of (txn in-i script value tx-i)) under FLAGS.
+   Returns (values ok msg tx-i in-i).  Small batches run inline; larger ones fan
+   across up to WORKERS threads."
+  (let ((n (length checks)))
+    (when (zerop n) (return-from verify-block-scripts (values t nil nil nil)))
+    (let ((abort (cons nil nil)) (fail (cons nil nil)) (lock (bt:make-lock)))
+      (if (< n *parallel-verify-threshold*)
+          (%run-checks checks flags 0 n abort fail lock)
+          (let* ((nw (max 1 (min workers n)))
+                 (per (ceiling n nw))
+                 (threads '()))
+            (dotimes (w nw)
+              (let ((lo (* w per)) (hi (min n (* (1+ w) per))))
+                (when (< lo hi)
+                  (push (bt:make-thread
+                         (let ((lo lo) (hi hi))
+                           (lambda () (%run-checks checks flags lo hi abort fail lock)))
+                         :name (format nil "verify ~d-~d" lo hi))
+                        threads))))
+            (mapc #'bt:join-thread threads)))
+      (if (car fail)
+          (values nil (car fail) (first (cdr fail)) (second (cdr fail)))
+          (values t nil nil nil)))))
+
 (defun connect-block (block height utxo &key (verify-scripts t))
   "Validate BLOCK at HEIGHT against UTXO and apply it.  Returns
    (values total-fees block-undo).  Signals CONSENSUS-ERROR on a rule violation."
@@ -205,6 +260,7 @@
          (enforce-locks (>= height +bip113-height+))
          (total-fees 0)
          (coinbase-claimed 0)
+         (checks '())                   ; deferred script-verification jobs
          (undo (make-block-undo)))
     ;; merkle root must match the header (structural integrity)
     (unless (blk:verify-merkle block)
@@ -257,14 +313,10 @@
                 (when (and enforce-locks (>= (tx:tx-version txn) 2))
                   (unless (sequence-lock-ok coin (tx:txin-sequence in) height mtp)
                     (cerr height "tx ~d input ~d: BIP68 relative locktime not met" tx-i in-i)))
-                ;; script verification (height-gated soft forks)
+                ;; script verification — deferred and fanned across cores after
+                ;; the sequential pass (scripts don't touch the UTXO set)
                 (when verify-scripts
-                  (handler-case
-                      (unless (s:verify-input txn in-i (u:coin-script coin) (u:coin-value coin)
-                                              :flags flags)
-                        (cerr height "tx ~d input ~d: script verification failed" tx-i in-i))
-                    (s:script-error (e)
-                      (cerr height "tx ~d input ~d: ~a" tx-i in-i e))))
+                  (push (list txn in-i (u:coin-script coin) (u:coin-value coin) tx-i) checks))
                 (incf total-in (u:coin-value coin))))
             ;; value conservation
             (let ((total-out (reduce #'+ (tx:tx-outputs txn) :key #'tx:txout-value :initial-value 0)))
@@ -290,6 +342,11 @@
       (when (> coinbase-claimed allowed)
         (cerr height "coinbase claims ~d > allowed ~d (subsidy ~d + fees ~d)"
               coinbase-claimed allowed (block-subsidy height) total-fees)))
+    ;; fan the deferred script checks across cores; any failure invalidates block
+    (when (and verify-scripts checks)
+      (multiple-value-bind (ok msg tx-i in-i)
+          (verify-block-scripts (coerce (nreverse checks) 'vector) flags)
+        (unless ok (cerr height "tx ~d input ~d: ~a" tx-i in-i msg))))
     (values total-fees undo)))
 
 ;;; ----------------------------------------------------------------------------
