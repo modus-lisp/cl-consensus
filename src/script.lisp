@@ -161,6 +161,18 @@
           (t (push op ops)))))
     (nreverse ops)))
 
+(defun op-byte-length (op)
+  "Serialized length in bytes of one parsed op (push or bare opcode).  Used to
+   track the byte offset of an executed OP_CODESEPARATOR for the legacy
+   scriptCode (subscript from after the last executed separator)."
+  (if (and (consp op) (eq (car op) :push))
+      (let ((opcode (cadr op)) (n (length (cddr op))))
+        (cond ((<= 1 opcode 75) (+ 1 n))
+              ((= opcode +op-pushdata1+) (+ 2 n))
+              ((= opcode +op-pushdata2+) (+ 3 n))
+              (t (+ 5 n))))                 ; pushdata4
+      1))
+
 (defun size-checked (data)
   (when (> (length data) 520) (serr "PUSH_SIZE"))
   data)
@@ -525,7 +537,8 @@
         (ops (parse-script script))
         (exec '())                     ; IF/ELSE execution flags (true = executing)
         (opcode-pos 0)                 ; Core's opcode_pos (for OP_CODESEPARATOR)
-        (codeseparator-script script)) ; subscript after last CODESEPARATOR
+        (byte-pos 0)                   ; byte offset of the current op (Core's pc)
+        (codeseparator-script script)) ; subscript after last executed CODESEPARATOR
     (declare (ignorable codeseparator-script))
     (labels ((executing-p () (every #'identity exec))
              (need (n) (when (< (length stack) n) (serr "INVALID_STACK_OPERATION")))
@@ -565,16 +578,21 @@
             ((not (executing-p)) nil)   ; skip everything else in a dead branch
             (is-push
              (push* (check-minimal-push (push-data op) (push-opcode op))))
-            ;; OP_CODESEPARATOR: record its position for the tapscript sighash
+            ;; OP_CODESEPARATOR: record its opcode position (tapscript sighash)
+            ;; AND truncate the legacy scriptCode to the bytes after it — every
+            ;; subsequent CHECKSIG/CHECKMULTISIG signs over that subscript, as
+            ;; Core does via pbegincodehash.
             ((and (not is-push) (= op +op-codeseparator+))
-             (setf (ctx-codesep-pos ctx) opcode-pos))
+             (setf (ctx-codesep-pos ctx) opcode-pos
+                   codeseparator-script (subseq script (1+ byte-pos))))
             (t (run-op op #'popn #'popnum #'push* #'need ctx
                        (lambda () alt) (lambda (v) (setf alt v))
                        (lambda () stack) (lambda (v) (setf stack v))
                        codeseparator-script)))
           ;; stack-size limit applies after each step (main + alt)
           (when (> (+ (length stack) (length alt)) +max-stack-size+) (serr "STACK_SIZE")))
-        (incf opcode-pos))             ; Core increments per GetOp, unconditionally
+        (incf opcode-pos)              ; Core increments per GetOp, unconditionally
+        (incf byte-pos (op-byte-length op)))
       (when exec (serr "UNBALANCED_CONDITIONAL"))   ; every IF needs an ENDIF
       stack)))
 
