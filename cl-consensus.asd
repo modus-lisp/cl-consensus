@@ -6,7 +6,7 @@
                 script test suite."
   :version "0.1.0"
   :license "MIT"
-  :depends-on ("ironclad" "usocket" "bordeaux-threads" "com.inuoe.jzon" "hunchentoot")
+  :depends-on ("secp256k1-fast" "ironclad" "usocket" "bordeaux-threads" "com.inuoe.jzon" "hunchentoot")
   :serial t
   :components
   ((:module "src"
