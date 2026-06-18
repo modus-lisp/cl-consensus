@@ -22,7 +22,8 @@
                     (#:bt #:bordeaux-threads) (#:secp #:secp256k1-fast))
   (:export
    #:block-subsidy #:connect-block #:disconnect-block #:consensus-error
-   #:run-ibd #:resume-ibd #:chainstate-path #:consensus-flags
+   #:run-ibd #:resume-ibd #:run-ibd-async #:chainstate-path #:consensus-flags
+   #:*verify-workers*
    #:block-undo #:block-undo-spent #:block-undo-created
    #:block-weight #:count-sigops
    #:+bip16-height+ #:+segwit-height+ #:+taproot-height+ #:+bip34-height+
@@ -251,9 +252,153 @@
           (values nil (car fail) (first (cdr fail)) (second (cdr fail)))
           (values t nil nil nil)))))
 
-(defun connect-block (block height utxo &key (verify-scripts t))
+;;; ----------------------------------------------------------------------------
+;;; Async / pipelined IBD.  UTXO application must be ordered, but script
+;;; verification needn't be — so the sequential pass (parse + UTXO mutation +
+;;; non-script rules) races ahead, enqueuing each block's script checks into a
+;;; bounded queue that a persistent pool of worker threads drains continuously.
+;;; Verification fills ALL cores instead of per-block bursts.  A checkpoint is
+;;; only written at a FULLY-VERIFIED height (a drain barrier at each save), so a
+;;; resume never trusts an unverified region; on any failure we halt and report
+;;; the offending (height, tx, input) once in-flight work settles.
+;;; ----------------------------------------------------------------------------
+
+;; minimal FIFO (O(1) push/pop) guarded by the vqueue lock
+(defstruct (fifo (:constructor make-fifo)) (head nil) (tail nil))
+(defun fifo-push (f x)
+  (let ((c (cons x nil)))
+    (if (fifo-tail f) (setf (cdr (fifo-tail f)) c) (setf (fifo-head f) c))
+    (setf (fifo-tail f) c)))
+(defun fifo-pop (f)
+  (let ((c (fifo-head f)))
+    (setf (fifo-head f) (cdr c))
+    (unless (fifo-head f) (setf (fifo-tail f) nil))
+    (car c)))
+
+(defstruct (vqueue (:constructor %make-vqueue))
+  (lock (bt:make-lock)) (fifo (make-fifo)) space items
+  (pending (make-hash-table)) (maxreg -1) (verified -1) (next 0)
+  (failed nil) (workers nil))
+
+(defun make-vqueue (&key (maxq 400000) (workers 100))
+  (let ((vq (%make-vqueue :space (bt:make-semaphore :count maxq) :items (bt:make-semaphore :count 0))))
+    (setf (vqueue-workers vq)
+          (loop repeat workers collect
+            (bt:make-thread (lambda () (vq-worker vq)) :name "ibd-verify")))
+    vq))
+
+(defun vq-put (vq job)
+  (bt:wait-on-semaphore (vqueue-space vq))
+  (bt:with-lock-held ((vqueue-lock vq)) (fifo-push (vqueue-fifo vq) job))
+  (bt:signal-semaphore (vqueue-items vq)))
+
+(defun vq-get (vq)
+  (bt:wait-on-semaphore (vqueue-items vq))
+  (prog1 (bt:with-lock-held ((vqueue-lock vq)) (fifo-pop (vqueue-fifo vq)))
+    (bt:signal-semaphore (vqueue-space vq))))
+
+(defun %vq-advance (vq)            ; call under lock: extend the verified watermark
+  (loop while (and (<= (vqueue-next vq) (vqueue-maxreg vq))
+                   (null (gethash (vqueue-next vq) (vqueue-pending vq))))
+        do (setf (vqueue-verified vq) (vqueue-next vq))
+           (incf (vqueue-next vq))))
+
+(defun vq-register (vq height n)   ; producer: register HEIGHT with N checks
+  (bt:with-lock-held ((vqueue-lock vq))
+    (setf (vqueue-maxreg vq) height)
+    (when (plusp n) (setf (gethash height (vqueue-pending vq)) n))
+    (%vq-advance vq)))
+
+(defun vq-complete (vq height)     ; worker: one check of HEIGHT done
+  (bt:with-lock-held ((vqueue-lock vq))
+    (let ((r (decf (gethash height (vqueue-pending vq)))))
+      (when (<= r 0) (remhash height (vqueue-pending vq)) (%vq-advance vq)))))
+
+(defun vq-worker (vq)
+  (secp:with-fresh-scratch
+    (loop
+      (let ((job (vq-get vq)))
+        (when (eq job :stop) (return))
+        (destructuring-bind (txn in-i script value tx-i height flags) job
+          (unless (vqueue-failed vq)
+            (let ((bad (handler-case
+                           (unless (s:verify-input txn in-i script value :flags flags)
+                             "script verification failed")
+                         (s:script-error (e) (princ-to-string e))
+                         (error (e) (princ-to-string e)))))
+              (when bad
+                (bt:with-lock-held ((vqueue-lock vq))
+                  (unless (vqueue-failed vq) (setf (vqueue-failed vq) (list height tx-i in-i bad)))))))
+          (vq-complete vq height))))))
+
+(defun vq-sink (vq)
+  "The CHECK-SINK closure for connect-block: register the height, enqueue jobs."
+  (lambda (checks height flags)
+    (let ((n (length checks)))
+      (vq-register vq height n)
+      (dolist (c checks)
+        (when (vqueue-failed vq) (return))
+        (vq-put vq (list* (first c) (second c) (third c) (fourth c) (fifth c) height (list flags)))))))
+
+(defun vq-drained-p (vq h) (or (vqueue-failed vq) (>= (vqueue-verified vq) h)))
+(defun vq-stop (vq)
+  (dotimes (i (length (vqueue-workers vq))) (vq-put vq :stop))
+  (mapc #'bt:join-thread (vqueue-workers vq)))
+
+(defun run-ibd-async (peer utxo &key (from 1) (to (c:tip-height)) (batch 256)
+                                     (assumevalid-below 0) (save-every 10000)
+                                     (workers 100) (progress-every 1000) (maxq 400000))
+  "Pipelined IBD: connect blocks in order (UTXO inline) while WORKERS verify
+   scripts asynchronously across all cores.  Below ASSUMEVALID-BELOW scripts are
+   skipped.  Checkpoints (every SAVE-EVERY) drain to a fully-verified height
+   first.  Returns the last verified height."
+  (let ((vq (make-vqueue :maxq maxq :workers workers))
+        (sink nil) (height from) (t0 (get-internal-real-time)) (last (1- from)))
+    (setf sink (vq-sink vq))
+    (flet ((fail-check ()
+             (when (vqueue-failed vq)
+               (destructuring-bind (h ti ii msg) (vqueue-failed vq)
+                 (vq-stop vq)
+                 (cerr h "tx ~d input ~d: ~a" ti ii msg)))))
+      (unwind-protect
+        (progn
+          (loop while (<= height to) do
+            (fail-check)
+            (let* ((hi (min to (+ height batch -1)))
+                   (hashes (loop for h from height to hi collect (c:header-hash (c:header-at-height h))))
+                   (blocks (blk:get-blocks peer hashes)))
+              (loop for b across blocks for h from height do
+                (unless b (cerr h "peer did not return block"))
+                (connect-block b h utxo
+                               :verify-scripts (>= h assumevalid-below)
+                               :check-sink sink)
+                (setf last h)
+                (when (zerop (mod h progress-every))
+                  (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+                    (format t "~&[ibd] height ~d  verified ~d  utxos ~d  total ~,4f BTC  ~,0f blk/s~%"
+                            h (vqueue-verified vq) (u:utxo-count utxo)
+                            (/ (u:utxo-set-total-value utxo) 1d8)
+                            (if (plusp secs) (/ (- h from -1) secs) 0))
+                    (force-output)))
+                (when (and save-every (zerop (mod h save-every)))
+                  (loop until (vq-drained-p vq h) do (sleep 0.02))   ; verify catches up
+                  (fail-check)
+                  (u:save-utxo utxo (chainstate-path) h)
+                  (format t "~&[ibd] checkpoint @ ~d (verified)~%" h) (force-output)))
+              (setf height (1+ hi))))
+          ;; final drain + checkpoint
+          (loop until (vq-drained-p vq last) do (sleep 0.02))
+          (fail-check)
+          (when save-every (u:save-utxo utxo (chainstate-path) last))
+          last)
+        (ignore-errors (vq-stop vq))))))
+
+(defun connect-block (block height utxo &key (verify-scripts t) check-sink)
   "Validate BLOCK at HEIGHT against UTXO and apply it.  Returns
-   (values total-fees block-undo).  Signals CONSENSUS-ERROR on a rule violation."
+   (values total-fees block-undo).  Signals CONSENSUS-ERROR on a rule violation.
+   With CHECK-SINK (a function of (checks height flags)), the script checks are
+   handed off instead of verified here — the async/pipelined IBD path; the UTXO
+   pass and all non-script rules still run inline and in order."
   (let* ((txs (blk:block-txs block))
          (flags (consensus-flags height))
          (mtp (block-mtp height))
@@ -342,11 +487,14 @@
       (when (> coinbase-claimed allowed)
         (cerr height "coinbase claims ~d > allowed ~d (subsidy ~d + fees ~d)"
               coinbase-claimed allowed (block-subsidy height) total-fees)))
-    ;; fan the deferred script checks across cores; any failure invalidates block
-    (when (and verify-scripts checks)
-      (multiple-value-bind (ok msg tx-i in-i)
-          (verify-block-scripts (coerce (nreverse checks) 'vector) flags)
-        (unless ok (cerr height "tx ~d input ~d: ~a" tx-i in-i msg))))
+    ;; script checks: hand to the async sink if present (register the height even
+    ;; with zero checks, so the verified-watermark advances), else verify now.
+    (if check-sink
+        (funcall check-sink (and verify-scripts (nreverse checks)) height flags)
+        (when (and verify-scripts checks)
+          (multiple-value-bind (ok msg tx-i in-i)
+              (verify-block-scripts (coerce (nreverse checks) 'vector) flags)
+            (unless ok (cerr height "tx ~d input ~d: ~a" tx-i in-i msg)))))
     (values total-fees undo)))
 
 ;;; ----------------------------------------------------------------------------
