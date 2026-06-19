@@ -28,7 +28,23 @@
 (defstruct udb
   fd sap capacity (count 0)
   ovf-stream                            ; append file for oversized scripts
-  (ovf-end 0))
+  (ovf-end 0) (lock-path nil))
+
+(defun %pid-alive-p (pid) (and (integerp pid) (probe-file (format nil "/proc/~d/" pid))))
+
+(defun udb-acquire-lock (path)
+  "Exclusive PID lock-file at PATH.lock — prevents two processes mapping the same
+   udb MAP_SHARED (which races and corrupts).  Steals a stale lock whose owner is
+   dead.  (flock isn't available in this SBCL build; a PID file is portable.)"
+  (let ((lp (concatenate 'string (namestring path) ".lock")))
+    (when (probe-file lp)
+      (let ((owner (ignore-errors (with-open-file (s lp) (read s nil nil)))))
+        (if (%pid-alive-p owner)
+            (error "udb ~a is locked by live process ~a" path owner)
+            (ignore-errors (delete-file lp)))))    ; stale owner: steal
+    (with-open-file (s lp :direction :output :if-exists :error :if-does-not-exist :create)
+      (princ (sb-posix:getpid) s))
+    lp))
 
 (declaim (inline slot-sap u64-at set-u64 u32-at set-u32 u16-at set-u16 u8-at set-u8))
 (defun u8-at  (sap off) (sb-sys:sap-ref-8 sap off))
@@ -63,14 +79,9 @@
 (defun open-udb (path capacity)
   "Open/create the mmap slot table at PATH sized for CAPACITY slots (a sparse
    file of CAPACITY*128 bytes).  OVERFLOW file is PATH.ovf."
-  (let* ((bytes (* capacity +slot-bytes+))
+  (let* ((lock (udb-acquire-lock path))      ; signals if another live process holds it
+         (bytes (* capacity +slot-bytes+))
          (fd (sb-posix:open path (logior sb-posix:o-rdwr sb-posix:o-creat) #o644)))
-    ;; exclusive non-blocking lock (LOCK_EX|LOCK_NB=6): a second process must NOT
-    ;; map the same udb — concurrent MAP_SHARED writers corrupt it.  Auto-released
-    ;; when the fd closes (incl. process death), so no stale locks.
-    (handler-case (sb-posix:flock fd 6)
-      (error () (sb-posix:close fd)
-        (error "udb ~a is already locked by another process" path)))
     (sb-posix:ftruncate fd bytes)
     (let ((sap (sb-posix:mmap nil bytes (logior sb-posix:prot-read sb-posix:prot-write)
                               sb-posix:map-shared fd 0))
@@ -78,11 +89,12 @@
       (let ((ostream (open ovf-path :direction :io :element-type '(unsigned-byte 8)
                                     :if-exists :overwrite :if-does-not-exist :create)))
         (make-udb :fd fd :sap sap :capacity capacity :ovf-stream ostream
-                  :ovf-end (file-length ostream))))))
+                  :ovf-end (file-length ostream) :lock-path lock)))))
 
 (defun close-udb (db)
   (sb-posix:munmap (udb-sap db) (* (udb-capacity db) +slot-bytes+))
   (sb-posix:close (udb-fd db))
+  (when (udb-lock-path db) (ignore-errors (delete-file (udb-lock-path db))))
   (close (udb-ovf-stream db)))
 
 (defun udb-sync (db)
