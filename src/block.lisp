@@ -137,13 +137,15 @@
     (dolist (h hashes) (w:w-u32 wr type) (w:w-hash wr h))
     (w:writer-bytes wr)))
 
-(defun get-blocks (peer hashes &key (timeout 180) (witness t))
-  "Request a batch of blocks (list of 32-byte hashes) in one getdata and collect
-   the responses.  Returns a vector of BLOCK* in the same order as HASHES."
+(defun get-blocks (peer hashes &key (timeout 60) (retries 8) (witness t))
+  "Request a batch of blocks (list of 32-byte hashes) and collect the responses.
+   Returns a vector of BLOCK* in HASHES order.  A peer can transiently stall mid-
+   batch; rather than fail the whole IBD, re-request the still-missing blocks each
+   TIMEOUT window for up to RETRIES attempts (real nodes re-request stalled
+   blocks).  Duplicate arrivals are ignored (want-set gate)."
   (let ((want (make-hash-table :test 'equal))
         (results (make-hash-table :test 'equal))
-        (done (bt:make-semaphore))
-        (remaining (length hashes)))
+        (lock (bt:make-lock)) (remaining (length hashes)))
     (when (zerop remaining) (return-from get-blocks #()))
     (dolist (h hashes) (setf (gethash (w:hash->hex h) want) t))
     (p:on peer "block"
@@ -151,13 +153,22 @@
             (declare (ignore pr))
             (handler-case
                 (let* ((b (parse-block payload)) (hx (block-hash-hex b)))
-                  (when (gethash hx want)
-                    (setf (gethash hx results) b)
-                    (remhash hx want)
-                    (when (zerop (decf remaining)) (bt:signal-semaphore done))))
+                  (bt:with-lock-held (lock)
+                    (when (gethash hx want)
+                      (setf (gethash hx results) b) (remhash hx want) (decf remaining))))
               (serious-condition () nil))))
-    (p:send peer "getdata"
-            (build-getdata-batch hashes (if witness +msg-witness-block+ +msg-block+)))
-    (unless (bt:wait-on-semaphore done :timeout timeout)
-      (error "block batch timed out (~d of ~d missing)" remaining (length hashes)))
+    (let ((typ (if witness +msg-witness-block+ +msg-block+)))
+      (loop for attempt from 1 to retries
+            for missing = (bt:with-lock-held (lock)
+                            (loop for h in hashes when (gethash (w:hash->hex h) want) collect h))
+            while missing do
+        (when (> attempt 1)
+          (format t "~&[peer] re-requesting ~d stalled block(s) (attempt ~d)~%" (length missing) attempt)
+          (force-output))
+        (p:send peer "getdata" (build-getdata-batch missing typ))
+        ;; poll until this window's deadline or batch complete
+        (let ((deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
+          (loop until (or (zerop remaining) (> (get-internal-real-time) deadline)) do (sleep 0.05)))))
+    (when (plusp remaining)
+      (error "block batch: ~d of ~d still missing after retries" remaining (length hashes)))
     (map 'vector (lambda (h) (gethash (w:hash->hex h) results)) hashes)))
