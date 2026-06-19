@@ -315,6 +315,42 @@
     (let ((r (decf (gethash height (vqueue-pending vq)))))
       (when (<= r 0) (remhash height (vqueue-pending vq)) (%vq-advance vq)))))
 
+(defvar *prefetch-workers* 64
+  "Threads to resolve a block's input coins from the mmap in parallel.")
+
+(defun prefetch-block-inputs (set block &optional (workers *prefetch-workers*))
+  "Resolve every non-coinbase input's committed (mmap) coin in parallel into
+   SET's prefetch map, so the serial connect-block pass skips the mmap cache-miss
+   + coin alloc.  No-op for the in-RAM backend.  Reads only (safe: the producer
+   does no mmap writes between checkpoints)."
+  (unless (u:utxo-disk-p set) (return-from prefetch-block-inputs))
+  (let ((ops '()))
+    (loop for txn across (blk:block-txs block) do
+      (unless (tx:tx-coinbase-p txn)
+        (dolist (in (tx:tx-inputs txn))
+          (push (u:utxo-key (tx:txin-prev-hash in) (tx:txin-prev-index in)) ops))))
+    (let* ((vec (coerce ops 'vector)) (n (length vec)))
+      (when (plusp n)
+        (let* ((nw (max 1 (min workers n))) (per (ceiling n nw))
+               (parts (make-array nw :initial-element nil))
+               (threads
+                 (loop for w below nw
+                       for lo = (* w per) for hi = (min n (* (1+ w) per))
+                       when (< lo hi) collect
+                       (let ((lo lo) (hi hi) (wi w))
+                         (bt:make-thread
+                          (lambda ()
+                            (let ((acc '()))
+                              (loop for i from lo below hi do
+                                (let* ((k (aref vec i))
+                                       (coin (u:prefetch-resolve set (car k) (cdr k))))
+                                  (when coin (push (cons k coin) acc))))
+                              (setf (aref parts wi) acc))))))))
+          (mapc #'bt:join-thread threads)
+          (let ((pf (make-hash-table :test 'equalp :size (1+ n))))
+            (dotimes (w nw) (dolist (kc (aref parts w)) (setf (gethash (car kc) pf) (cdr kc))))
+            (u:set-prefetch set pf)))))))
+
 (defun vq-worker (vq)
   (secp:with-fresh-scratch
    (s:with-sighash-buffer
@@ -375,9 +411,11 @@
               (loop for b across blocks for h from height do
                 (unless b (cerr h "peer did not return block"))
                 (let ((cn0 (get-internal-real-time)))
+                  (prefetch-block-inputs utxo b)         ; parallel mmap lookups
                   (connect-block b h utxo
                                  :verify-scripts (>= h assumevalid-below)
                                  :check-sink sink)
+                  (u:clear-prefetch utxo)
                   (incf cn (- (get-internal-real-time) cn0)))
                 (setf last h)
                 (when (zerop (mod h progress-every))

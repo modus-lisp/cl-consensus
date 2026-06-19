@@ -19,7 +19,8 @@
    #:utxo-set #:make-utxo-set #:utxo-count #:utxo-set-total-value
    #:utxo-get #:utxo-add #:utxo-spend #:utxo-key #:utxo-digest
    #:save-utxo #:load-utxo
-   #:open-disk-utxo #:flush-utxo #:close-utxo #:utxo-disk-p #:+udb-tip-capacity+))
+   #:open-disk-utxo #:flush-utxo #:close-utxo #:utxo-disk-p #:+udb-tip-capacity+
+   #:prefetch-resolve #:set-prefetch #:clear-prefetch))
 
 (in-package #:cl-consensus.utxo)
 
@@ -36,7 +37,9 @@
   ;; Disk backend (when DISK is non-nil): the mmap committed table + an in-RAM
   ;; STAGING buffer of changes since the last flush (a coin = added, :SPENT =
   ;; removed).  COUNT/total are kept running; PATH is the meta-file path.
-  (disk nil) (staging nil) (count 0) (path nil))
+  ;; PREFETCH: a per-block map (outpoint -> coin) of committed coins resolved in
+  ;; parallel before the serial pass, so utxo-spend skips the mmap cache-miss.
+  (disk nil) (staging nil) (count 0) (path nil) (prefetch nil))
 
 (defun utxo-disk-p (set) (and (utxo-set-disk set) t))
 (defun make-utxo-set () (%make-utxo-set))
@@ -79,11 +82,18 @@
         (cond
           ((eq st :spent) nil)
           ((eq st :miss)                ; spend a coin that lives in the mmap
-           (multiple-value-bind (found v h cb s) (d:udb-get (utxo-set-disk set) txid-bytes index)
-             (when found
-               (setf (gethash key (utxo-set-staging set)) :spent)
-               (decf (utxo-set-total-value set) v) (decf (utxo-set-count set))
-               (make-coin :value v :height h :coinbase-p cb :script s))))
+           (let ((pc (let ((pf (utxo-set-prefetch set))) (and pf (gethash key pf)))))
+             (cond
+               (pc                       ; resolved in parallel — no mmap touch here
+                (setf (gethash key (utxo-set-staging set)) :spent)
+                (decf (utxo-set-total-value set) (coin-value pc)) (decf (utxo-set-count set))
+                pc)
+               (t
+                (multiple-value-bind (found v h cb s) (d:udb-get (utxo-set-disk set) txid-bytes index)
+                  (when found
+                    (setf (gethash key (utxo-set-staging set)) :spent)
+                    (decf (utxo-set-total-value set) v) (decf (utxo-set-count set))
+                    (make-coin :value v :height h :coinbase-p cb :script s)))))))
           (t                            ; spend a still-staged fresh coin (never flushed)
            (remhash key (utxo-set-staging set))
            (decf (utxo-set-total-value set) (coin-value st)) (decf (utxo-set-count set))
@@ -144,6 +154,20 @@
 
 (defun close-utxo (set)
   (when (utxo-set-disk set) (d:close-udb (utxo-set-disk set))))
+
+;;; Parallel UTXO-lookup prefetch.  Input lookups are independent read-only mmap
+;;; accesses (cache-miss + coin alloc) — the bulk of the single-threaded
+;;; connect-block pass.  Resolve them across cores BEFORE the serial pass, then
+;;; utxo-spend consumes the prefetch map (hot) instead of touching the mmap.
+(defun prefetch-resolve (set txid-bytes index)
+  "Read-only: the committed (mmap) coin for this outpoint, or NIL if absent.
+   Thread-safe (pure mmap reads + fresh allocation; staged coins are resolved by
+   the serial pass and intentionally not prefetched)."
+  (multiple-value-bind (found v h cb s) (d:udb-get (utxo-set-disk set) txid-bytes index)
+    (and found (make-coin :value v :height h :coinbase-p cb :script s))))
+
+(defun set-prefetch (set map) (setf (utxo-set-prefetch set) map))
+(defun clear-prefetch (set) (setf (utxo-set-prefetch set) nil))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Order-independent set digest — an additive (MuHash-style) commitment to the
