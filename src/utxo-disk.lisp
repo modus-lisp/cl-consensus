@@ -65,6 +65,12 @@
    file of CAPACITY*128 bytes).  OVERFLOW file is PATH.ovf."
   (let* ((bytes (* capacity +slot-bytes+))
          (fd (sb-posix:open path (logior sb-posix:o-rdwr sb-posix:o-creat) #o644)))
+    ;; exclusive non-blocking lock (LOCK_EX|LOCK_NB=6): a second process must NOT
+    ;; map the same udb — concurrent MAP_SHARED writers corrupt it.  Auto-released
+    ;; when the fd closes (incl. process death), so no stale locks.
+    (handler-case (sb-posix:flock fd 6)
+      (error () (sb-posix:close fd)
+        (error "udb ~a is already locked by another process" path)))
     (sb-posix:ftruncate fd bytes)
     (let ((sap (sb-posix:mmap nil bytes (logior sb-posix:prot-read sb-posix:prot-write)
                               sb-posix:map-shared fd 0))

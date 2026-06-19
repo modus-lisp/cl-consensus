@@ -390,65 +390,75 @@
    scripts asynchronously across all cores.  Below ASSUMEVALID-BELOW scripts are
    skipped.  Checkpoints (every SAVE-EVERY) drain to a fully-verified height
    first.  Returns the last verified height."
-  (let ((vq (make-vqueue :maxq maxq :workers workers))
-        (sink nil) (height from) (t0 (get-internal-real-time)) (last (1- from))
-        (dl 0) (cn 0))                 ; cumulative download vs serial-pass time
-    (setf sink (vq-sink vq))
-    (flet ((fail-check ()
-             (when (vqueue-failed vq)
-               (destructuring-bind (h ti ii msg) (vqueue-failed vq)
-                 (vq-stop vq)
-                 (cerr h "tx ~d input ~d: ~a" ti ii msg)))))
-      (unwind-protect
-        (progn
-          (loop while (<= height to) do
+  (let* ((vq (make-vqueue :maxq maxq :workers workers))
+         (sink (vq-sink vq)) (t0 (get-internal-real-time)) (last (1- from))
+         (wait 0) (cn 0)                ; producer wait-for-batch vs serial-pass time
+         ;; bounded batch queue: a background fetcher downloads batches AHEAD so
+         ;; the producer never blocks on the network (download overlaps validate).
+         (bq (make-fifo)) (bq-lock (bt:make-lock))
+         (bq-space (bt:make-semaphore :count 3)) (bq-items (bt:make-semaphore :count 0))
+         (fetch-err nil))
+    (labels ((fail-check ()
+               (when (vqueue-failed vq)
+                 (destructuring-bind (h ti ii msg) (vqueue-failed vq)
+                   (vq-stop vq) (cerr h "tx ~d input ~d: ~a" ti ii msg))))
+             (bq-push (x) (bt:wait-on-semaphore bq-space)
+               (bt:with-lock-held (bq-lock) (fifo-push bq x)) (bt:signal-semaphore bq-items))
+             (bq-pop () (bt:wait-on-semaphore bq-items)
+               (prog1 (bt:with-lock-held (bq-lock) (fifo-pop bq)) (bt:signal-semaphore bq-space))))
+      (let ((fetcher
+              (bt:make-thread
+               (lambda ()
+                 (handler-case
+                     (let ((h from))
+                       (loop while (<= h to) do
+                         (let* ((hi (min to (+ h batch -1)))
+                                (hashes (loop for x from h to hi collect (c:header-hash (c:header-at-height x))))
+                                (blocks (blk:get-blocks peer hashes)))
+                           (bq-push (list h blocks)) (setf h (1+ hi))))
+                       (bq-push :done))
+                   (serious-condition (e) (setf fetch-err e) (bq-push :done))))
+               :name "ibd-fetch")))
+        (unwind-protect
+          (progn
+            (loop
+              (fail-check)
+              (let* ((w0 (get-internal-real-time)) (item (bq-pop)))
+                (incf wait (- (get-internal-real-time) w0))  ; >0 only when download-bound
+                (when (eq item :done) (return))
+                (destructuring-bind (bh blocks) item
+                  ;; structural checks (pure block fns) across cores, then the
+                  ;; ordered serial connect pass (UTXO + verify-enqueue).
+                  (let ((sts (get-internal-real-time)))
+                    (multiple-value-bind (ok fh msg) (prevalidate-structural blocks bh (min 32 workers))
+                      (unless ok (cerr fh "~a" msg)))
+                    (incf *cb-struct* (- (get-internal-real-time) sts)))
+                  (loop for b across blocks for h from bh do
+                    (unless b (cerr h "peer did not return block"))
+                    (let ((cn0 (get-internal-real-time)))
+                      (connect-block b h utxo :verify-scripts (>= h assumevalid-below)
+                                             :check-sink sink :skip-structural t)
+                      (incf cn (- (get-internal-real-time) cn0)))
+                    (setf last h)
+                    (when (zerop (mod h progress-every))
+                      (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+                        (format t "~&[ibd] height ~d  verified ~d  utxos ~d  total ~,4f BTC  ~,0f blk/s  [wait ~,1f cn ~,1f loop ~,1f sink ~,1f lag ~d]~%"
+                                h (vqueue-verified vq) (u:utxo-count utxo) (/ (u:utxo-set-total-value utxo) 1d8)
+                                (if (plusp secs) (/ (- h from -1) secs) 0)
+                                (/ wait internal-time-units-per-second) (/ cn internal-time-units-per-second)
+                                (/ *cb-loop* internal-time-units-per-second) (/ *cb-sink* internal-time-units-per-second)
+                                (- h (vqueue-verified vq)))
+                        (force-output)))
+                    (when (and save-every (zerop (mod h save-every)))
+                      (loop until (vq-drained-p vq h) do (sleep 0.02))
+                      (fail-check) (u:save-utxo utxo (chainstate-path) h)
+                      (format t "~&[ibd] checkpoint @ ~d (verified)~%" h) (force-output))))))
+            (when fetch-err (error fetch-err))
+            (loop until (vq-drained-p vq last) do (sleep 0.02))
             (fail-check)
-            (let* ((hi (min to (+ height batch -1)))
-                   (hashes (loop for h from height to hi collect (c:header-hash (c:header-at-height h))))
-                   (dl0 (get-internal-real-time))
-                   (blocks (blk:get-blocks peer hashes)))
-              (incf dl (- (get-internal-real-time) dl0))
-              ;; structural checks (merkle/witness/weight/sigops) are pure block
-              ;; fns — run the whole batch across cores before the serial pass.
-              ;; cap structural threads so they don't oversubscribe vs the
-              ;; persistent verify pool (total threads <= cores).
-              (let ((sts (get-internal-real-time)))
-                (multiple-value-bind (ok bh msg) (prevalidate-structural blocks height (min 32 workers))
-                  (unless ok (cerr bh "~a" msg)))
-                (incf *cb-struct* (- (get-internal-real-time) sts)))
-              (loop for b across blocks for h from height do
-                (unless b (cerr h "peer did not return block"))
-                (let ((cn0 (get-internal-real-time)))
-                  (connect-block b h utxo
-                                 :verify-scripts (>= h assumevalid-below)
-                                 :check-sink sink :skip-structural t)
-                  (incf cn (- (get-internal-real-time) cn0)))
-                (setf last h)
-                (when (zerop (mod h progress-every))
-                  (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
-                    (format t "~&[ibd] height ~d  verified ~d  utxos ~d  total ~,4f BTC  ~,0f blk/s  [dl ~,1f cn ~,1f loop ~,1f sink ~,1f lag ~d]~%"
-                            h (vqueue-verified vq) (u:utxo-count utxo)
-                            (/ (u:utxo-set-total-value utxo) 1d8)
-                            (if (plusp secs) (/ (- h from -1) secs) 0)
-                            (/ dl internal-time-units-per-second) (/ cn internal-time-units-per-second)
-                            (/ *cb-loop* internal-time-units-per-second) (/ *cb-sink* internal-time-units-per-second)
-                            (- h (vqueue-verified vq)))
-                    (format t "       [struct ~,1f loop ~,1f sink ~,1f]~%"
-                            (/ *cb-struct* internal-time-units-per-second) (/ *cb-loop* internal-time-units-per-second)
-                            (/ *cb-sink* internal-time-units-per-second))
-                    (force-output)))
-                (when (and save-every (zerop (mod h save-every)))
-                  (loop until (vq-drained-p vq h) do (sleep 0.02))   ; verify catches up
-                  (fail-check)
-                  (u:save-utxo utxo (chainstate-path) h)
-                  (format t "~&[ibd] checkpoint @ ~d (verified)~%" h) (force-output)))
-              (setf height (1+ hi))))
-          ;; final drain + checkpoint
-          (loop until (vq-drained-p vq last) do (sleep 0.02))
-          (fail-check)
-          (when save-every (u:save-utxo utxo (chainstate-path) last))
-          last)
-        (ignore-errors (vq-stop vq))))))
+            (when save-every (u:save-utxo utxo (chainstate-path) last))
+            last)
+          (ignore-errors (vq-stop vq)))))))
 
 (defvar *cb-loop* 0) (defvar *cb-sink* 0) (defvar *cb-struct* 0)   ; instrumentation
 
