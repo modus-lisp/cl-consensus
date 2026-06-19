@@ -383,7 +383,7 @@
   (dotimes (i (length (vqueue-workers vq))) (vq-put vq :stop))
   (mapc #'bt:join-thread (vqueue-workers vq)))
 
-(defun run-ibd-async (peer utxo &key (from 1) (to (c:tip-height)) (batch 256)
+(defun run-ibd-async (peer utxo &key (from 1) (to (c:tip-height)) (batch 64)
                                      (assumevalid-below 0) (save-every 10000)
                                      (workers 100) (progress-every 1000) (maxq 400000))
   "Pipelined IBD: connect blocks in order (UTXO inline) while WORKERS verify
@@ -638,7 +638,7 @@
   (merge-pathnames (if height (format nil "chainstate-~d.dat" height) "chainstate.dat")
                    (c:data-dir)))
 
-(defun run-ibd (peer utxo &key (from 1) (to (c:tip-height)) (batch 256)
+(defun run-ibd (peer utxo &key (from 1) (to (c:tip-height)) (batch 64)
                                (verify-scripts t) (progress-every 5000)
                                (assumevalid-below 0) (save-every nil))
   "Download and connect blocks [FROM, TO] in order, applying each to UTXO.
@@ -671,7 +671,7 @@
     (when save-every (u:save-utxo utxo (chainstate-path) last))
     last))
 
-(defun resume-ibd (peer &key (to (c:tip-height)) (batch 256) (verify-scripts t)
+(defun resume-ibd (peer &key (to (c:tip-height)) (batch 64) (verify-scripts t)
                              (save-every 25000) (progress-every 5000))
   "Resume IBD from the last on-disk chainstate checkpoint (or from genesis if
    none).  Saves periodically.  Returns (values last-height utxo)."
