@@ -27,6 +27,7 @@
   (:export
    #:eval-script #:verify-input #:script-error #:parse-script #:disassemble-script
    #:legacy-sighash #:bip143-sighash #:taproot-sighash #:parse-der-sig #:parse-pubkey
+   #:with-sighash-buffer
    #:verify-taproot #:tapleaf-hash
    #:+sighash-all+ #:+sighash-none+ #:+sighash-single+ #:+sighash-anyonecanpay+))
 
@@ -55,6 +56,17 @@
 
 (defparameter *flags* nil)
 (defvar *opcount* 0 "Non-push opcode count for the script being evaluated (limit 201).")
+
+;;; Per-thread reusable sighash serialization buffer.  The LEGACY sighash
+;;; re-serializes the whole tx for EVERY input (the pre-segwit O(n^2)); a fresh
+;;; writer per input was the dominant verify-path allocator on dense pre-segwit
+;;; blocks, driving stop-the-world GC that capped multicore IBD.  Each worker
+;;; thread binds its own buffer via WITH-SIGHASH-BUFFER and the sighash refills
+;;; it (fill-pointer 0) instead of consing.  NOT shared across threads.
+(defvar *sighash-buf* (w:make-writer))
+(defmacro with-sighash-buffer (&body body)
+  "Bind a fresh per-thread sighash buffer for BODY (wrap each verify worker)."
+  `(let ((*sighash-buf* (w:make-writer))) ,@body))
 (declaim (inline flag?))
 (defun flag? (f) (and (member f *flags*) t))
 
@@ -440,7 +452,8 @@
       (return-from legacy-sighash
         (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
           (setf (aref h 0) 1) h)))
-    (let ((wr (w:make-writer)))
+    (let ((wr *sighash-buf*))           ; per-thread reusable buffer (refill, don't cons)
+      (setf (fill-pointer wr) 0)
       (w:w-i32 wr (tx:tx-version transaction))
       ;; inputs
       (let ((ins (if anyonecanpay (list (nth in-index inputs)) inputs)))
@@ -479,7 +492,7 @@
            (w:w-bytes wr (tx:txout-script out)))))
       (w:w-u32 wr (tx:tx-locktime transaction))
       (w:w-u32 wr hashtype)            ; 4-byte hashtype appended
-      (w:hash256 (w:writer-bytes wr)))))
+      (w:hash256 wr))))                ; hash the buffer in place (no coerce copy)
 
 ;;; ----------------------------------------------------------------------------
 ;;; Sighash — BIP143 (segwit v0)

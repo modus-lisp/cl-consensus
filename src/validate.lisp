@@ -215,6 +215,7 @@
   "Worker: verify CHECKS[lo,hi) in this thread's own secp scratch, stopping
    early if another worker has already failed (ABORT)."
   (secp:with-fresh-scratch
+   (s:with-sighash-buffer
     (loop for i from lo below hi until (car abort) do
       (destructuring-bind (txn in-i script value tx-i) (aref checks i)
         (let ((bad (handler-case
@@ -225,7 +226,7 @@
           (when bad
             (setf (car abort) t)
             (bt:with-lock-held (lock)
-              (unless (car fail) (setf (car fail) bad (cdr fail) (list tx-i in-i))))))))))
+              (unless (car fail) (setf (car fail) bad (cdr fail) (list tx-i in-i)))))))))))
 
 (defun verify-block-scripts (checks flags &optional (workers *verify-workers*))
   "Run all script CHECKS (vector of (txn in-i script value tx-i)) under FLAGS.
@@ -316,6 +317,7 @@
 
 (defun vq-worker (vq)
   (secp:with-fresh-scratch
+   (s:with-sighash-buffer
     (loop
       (let ((job (vq-get vq)))
         (when (eq job :stop) (return))
@@ -329,7 +331,7 @@
               (when bad
                 (bt:with-lock-held ((vqueue-lock vq))
                   (unless (vqueue-failed vq) (setf (vqueue-failed vq) (list height tx-i in-i bad)))))))
-          (vq-complete vq height))))))
+          (vq-complete vq height)))))))
 
 (defun vq-sink (vq)
   "The CHECK-SINK closure for connect-block: register the height, enqueue jobs."
