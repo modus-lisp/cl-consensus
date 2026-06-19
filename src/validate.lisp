@@ -408,24 +408,34 @@
                    (dl0 (get-internal-real-time))
                    (blocks (blk:get-blocks peer hashes)))
               (incf dl (- (get-internal-real-time) dl0))
+              ;; structural checks (merkle/witness/weight/sigops) are pure block
+              ;; fns — run the whole batch across cores before the serial pass.
+              ;; cap structural threads so they don't oversubscribe vs the
+              ;; persistent verify pool (total threads <= cores).
+              (let ((sts (get-internal-real-time)))
+                (multiple-value-bind (ok bh msg) (prevalidate-structural blocks height (min 32 workers))
+                  (unless ok (cerr bh "~a" msg)))
+                (incf *cb-struct* (- (get-internal-real-time) sts)))
               (loop for b across blocks for h from height do
                 (unless b (cerr h "peer did not return block"))
                 (let ((cn0 (get-internal-real-time)))
-                  (prefetch-block-inputs utxo b)         ; parallel mmap lookups
                   (connect-block b h utxo
                                  :verify-scripts (>= h assumevalid-below)
-                                 :check-sink sink)
-                  (u:clear-prefetch utxo)
+                                 :check-sink sink :skip-structural t)
                   (incf cn (- (get-internal-real-time) cn0)))
                 (setf last h)
                 (when (zerop (mod h progress-every))
                   (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
-                    (format t "~&[ibd] height ~d  verified ~d  utxos ~d  total ~,4f BTC  ~,0f blk/s  [dl ~,1fs cn ~,1fs lag ~d]~%"
+                    (format t "~&[ibd] height ~d  verified ~d  utxos ~d  total ~,4f BTC  ~,0f blk/s  [dl ~,1f cn ~,1f loop ~,1f sink ~,1f lag ~d]~%"
                             h (vqueue-verified vq) (u:utxo-count utxo)
                             (/ (u:utxo-set-total-value utxo) 1d8)
                             (if (plusp secs) (/ (- h from -1) secs) 0)
                             (/ dl internal-time-units-per-second) (/ cn internal-time-units-per-second)
+                            (/ *cb-loop* internal-time-units-per-second) (/ *cb-sink* internal-time-units-per-second)
                             (- h (vqueue-verified vq)))
+                    (format t "       [struct ~,1f loop ~,1f sink ~,1f]~%"
+                            (/ *cb-struct* internal-time-units-per-second) (/ *cb-loop* internal-time-units-per-second)
+                            (/ *cb-sink* internal-time-units-per-second))
                     (force-output)))
                 (when (and save-every (zerop (mod h save-every)))
                   (loop until (vq-drained-p vq h) do (sleep 0.02))   ; verify catches up
@@ -440,7 +450,44 @@
           last)
         (ignore-errors (vq-stop vq))))))
 
-(defun connect-block (block height utxo &key (verify-scripts t) check-sink)
+(defvar *cb-loop* 0) (defvar *cb-sink* 0) (defvar *cb-struct* 0)   ; instrumentation
+
+(defun check-structural (block height)
+  "Block-only consensus checks (no UTXO / no ordering dependency): merkle root,
+   BIP141 witness commitment, weight, sigop cost.  Pure fn of (block,height), so
+   it parallelizes across a download batch.  Signals CONSENSUS-ERROR on failure."
+  (unless (blk:verify-merkle block) (cerr height "merkle root mismatch"))
+  (check-witness-commitment block height)
+  (let ((wt (block-weight block)))
+    (when (> wt *max-block-weight*) (cerr height "block weight ~d exceeds ~d" wt *max-block-weight*)))
+  (let ((so (count-sigops block)))
+    (when (> so *max-block-sigops*) (cerr height "sigop cost ~d exceeds ~d" so *max-block-sigops*))))
+
+(defun prevalidate-structural (blocks from-height &optional (workers *verify-workers*))
+  "Run check-structural on a batch of BLOCKS (heights FROM-HEIGHT..) across
+   WORKERS threads.  Returns (values ok height msg) — the first failing block, or
+   T.  One spawn set per BATCH (not per block), so thread overhead is amortised."
+  (let* ((n (length blocks)) (fail (cons nil nil)) (lock (bt:make-lock)))
+    (when (zerop n) (return-from prevalidate-structural (values t nil nil)))
+    (let* ((nw (max 1 (min workers n))) (per (ceiling n nw)) (threads '()))
+      (dotimes (w nw)
+        (let ((lo (* w per)) (hi (min n (* (1+ w) per))))
+          (when (< lo hi)
+            (push (bt:make-thread
+                   (let ((lo lo) (hi hi))
+                     (lambda ()
+                       (loop for i from lo below hi until (car fail) do
+                         (let ((b (aref blocks i)) (h (+ from-height i)))
+                           (when b
+                             (handler-case (check-structural b h)
+                               (consensus-error (e)
+                                 (bt:with-lock-held (lock)
+                                   (unless (car fail) (setf (car fail) h (cdr fail) (princ-to-string e))))))))))))
+                  threads))))
+      (mapc #'bt:join-thread threads))
+    (if (car fail) (values nil (car fail) (cdr fail)) (values t nil nil))))
+
+(defun connect-block (block height utxo &key (verify-scripts t) check-sink skip-structural)
   "Validate BLOCK at HEIGHT against UTXO and apply it.  Returns
    (values total-fees block-undo).  Signals CONSENSUS-ERROR on a rule violation.
    With CHECK-SINK (a function of (checks height flags)), the script checks are
@@ -454,19 +501,12 @@
          (coinbase-claimed 0)
          (checks '())                   ; deferred script-verification jobs
          (undo (make-block-undo)))
-    ;; merkle root must match the header (structural integrity)
-    (unless (blk:verify-merkle block)
-      (cerr height "merkle root mismatch"))
-    ;; segwit witness commitment (BIP141)
-    (check-witness-commitment block height)
-    ;; block weight limit (BIP141)
-    (let ((wt (block-weight block)))
-      (when (> wt *max-block-weight*)
-        (cerr height "block weight ~d exceeds ~d" wt *max-block-weight*)))
-    ;; sigop cost limit
-    (let ((so (count-sigops block)))
-      (when (> so *max-block-sigops*)
-        (cerr height "sigop cost ~d exceeds ~d" so *max-block-sigops*)))
+    ;; block-only structural checks — skipped here when already run in parallel
+    ;; across the batch (SKIP-STRUCTURAL); see PREVALIDATE-STRUCTURAL.
+    (unless skip-structural
+      (let ((%sts (get-internal-real-time)))
+        (check-structural block height)
+        (incf *cb-struct* (- (get-internal-real-time) %sts))))
     ;; coinbase structure + BIP34 (coinbase must encode its own height)
     (let ((cb (aref txs 0)))
       (unless (tx:tx-coinbase-p cb) (cerr height "first tx is not a coinbase"))
@@ -477,6 +517,7 @@
     ;; single pass, in order: validate a tx's inputs, then immediately add its
     ;; outputs — so a later tx may spend an earlier tx in the SAME block, but
     ;; not a later one (Bitcoin's ordering rule).
+    (let ((%ls (get-internal-real-time)))
     (loop for txn across txs
           for tx-i from 0
           for coinbase = (tx:tx-coinbase-p txn) do
@@ -533,6 +574,7 @@
                                    :script (tx:txout-script out)
                                    :height height :coinbase-p coinbase))
           (push (cons (tx:tx-txid txn) vout) (block-undo-created undo)))))
+    (incf *cb-loop* (- (get-internal-real-time) %ls)))
     ;; coinbase value check: claimed <= subsidy + fees
     (let ((allowed (+ (block-subsidy height) total-fees)))
       (when (> coinbase-claimed allowed)
@@ -541,7 +583,9 @@
     ;; script checks: hand to the async sink if present (register the height even
     ;; with zero checks, so the verified-watermark advances), else verify now.
     (if check-sink
-        (funcall check-sink (and verify-scripts (nreverse checks)) height flags)
+        (let ((%ss (get-internal-real-time)))
+          (funcall check-sink (and verify-scripts (nreverse checks)) height flags)
+          (incf *cb-sink* (- (get-internal-real-time) %ss)))
         (when (and verify-scripts checks)
           (multiple-value-bind (ok msg tx-i in-i)
               (verify-block-scripts (coerce (nreverse checks) 'vector) flags)
