@@ -13,12 +13,13 @@
 (defpackage #:cl-consensus.utxo
   (:use #:cl)
   (:nicknames #:btc-utxo)
-  (:local-nicknames (#:w #:cl-consensus.wire))
+  (:local-nicknames (#:w #:cl-consensus.wire) (#:d #:cl-consensus.utxo-disk))
   (:export
    #:coin #:make-coin #:coin-value #:coin-script #:coin-height #:coin-coinbase-p
    #:utxo-set #:make-utxo-set #:utxo-count #:utxo-set-total-value
    #:utxo-get #:utxo-add #:utxo-spend #:utxo-key #:utxo-digest
-   #:save-utxo #:load-utxo))
+   #:save-utxo #:load-utxo
+   #:open-disk-utxo #:flush-utxo #:close-utxo #:utxo-disk-p #:+udb-tip-capacity+))
 
 (in-package #:cl-consensus.utxo)
 
@@ -29,12 +30,15 @@
   coinbase-p)    ; t if from a coinbase tx (for maturity rule)
 
 (defstruct (utxo-set (:constructor %make-utxo-set))
-  ;; EQUALP map keyed by (txid-bytes . index): compares the 32 txid bytes by
-  ;; content + the integer index.  (Was a per-op `format`ed hex STRING key — the
-  ;; format/hex-encode dominated connect-block at ~16us/op and bloated memory.)
+  ;; In-RAM backend: EQUALP map keyed by (txid-bytes . index).
   (map (make-hash-table :test 'equalp :size 1024))
-  (total-value 0))
+  (total-value 0)
+  ;; Disk backend (when DISK is non-nil): the mmap committed table + an in-RAM
+  ;; STAGING buffer of changes since the last flush (a coin = added, :SPENT =
+  ;; removed).  COUNT/total are kept running; PATH is the meta-file path.
+  (disk nil) (staging nil) (count 0) (path nil))
 
+(defun utxo-disk-p (set) (and (utxo-set-disk set) t))
 (defun make-utxo-set () (%make-utxo-set))
 
 (declaim (inline utxo-key))
@@ -44,25 +48,102 @@
    the cons, no string formatting."
   (cons txid-bytes index))
 
-(defun utxo-count (set) (hash-table-count (utxo-set-map set)))
+(defun utxo-count (set)
+  (if (utxo-set-disk set) (utxo-set-count set) (hash-table-count (utxo-set-map set))))
 
 (defun utxo-get (set txid-bytes index)
-  (gethash (utxo-key txid-bytes index) (utxo-set-map set)))
+  (if (utxo-set-disk set)
+      (let ((st (gethash (utxo-key txid-bytes index) (utxo-set-staging set) :miss)))
+        (cond ((eq st :spent) nil)
+              ((eq st :miss)
+               (multiple-value-bind (found v h cb s) (d:udb-get (utxo-set-disk set) txid-bytes index)
+                 (and found (make-coin :value v :height h :coinbase-p cb :script s))))
+              (t st)))                  ; staged fresh coin
+      (gethash (utxo-key txid-bytes index) (utxo-set-map set))))
 
 (defun utxo-add (set txid-bytes index coin)
-  (setf (gethash (utxo-key txid-bytes index) (utxo-set-map set)) coin)
+  (cond
+    ((utxo-set-disk set)
+     (setf (gethash (utxo-key txid-bytes index) (utxo-set-staging set)) coin)
+     (incf (utxo-set-count set)))
+    (t (setf (gethash (utxo-key txid-bytes index) (utxo-set-map set)) coin)))
   (incf (utxo-set-total-value set) (coin-value coin))
   coin)
 
 (defun utxo-spend (set txid-bytes index)
   "Remove and return the coin at this outpoint, or NIL if absent (double-spend
    / missing input — the caller treats NIL as a consensus failure)."
-  (let* ((key (utxo-key txid-bytes index))
-         (coin (gethash key (utxo-set-map set))))
-    (when coin
-      (remhash key (utxo-set-map set))
-      (decf (utxo-set-total-value set) (coin-value coin)))
-    coin))
+  (if (utxo-set-disk set)
+      (let* ((key (utxo-key txid-bytes index))
+             (st (gethash key (utxo-set-staging set) :miss)))
+        (cond
+          ((eq st :spent) nil)
+          ((eq st :miss)                ; spend a coin that lives in the mmap
+           (multiple-value-bind (found v h cb s) (d:udb-get (utxo-set-disk set) txid-bytes index)
+             (when found
+               (setf (gethash key (utxo-set-staging set)) :spent)
+               (decf (utxo-set-total-value set) v) (decf (utxo-set-count set))
+               (make-coin :value v :height h :coinbase-p cb :script s))))
+          (t                            ; spend a still-staged fresh coin (never flushed)
+           (remhash key (utxo-set-staging set))
+           (decf (utxo-set-total-value set) (coin-value st)) (decf (utxo-set-count set))
+           st)))
+      (let* ((key (utxo-key txid-bytes index))
+             (coin (gethash key (utxo-set-map set))))
+        (when coin
+          (remhash key (utxo-set-map set))
+          (decf (utxo-set-total-value set) (coin-value coin)))
+        coin)))
+
+;;; ----------------------------------------------------------------------------
+;;; Disk backend: open / flush / close + the on-disk marker (height, totals).
+;;; ----------------------------------------------------------------------------
+
+(defconstant +udb-tip-capacity+ 500000003
+  "Open-addressing slots — sized ~2.5x the ~180M-coin tip set (a sparse mmap;
+   the OS only pages live regions).")
+
+(defun open-disk-utxo (udb-path &optional (capacity +udb-tip-capacity+))
+  "Open/create the disk-backed UTXO at UDB-PATH (+ .ovf + .meta).  Returns
+   (values utxo-set height) — height 0 for a fresh store, else the marker."
+  (let* ((db (d:open-udb udb-path capacity))
+         (meta-path (concatenate 'string (namestring udb-path) ".meta"))
+         (height 0) (total 0) (count 0))
+    (when (probe-file meta-path)
+      (with-open-file (s meta-path :element-type '(unsigned-byte 8))
+        (let* ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+          (read-sequence v s)
+          (let ((r (w:make-reader v)))
+            (setf height (w:r-u32 r) total (w:r-u64 r) count (w:r-u64 r))
+            (setf (d::udb-count db) count)))))
+    (values (%make-utxo-set :disk db :staging (make-hash-table :test 'equalp)
+                            :total-value total :count count :path meta-path)
+            height)))
+
+(defun flush-utxo (set height)
+  "Apply the staging buffer to the mmap, msync, and atomically write the marker
+   at HEIGHT — leaving the on-disk store consistent at a verified height."
+  (let ((db (utxo-set-disk set)))
+    (maphash (lambda (key v)
+               (let ((txid (car key)) (index (cdr key)))
+                 (if (eq v :spent)
+                     (d:udb-del db txid index)
+                     (d:udb-put db txid index (coin-value v) (coin-height v)
+                                (coin-coinbase-p v) (coin-script v)))))
+             (utxo-set-staging set))
+    (clrhash (utxo-set-staging set))
+    (d:udb-sync db)
+    ;; marker: temp file + rename = atomic commit point
+    (let ((wr (w:make-writer)) (tmp (concatenate 'string (utxo-set-path set) ".tmp")))
+      (w:w-u32 wr height) (w:w-u64 wr (utxo-set-total-value set)) (w:w-u64 wr (utxo-set-count set))
+      (with-open-file (s tmp :direction :output :element-type '(unsigned-byte 8)
+                             :if-exists :supersede :if-does-not-exist :create)
+        (write-sequence (w:writer-bytes wr) s))
+      (rename-file tmp (utxo-set-path set)))
+    height))
+
+(defun close-utxo (set)
+  (when (utxo-set-disk set) (d:close-udb (utxo-set-disk set))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Order-independent set digest — an additive (MuHash-style) commitment to the
@@ -85,10 +166,21 @@
 
 (defun utxo-digest (set)
   "A 32-byte order-independent digest of the whole set (sum of per-coin
-   commitments mod 2^256)."
-  (let ((acc 0))
-    (maphash (lambda (k c) (setf acc (mod (+ acc (coin-commitment k c)) (ash 1 256))))
-             (utxo-set-map set))
+   commitments mod 2^256).  For the disk backend, combines the committed mmap
+   slots with the staging buffer (staged spends mask mmap coins)."
+  (let ((acc 0) (m (ash 1 256)))
+    (flet ((add (k c) (setf acc (mod (+ acc (coin-commitment k c)) m))))
+      (cond
+        ((utxo-set-disk set)
+         (let ((staging (utxo-set-staging set)))
+           ;; committed mmap coins not overridden by a staged spend/re-add
+           (d:udb-map-slots (utxo-set-disk set)
+             (lambda (txid index v h cb s)
+               (unless (nth-value 1 (gethash (cons txid index) staging))   ; in staging? skip (handled below)
+                 (add (cons txid index) (make-coin :value v :height h :coinbase-p cb :script s)))))
+           ;; staged fresh adds (coins); staged :spent contribute nothing
+           (maphash (lambda (k v) (unless (eq v :spent) (add k v))) staging)))
+        (t (maphash #'add (utxo-set-map set)))))
     (let ((out (make-array 32 :element-type '(unsigned-byte 8))))
       (dotimes (i 32 out) (setf (aref out i) (logand (ash acc (* -8 i)) #xff))))))
 
@@ -98,6 +190,8 @@
 ;;; ----------------------------------------------------------------------------
 
 (defun save-utxo (set path height)
+  (when (utxo-set-disk set)            ; disk backend: flush + marker, ignore PATH
+    (return-from save-utxo (flush-utxo set height)))
   (ensure-directories-exist path)
   (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
                           :if-exists :supersede :if-does-not-exist :create)

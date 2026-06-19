@@ -20,7 +20,8 @@
      (:file "tx")          ; transactions (legacy + segwit), txid/wtxid
      (:file "peer")        ; P2P: handshake, message loop
      (:file "chain")       ; header chain: PoW, retarget, MTP, sync
-     (:file "utxo")        ; UTXO set
+     (:file "utxo-disk")   ; mmap open-addressing slot table (disk UTXO core)
+     (:file "utxo")        ; UTXO set (in-RAM + disk-backed via utxo-disk)
      (:file "block")       ; block parse, merkle root, block download
      (:file "script")      ; the Script interpreter + sighash (the consensus core)
      (:file "validate")    ; connect/disconnect-block, consensus rules, IBD
