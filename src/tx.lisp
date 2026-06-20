@@ -18,6 +18,7 @@
   (:export
    #:tx #:make-tx #:tx-version #:tx-inputs #:tx-outputs #:tx-witnesses #:tx-locktime
    #:tx-segwit-p #:tx-txid #:tx-wtxid #:tx-base-size #:tx-total-size
+   #:tx-bip143-hp #:tx-bip143-hs #:tx-bip143-ho #:compute-bip143-midstate
    #:tx-weight #:tx-vsize #:tx-coinbase-p #:finalize-tx
    #:txin #:make-txin #:txin-prev-hash #:txin-prev-index #:txin-script #:txin-sequence
    #:txout #:make-txout #:txout-value #:txout-script
@@ -45,7 +46,13 @@
   txid           ; 32-byte (internal LE)
   wtxid
   base-size      ; legacy serialization length
-  total-size)    ; full (segwit) serialization length
+  total-size     ; full (segwit) serialization length
+  ;; BIP143 midstate (SIGHASH_ALL case): hashPrevouts/hashSequence/hashOutputs
+  ;; are over ALL inputs/outputs — identical for every input of the tx.  Computed
+  ;; ONCE at parse (single-threaded) and cached so concurrent verify workers read
+  ;; rather than recompute it per-input (was O(n^2) hashing+allocation, the
+  ;; dominant allocator that drove SBCL's threaded GC to corrupt under load).
+  bip143-hp bip143-hs bip143-ho)
 
 ;;; ----------------------------------------------------------------------------
 ;;; Serialization
@@ -138,11 +145,30 @@
               (tx-wtxid tx) (if segwit
                                 (w:hash256 (subseq (cl-consensus.wire::reader-buf r) start end))
                                 (tx-txid tx))))
+      ;; precompute the BIP143 midstate for segwit txs (single-threaded here)
+      (when segwit (compute-bip143-midstate tx))
       tx)))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Derived quantities
 ;;; ----------------------------------------------------------------------------
+
+(defun compute-bip143-midstate (tx)
+  "Compute & cache the SIGHASH_ALL BIP143 midstate (hashPrevouts, hashSequence,
+   hashOutputs) — each over all inputs/outputs, identical for every input.  Done
+   once, single-threaded; concurrent verify workers then read the cache."
+  (let ((wp (w:make-writer)) (ws (w:make-writer)) (wo (w:make-writer)))
+    (dolist (in (tx-inputs tx))
+      (w:w-hash wp (txin-prev-hash in)) (w:w-u32 wp (txin-prev-index in))
+      (w:w-u32 ws (txin-sequence in)))
+    (dolist (out (tx-outputs tx))
+      (w:w-i64 wo (txout-value out))
+      (w:w-varint wo (length (txout-script out)))
+      (w:w-bytes wo (txout-script out)))
+    (setf (tx-bip143-hp tx) (w:hash256 (w:writer-bytes wp))
+          (tx-bip143-hs tx) (w:hash256 (w:writer-bytes ws))
+          (tx-bip143-ho tx) (w:hash256 (w:writer-bytes wo))))
+  tx)
 
 (defun finalize-tx (tx)
   "Compute txid/wtxid/sizes for a hand-built TX (PARSE-TX already does this for
