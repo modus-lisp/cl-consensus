@@ -10,7 +10,8 @@
   (:use #:cl)
   (:nicknames #:btc-discovery)
   (:local-nicknames (#:p #:cl-consensus.peer) (#:am #:cl-consensus.addrman) (#:w #:cl-consensus.wire))
-  (:export #:*dns-seeds* #:seed-from-dns #:connect-n #:discover-peers))
+  (:export #:*dns-seeds* #:seed-from-dns #:try-connect #:connect-n
+           #:make-peer-source #:discover-peers))
 
 (in-package #:cl-consensus.discovery)
 
@@ -38,30 +39,59 @@
       (dolist (ip (%resolve-a host))
         (when (am:addrman-add am ip port) (incf added))))))
 
-(defun connect-n (n &key (am am:*addrman*) (start-height 0) (timeout 8) (max-attempts (* 6 n)))
-  "Dial up to N untried addresses from AM; return the live peers (dead/unreachable
-   candidates are skipped).  Bounded by MAX-ATTEMPTS so a run of bad addresses
-   can't loop forever."
+(defun try-connect (host port &key (start-height 0) (timeout 8) (require-network t) (min-height 0))
+  "Dial one address; return a live peer, or NIL on failure / wrong services / too
+   far behind.  IBD of historical blocks needs NODE_NETWORK (full, unpruned)
+   peers — pruned nodes can't serve old blocks — and the peer must itself be
+   synced past the heights we want (MIN-HEIGHT), else it can't serve them."
+  (handler-case
+      (let ((peer (p:connect-peer host :port port :start-height start-height :timeout timeout)))
+        (cond
+          ((and require-network (not (logtest (p:peer-services peer) w:+services-network+)))
+           (p:disconnect peer) nil)       ; pruned / non-archive: can't serve history
+          ((< (or (p:peer-height peer) 0) min-height)
+           (p:disconnect peer) nil)       ; peer itself not synced past our target
+          (t (format t "~&[discovery] +peer ~a:~d h~a ~a~%"
+                     host port (p:peer-height peer) (p:peer-subver peer)) (force-output)
+             peer)))
+    (serious-condition () nil)))           ; unreachable / handshake failed
+
+(defun connect-n (n &key (am am:*addrman*) (start-height 0) (timeout 8)
+                         (max-attempts (* 12 n)) (require-network t) (min-height 0))
+  "Dial up to N untried NODE_NETWORK addresses from AM; return the live peers.
+   Bounded by MAX-ATTEMPTS so a run of pruned/dead addresses can't loop forever."
   (let ((peers '()) (attempts 0))
     (loop while (and (< (length peers) n) (< attempts max-attempts)) do
-      (let ((cands (am:addrman-take am (- n (length peers)))))
+      (let ((cands (am:addrman-take am (max 1 (- n (length peers))))))
         (when (null cands) (return))
         (dolist (hp cands)
           (when (>= (length peers) n) (return))
           (incf attempts)
-          (handler-case
-              (let ((peer (p:connect-peer (car hp) :port (cdr hp)
-                                          :start-height start-height :timeout timeout)))
-                (push peer peers)
-                (format t "~&[discovery] +peer ~a:~d (height ~a)~%"
-                        (car hp) (cdr hp) (p:peer-height peer)) (force-output))
-            (serious-condition () nil)))))   ; unreachable / handshake failed: skip
+          (let ((peer (try-connect (car hp) (cdr hp) :start-height start-height
+                                   :timeout timeout :require-network require-network
+                                   :min-height min-height)))
+            (when peer (push peer peers))))))
     (nreverse peers)))
 
+(defun make-peer-source (&key (am am:*addrman*) (start-height 0) (timeout 8)
+                              (require-network t) (min-height 0))
+  "Return a thunk that yields ONE fresh live NODE_NETWORK peer from AM (or NIL when
+   exhausted).  Passed to RUN-IBD-ASYNC so a fetcher whose peer dies can pull a
+   replacement instead of aborting the whole run."
+  (lambda ()
+    (loop for tries from 0 below 24
+          for hp = (first (am:addrman-take am 1))
+          while hp
+          for peer = (try-connect (car hp) (cdr hp) :start-height start-height
+                                  :timeout timeout :require-network require-network
+                                  :min-height min-height)
+          when peer do (return peer)
+          finally (return nil))))
+
 (defun discover-peers (n &key (am am:*addrman*) (start-height 0) bootstrap)
-  "Return up to N live peer connections.  Seeds AM from DNS when empty, and — if a
-   BOOTSTRAP peer is given — asks it for addresses (getaddr) first, so a local
-   node can supply the network without DNS."
+  "Return up to N live NODE_NETWORK peer connections.  Seeds AM from DNS when
+   empty, and — if a BOOTSTRAP peer is given — asks it for addresses (getaddr)
+   first, so a local node can supply the network without DNS."
   (when bootstrap
     (p:enable-discovery bootstrap (lambda (hp) (am:addrman-add am (car hp) (cdr hp))))
     (sleep 3))                            ; let the addr/addrv2 reply arrive

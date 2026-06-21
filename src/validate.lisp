@@ -422,38 +422,56 @@
   ;; fetchers) so no party starves.  State changes are per-batch, so this is cheap.
   (dotimes (i (1+ (ibd-q-nthreads q))) (bt:condition-notify (ibd-q-cv q))))
 
-(defun ibd-fetcher (q peer batch to)
-  "Claim successive batch ranges from the shared cursor, download each from PEER
-   (outside the lock), deposit into the reorder buffer under backpressure."
-  (loop
-    (let (lo hi)
-      (bt:with-lock-held ((ibd-q-lock q))
-        (when (or (ibd-q-err q) (> (ibd-q-next-lo q) to))
-          (decf (ibd-q-live q)) (%ibd-wake-all q) (return))
-        (setf lo (ibd-q-next-lo q)
-              hi (min to (+ lo batch -1))
-              (ibd-q-next-lo q) (1+ hi)))
-      (let ((blocks
-              (handler-case
-                  (blk:get-blocks peer
-                    (loop for x from lo to hi collect (c:header-hash (c:header-at-height x))))
-                (serious-condition (e)
-                  (bt:with-lock-held ((ibd-q-lock q))
-                    (unless (ibd-q-err q) (setf (ibd-q-err q) e))
-                    (decf (ibd-q-live q)) (%ibd-wake-all q))
-                  (return)))))
-        (bt:with-lock-held ((ibd-q-lock q))
-          ;; backpressure: wait for a slot, UNLESS this is the batch the consumer
-          ;; is starving for (lo = expected) — that one is always admitted, which
-          ;; (with max-inflight >= nthreads) makes deadlock impossible.
-          (loop until (or (ibd-q-err q)
-                          (< (ibd-q-inflight q) (ibd-q-max-inflight q))
-                          (= lo (ibd-q-expected q)))
-                do (bt:condition-wait (ibd-q-cv q) (ibd-q-lock q)))
-          (when (ibd-q-err q) (decf (ibd-q-live q)) (%ibd-wake-all q) (return))
-          (setf (gethash lo (ibd-q-ready q)) (cons hi blocks))
-          (incf (ibd-q-inflight q))
-          (%ibd-wake-all q))))))
+(defun ibd-fetcher (q peer0 batch to &optional peer-source)
+  "Claim successive batch ranges from the shared cursor, download each from this
+   fetcher's peer (outside the lock), deposit into the reorder buffer in order.
+   On peer failure, if PEER-SOURCE is given, disconnect the dead peer and pull a
+   fresh one to retry the SAME range (so one flaky public peer doesn't abort the
+   run); only abort when no replacement is available."
+  (let ((peer peer0))
+    (block fetcher
+      (loop
+        (let (lo hi)
+          (bt:with-lock-held ((ibd-q-lock q))
+            (when (or (ibd-q-err q) (> (ibd-q-next-lo q) to))
+              (decf (ibd-q-live q)) (%ibd-wake-all q) (return-from fetcher))
+            (setf lo (ibd-q-next-lo q)
+                  hi (min to (+ lo batch -1))
+                  (ibd-q-next-lo q) (1+ hi)))
+          (let ((hashes (loop for x from lo to hi collect (c:header-hash (c:header-at-height x))))
+                (blocks nil))
+            ;; download this range, swapping the peer out on failure
+            (loop
+              (when (ibd-q-err q) (return-from fetcher))
+              (setf blocks (handler-case (blk:get-blocks peer hashes :timeout 30 :retries 3)
+                             (serious-condition () nil)))
+              (when blocks (return))                ; got the batch
+              (ignore-errors (p:disconnect peer))   ; dead peer
+              (let ((repl (and peer-source (funcall peer-source))))
+                (cond
+                  (repl (setf peer repl)
+                        (format t "~&[ibd] fetcher swapped in fresh peer ~a:~d~%"
+                                (p:peer-host repl) (p:peer-port repl)) (force-output))
+                  (t (bt:with-lock-held ((ibd-q-lock q))
+                       (unless (ibd-q-err q)
+                         (setf (ibd-q-err q)
+                               (make-condition 'simple-error
+                                 :format-control "no live peer to fetch heights ~d-~d"
+                                 :format-arguments (list lo hi))))
+                       (decf (ibd-q-live q)) (%ibd-wake-all q))
+                     (return-from fetcher)))))
+            (bt:with-lock-held ((ibd-q-lock q))
+              ;; backpressure: wait for a slot, UNLESS this is the batch the consumer
+              ;; is starving for (lo = expected) — that one is always admitted, which
+              ;; (with max-inflight >= nthreads) makes deadlock impossible.
+              (loop until (or (ibd-q-err q)
+                              (< (ibd-q-inflight q) (ibd-q-max-inflight q))
+                              (= lo (ibd-q-expected q)))
+                    do (bt:condition-wait (ibd-q-cv q) (ibd-q-lock q)))
+              (when (ibd-q-err q) (decf (ibd-q-live q)) (%ibd-wake-all q) (return-from fetcher))
+              (setf (gethash lo (ibd-q-ready q)) (cons hi blocks))
+              (incf (ibd-q-inflight q))
+              (%ibd-wake-all q))))))))
 
 (defun ibd-pull (q)
   "Block until the batch starting at EXPECTED is ready; return (values bh blocks),
@@ -476,7 +494,7 @@
 (defun run-ibd-async (peer-or-peers utxo &key (from 1) (to (c:tip-height)) (batch 64)
                                      (assumevalid-below 0) (save-every 10000)
                                      (workers 100) (progress-every 1000) (maxq 8192)
-                                     max-inflight)
+                                     max-inflight peer-source)
   "Pipelined IBD: N fetcher threads (one per peer in PEER-OR-PEERS — pass a single
    peer or a list) download blocks in parallel while connect runs them in order
    and WORKERS verify scripts asynchronously across all cores.  Below
@@ -496,7 +514,7 @@
                    (vq-stop vq) (cerr h "tx ~d input ~d: ~a" ti ii msg)))))
       (let ((fetchers
               (loop for peer in peers collect
-                (bt:make-thread (let ((peer peer)) (lambda () (ibd-fetcher q peer batch to)))
+                (bt:make-thread (let ((peer peer)) (lambda () (ibd-fetcher q peer batch to peer-source)))
                                 :name "ibd-fetch"))))
         (unwind-protect
           (progn
