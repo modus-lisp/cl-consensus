@@ -16,7 +16,8 @@
   (:export
    #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
    #:peer-services #:peer-alive-p #:peer-connected-at
-   #:connect-peer #:disconnect #:send #:on #:peer-log
+   #:connect-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
+   #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
    #:*default-user-agent* #:*protocol-version*))
 
 (in-package #:cl-consensus.peer)
@@ -148,9 +149,12 @@
     ((string= command "ping")
      (send p "pong" payload) t)          ; echo the nonce
     ((member command '("alert" "feefilter" "sendheaders" "sendcmpct"
-                       "addr" "addrv2" "getheaders" "wtxidrelay")
+                       "getheaders" "wtxidrelay")
              :test #'string=)
      t)                                   ; ignore for now
+    ;; NOTE: "addr"/"addrv2" are intentionally NOT swallowed here — they dispatch
+    ;; to a registered handler (peer discovery, see ENABLE-DISCOVERY); with no
+    ;; handler installed, DISPATCH simply no-ops, so this stays safe by default.
     (t nil)))
 
 (defun read-loop (p)
@@ -223,7 +227,54 @@
 (defun disconnect (p)
   (setf (peer-alive p) nil)
   (ignore-errors (usocket:socket-close (peer-socket p)))
+  ;; The read-loop may be parked in a blocking read with the idle timeout cleared
+  ;; (see CONNECT-PEER); closing the socket from another thread does not reliably
+  ;; unblock that read, so join with a bounded timeout and move on rather than
+  ;; hang forever.  A leftover thread dies when its read finally errors / at exit.
   (when (and (peer-thread p) (bt:thread-alive-p (peer-thread p))
              (not (eq (peer-thread p) (bt:current-thread))))
-    (ignore-errors (bt:join-thread (peer-thread p))))
+    (ignore-errors (sb-thread:join-thread (peer-thread p) :timeout 3 :default nil)))
+  p)
+
+;;; ----------------------------------------------------------------------------
+;;; Peer discovery: ask a peer for its known addresses (getaddr -> addr/addrv2).
+;;; ----------------------------------------------------------------------------
+
+(defun send-getaddr (p) (send p "getaddr" #()))
+
+(defun parse-addr-payload (payload)
+  "addr message: varint count + entries[time u32, services u64, ip16, port u16BE].
+   Returns a list of (host . port) for the IPv4 entries (others skipped)."
+  (let ((r (w:make-reader payload)) (out '()))
+    (let ((n (w:r-varint r)))
+      (dotimes (i n)
+        (let ((a (w:r-netaddr r :with-time t))) (when a (push a out)))))
+    out))
+
+(defun parse-addrv2-payload (payload)
+  "addrv2 (BIP155): varint count + entries[time u32, services varint, netID u8,
+   addrlen varint, addr, port u16BE].  Returns (host . port) for IPv4 (netID 1)."
+  (let ((r (w:make-reader payload)) (out '()))
+    (let ((n (w:r-varint r)))
+      (dotimes (i n)
+        (w:r-u32 r)                      ; time
+        (w:r-varint r)                   ; services
+        (let* ((netid (w:r-u8 r)) (len (w:r-varint r))
+               (addr (w:r-bytes r len)) (port (w:r-port-be r)))
+          (when (and (= netid 1) (= len 4))   ; IPV4
+            (push (cons (format nil "~d.~d.~d.~d"
+                                (aref addr 0) (aref addr 1) (aref addr 2) (aref addr 3))
+                        port)
+                  out)))))
+    out))
+
+(defun enable-discovery (p sink)
+  "Register addr/addrv2 handlers on P that feed parsed (host . port) pairs to
+   SINK (a function of one (host . port)), and send getaddr.  SINK is typically
+   ADDRMAN-ADD bound to the process address pool."
+  (on p "addr"   (lambda (pr payload) (declare (ignore pr))
+                   (dolist (hp (parse-addr-payload payload)) (funcall sink hp))))
+  (on p "addrv2" (lambda (pr payload) (declare (ignore pr))
+                   (dolist (hp (parse-addrv2-payload payload)) (funcall sink hp))))
+  (send-getaddr p)
   p)

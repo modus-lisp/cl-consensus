@@ -24,6 +24,7 @@
    #:make-reader #:reader-eof-p #:reader-pos #:reader-remaining
    #:r-u8 #:r-u16 #:r-u32 #:r-u64 #:r-i32 #:r-i64
    #:r-bytes #:r-varint #:r-varstr #:r-hash #:r-bool #:r-rest
+   #:r-port-be #:r-netaddr #:ip16->ipv4
    ;; message envelope
    #:encode-message #:checksum
    ;; network params
@@ -236,6 +237,25 @@
   (let* ((n (r-varint r))
          (bytes (r-bytes r n)))
     (map 'string #'code-char bytes)))
+
+(defun r-port-be (r)
+  "Read a big-endian u16 port (the one BE field in net_addr)."
+  (let ((hi (r-u8 r)) (lo (r-u8 r))) (logior (ash hi 8) lo)))
+
+(defun ip16->ipv4 (bytes)
+  "If BYTES (16) is an IPv4-mapped IPv6 (10x00, ff ff, a.b.c.d) return the dotted
+   string; else NIL (native IPv6/Tor/I2P — skipped in v1)."
+  (when (and (loop for i below 10 always (zerop (aref bytes i)))
+             (= #xff (aref bytes 10)) (= #xff (aref bytes 11)))
+    (format nil "~d.~d.~d.~d" (aref bytes 12) (aref bytes 13) (aref bytes 14) (aref bytes 15))))
+
+(defun r-netaddr (r &key with-time)
+  "Read one net_addr entry (addr-message form has WITH-TIME).  Returns
+   (host . port) for an IPv4 entry, else NIL (skipped address family)."
+  (when with-time (r-u32 r))
+  (r-u64 r)                              ; services
+  (let* ((ip (r-bytes r 16)) (port (r-port-be r)) (host (ip16->ipv4 ip)))
+    (when host (cons host port))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Message envelope:  magic(4) command(12) length(4) checksum(4) payload

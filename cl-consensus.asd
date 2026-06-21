@@ -19,6 +19,8 @@
      (:file "wire")        ; serialization, message envelope, network params
      (:file "tx")          ; transactions (legacy + segwit), txid/wtxid
      (:file "peer")        ; P2P: handshake, message loop
+     (:file "addrman")     ; address pool (dedup) for peer discovery
+     (:file "discovery")   ; DNS seeds + getaddr-driven peer pool
      (:file "chain")       ; header chain: PoW, retarget, MTP, sync
      (:file "utxo-disk")   ; mmap open-addressing slot table (disk UTXO core)
      (:file "utxo")        ; UTXO set (in-RAM + disk-backed via utxo-disk)
