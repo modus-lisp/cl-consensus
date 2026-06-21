@@ -217,9 +217,9 @@
   (secp:with-fresh-scratch
    (s:with-sighash-buffer
     (loop for i from lo below hi until (car abort) do
-      (destructuring-bind (txn in-i script value tx-i) (aref checks i)
+      (destructuring-bind (txn in-i script value tx-i prevouts) (aref checks i)
         (let ((bad (handler-case
-                       (unless (s:verify-input txn in-i script value :flags flags)
+                       (unless (s:verify-input txn in-i script value :flags flags :prevouts prevouts)
                          "script verification failed")
                      (s:script-error (e) (princ-to-string e))
                      (error (e) (princ-to-string e)))))
@@ -363,9 +363,9 @@
         (destructuring-bind (height flags k . checks) job
           (unless (vqueue-failed vq)
             (dolist (c checks)
-              (destructuring-bind (txn in-i script value tx-i) c
+              (destructuring-bind (txn in-i script value tx-i prevouts) c
                 (let ((bad (handler-case
-                               (unless (s:verify-input txn in-i script value :flags flags)
+                               (unless (s:verify-input txn in-i script value :flags flags :prevouts prevouts)
                                  "script verification failed")
                              (s:script-error (e) (princ-to-string e))
                              (error (e) (princ-to-string e)))))
@@ -401,82 +401,151 @@
   (dotimes (i (length (vqueue-workers vq))) (vq-put vq :stop))
   (mapc #'bt:join-thread (vqueue-workers vq)))
 
-(defun run-ibd-async (peer utxo &key (from 1) (to (c:tip-height)) (batch 64)
+;;; ----------------------------------------------------------------------------
+;;; Parallel ordered download queue.  N fetcher threads (each on its OWN peer
+;;; connection — get-blocks installs one "block" handler per peer) claim batch
+;;; ranges from a shared cursor and download concurrently; the consumer pulls
+;;; batches back in STRICT height order via a reorder buffer.  One lock + one
+;;; condition var; predicates re-checked after every wake.
+;;; ----------------------------------------------------------------------------
+(defstruct (ibd-q (:constructor %make-ibd-q))
+  (lock (bt:make-lock)) (cv (bt:make-condition-variable))
+  (next-lo 0) (to 0) (batch 64)
+  (expected 0)
+  (ready (make-hash-table))             ; batch-lo -> (cons hi blocks)
+  (inflight 0) (max-inflight 8)         ; downloaded-but-not-consumed batches
+  (live 0) (nthreads 1)                 ; fetchers still running
+  (err nil))
+
+(defun %ibd-wake-all (q)
+  ;; bt:condition-notify wakes one waiter; wake every known waiter (consumer + N
+  ;; fetchers) so no party starves.  State changes are per-batch, so this is cheap.
+  (dotimes (i (1+ (ibd-q-nthreads q))) (bt:condition-notify (ibd-q-cv q))))
+
+(defun ibd-fetcher (q peer batch to)
+  "Claim successive batch ranges from the shared cursor, download each from PEER
+   (outside the lock), deposit into the reorder buffer under backpressure."
+  (loop
+    (let (lo hi)
+      (bt:with-lock-held ((ibd-q-lock q))
+        (when (or (ibd-q-err q) (> (ibd-q-next-lo q) to))
+          (decf (ibd-q-live q)) (%ibd-wake-all q) (return))
+        (setf lo (ibd-q-next-lo q)
+              hi (min to (+ lo batch -1))
+              (ibd-q-next-lo q) (1+ hi)))
+      (let ((blocks
+              (handler-case
+                  (blk:get-blocks peer
+                    (loop for x from lo to hi collect (c:header-hash (c:header-at-height x))))
+                (serious-condition (e)
+                  (bt:with-lock-held ((ibd-q-lock q))
+                    (unless (ibd-q-err q) (setf (ibd-q-err q) e))
+                    (decf (ibd-q-live q)) (%ibd-wake-all q))
+                  (return)))))
+        (bt:with-lock-held ((ibd-q-lock q))
+          ;; backpressure: wait for a slot, UNLESS this is the batch the consumer
+          ;; is starving for (lo = expected) — that one is always admitted, which
+          ;; (with max-inflight >= nthreads) makes deadlock impossible.
+          (loop until (or (ibd-q-err q)
+                          (< (ibd-q-inflight q) (ibd-q-max-inflight q))
+                          (= lo (ibd-q-expected q)))
+                do (bt:condition-wait (ibd-q-cv q) (ibd-q-lock q)))
+          (when (ibd-q-err q) (decf (ibd-q-live q)) (%ibd-wake-all q) (return))
+          (setf (gethash lo (ibd-q-ready q)) (cons hi blocks))
+          (incf (ibd-q-inflight q))
+          (%ibd-wake-all q))))))
+
+(defun ibd-pull (q)
+  "Block until the batch starting at EXPECTED is ready; return (values bh blocks),
+   or (values :done nil) at end-of-stream.  Re-signals the first fetch error."
+  (bt:with-lock-held ((ibd-q-lock q))
+    (loop
+      (when (ibd-q-err q) (error (ibd-q-err q)))
+      (let ((cell (gethash (ibd-q-expected q) (ibd-q-ready q))))
+        (when cell
+          (remhash (ibd-q-expected q) (ibd-q-ready q))
+          (let ((bh (ibd-q-expected q)) (hi (car cell)) (blocks (cdr cell)))
+            (setf (ibd-q-expected q) (1+ hi))
+            (decf (ibd-q-inflight q))
+            (%ibd-wake-all q)
+            (return-from ibd-pull (values bh blocks)))))
+      (when (and (> (ibd-q-next-lo q) (ibd-q-to q)) (zerop (ibd-q-live q)))
+        (return-from ibd-pull (values :done nil)))
+      (bt:condition-wait (ibd-q-cv q) (ibd-q-lock q)))))
+
+(defun run-ibd-async (peer-or-peers utxo &key (from 1) (to (c:tip-height)) (batch 64)
                                      (assumevalid-below 0) (save-every 10000)
-                                     (workers 100) (progress-every 1000) (maxq 8192))
-  "Pipelined IBD: connect blocks in order (UTXO inline) while WORKERS verify
-   scripts asynchronously across all cores.  Below ASSUMEVALID-BELOW scripts are
-   skipped.  Checkpoints (every SAVE-EVERY) drain to a fully-verified height
-   first.  Returns the last verified height."
-  (let* ((vq (make-vqueue :maxq maxq :workers workers))
+                                     (workers 100) (progress-every 1000) (maxq 8192)
+                                     max-inflight)
+  "Pipelined IBD: N fetcher threads (one per peer in PEER-OR-PEERS — pass a single
+   peer or a list) download blocks in parallel while connect runs them in order
+   and WORKERS verify scripts asynchronously across all cores.  Below
+   ASSUMEVALID-BELOW scripts are skipped.  Checkpoints (every SAVE-EVERY) drain to
+   a fully-verified height first.  Returns the last verified height."
+  (let* ((peers (if (listp peer-or-peers) peer-or-peers (list peer-or-peers)))
+         (n (length peers))
+         (mi (or max-inflight (max (* 2 n) 4)))
+         (vq (make-vqueue :maxq maxq :workers workers))
          (sink (vq-sink vq)) (t0 (get-internal-real-time)) (last (1- from))
          (wait 0) (cn 0)                ; producer wait-for-batch vs serial-pass time
-         ;; bounded batch queue: a background fetcher downloads batches AHEAD so
-         ;; the producer never blocks on the network (download overlaps validate).
-         (bq (make-fifo)) (bq-lock (bt:make-lock))
-         (bq-space (bt:make-semaphore :count 3)) (bq-items (bt:make-semaphore :count 0))
-         (fetch-err nil))
+         (q (%make-ibd-q :to to :batch batch :next-lo from :expected from
+                         :max-inflight mi :live n :nthreads n)))
     (labels ((fail-check ()
                (when (vqueue-failed vq)
                  (destructuring-bind (h ti ii msg) (vqueue-failed vq)
-                   (vq-stop vq) (cerr h "tx ~d input ~d: ~a" ti ii msg))))
-             (bq-push (x) (bt:wait-on-semaphore bq-space)
-               (bt:with-lock-held (bq-lock) (fifo-push bq x)) (bt:signal-semaphore bq-items))
-             (bq-pop () (bt:wait-on-semaphore bq-items)
-               (prog1 (bt:with-lock-held (bq-lock) (fifo-pop bq)) (bt:signal-semaphore bq-space))))
-      (let ((fetcher
-              (bt:make-thread
-               (lambda ()
-                 (handler-case
-                     (let ((h from))
-                       (loop while (<= h to) do
-                         (let* ((hi (min to (+ h batch -1)))
-                                (hashes (loop for x from h to hi collect (c:header-hash (c:header-at-height x))))
-                                (blocks (blk:get-blocks peer hashes)))
-                           (bq-push (list h blocks)) (setf h (1+ hi))))
-                       (bq-push :done))
-                   (serious-condition (e) (setf fetch-err e) (bq-push :done))))
-               :name "ibd-fetch")))
+                   (vq-stop vq) (cerr h "tx ~d input ~d: ~a" ti ii msg)))))
+      (let ((fetchers
+              (loop for peer in peers collect
+                (bt:make-thread (let ((peer peer)) (lambda () (ibd-fetcher q peer batch to)))
+                                :name "ibd-fetch"))))
         (unwind-protect
           (progn
+            (format t "~&[ibd] ~d fetcher(s), max-inflight ~d~%" n mi) (force-output)
             (loop
               (fail-check)
-              (let* ((w0 (get-internal-real-time)) (item (bq-pop)))
-                (incf wait (- (get-internal-real-time) w0))  ; >0 only when download-bound
-                (when (eq item :done) (return))
-                (destructuring-bind (bh blocks) item
-                  ;; structural checks (pure block fns) across cores, then the
-                  ;; ordered serial connect pass (UTXO + verify-enqueue).
-                  (let ((sts (get-internal-real-time)))
-                    (multiple-value-bind (ok fh msg) (prevalidate-structural blocks bh (min 32 workers))
-                      (unless ok (cerr fh "~a" msg)))
-                    (incf *cb-struct* (- (get-internal-real-time) sts)))
-                  (loop for b across blocks for h from bh do
-                    (unless b (cerr h "peer did not return block"))
-                    (let ((cn0 (get-internal-real-time)))
-                      (connect-block b h utxo :verify-scripts (>= h assumevalid-below)
-                                             :check-sink sink :skip-structural t)
-                      (incf cn (- (get-internal-real-time) cn0)))
-                    (setf last h)
-                    (when (zerop (mod h progress-every))
-                      (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
-                        (format t "~&[ibd] height ~d  verified ~d  utxos ~d  total ~,4f BTC  ~,0f blk/s  [wait ~,1f cn ~,1f loop ~,1f sink ~,1f lag ~d]~%"
-                                h (vqueue-verified vq) (u:utxo-count utxo) (/ (u:utxo-set-total-value utxo) 1d8)
-                                (if (plusp secs) (/ (- h from -1) secs) 0)
-                                (/ wait internal-time-units-per-second) (/ cn internal-time-units-per-second)
-                                (/ *cb-loop* internal-time-units-per-second) (/ *cb-sink* internal-time-units-per-second)
-                                (- h (vqueue-verified vq)))
-                        (force-output)))
-                    (when (and save-every (zerop (mod h save-every)))
-                      (loop until (vq-drained-p vq h) do (sleep 0.02))
-                      (fail-check) (u:save-utxo utxo (chainstate-path) h)
-                      (format t "~&[ibd] checkpoint @ ~d (verified)~%" h) (force-output))))))
-            (when fetch-err (error fetch-err))
+              (let (bh blocks)
+                (let ((w0 (get-internal-real-time)))
+                  (multiple-value-setq (bh blocks) (ibd-pull q))
+                  (incf wait (- (get-internal-real-time) w0)))  ; download-bound time
+                (when (eq bh :done) (return))
+                ;; structural checks (pure block fns) across cores, then the
+                ;; ordered serial connect pass (UTXO + verify-enqueue).
+                (let ((sts (get-internal-real-time)))
+                  (multiple-value-bind (ok fh msg) (prevalidate-structural blocks bh (min 32 workers))
+                    (unless ok (cerr fh "~a" msg)))
+                  (incf *cb-struct* (- (get-internal-real-time) sts)))
+                (loop for b across blocks for h from bh do
+                  (unless b (cerr h "peer did not return block"))
+                  (let ((cn0 (get-internal-real-time)))
+                    (connect-block b h utxo :verify-scripts (>= h assumevalid-below)
+                                           :check-sink sink :skip-structural t)
+                    (incf cn (- (get-internal-real-time) cn0)))
+                  (setf last h)
+                  (when (zerop (mod h progress-every))
+                    (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+                      (format t "~&[ibd] height ~d  verified ~d  utxos ~d  total ~,4f BTC  ~,0f blk/s  [wait ~,1f cn ~,1f loop ~,1f sink ~,1f lag ~d]~%"
+                              h (vqueue-verified vq) (u:utxo-count utxo) (/ (u:utxo-set-total-value utxo) 1d8)
+                              (if (plusp secs) (/ (- h from -1) secs) 0)
+                              (/ wait internal-time-units-per-second) (/ cn internal-time-units-per-second)
+                              (/ *cb-loop* internal-time-units-per-second) (/ *cb-sink* internal-time-units-per-second)
+                              (- h (vqueue-verified vq)))
+                      (force-output)))
+                  (when (and save-every (zerop (mod h save-every)))
+                    (loop until (vq-drained-p vq h) do (sleep 0.02))
+                    (fail-check) (u:save-utxo utxo (chainstate-path) h)
+                    (format t "~&[ibd] checkpoint @ ~d (verified)~%" h) (force-output)))))
+            (when (ibd-q-err q) (error (ibd-q-err q)))
             (loop until (vq-drained-p vq last) do (sleep 0.02))
             (fail-check)
             (when save-every (u:save-utxo utxo (chainstate-path) last))
             last)
-          (ignore-errors (vq-stop vq)))))))
+          (progn
+            ;; force any still-running fetchers to exit, then reap them
+            (bt:with-lock-held ((ibd-q-lock q))
+              (unless (ibd-q-err q) (setf (ibd-q-err q) :shutdown))
+              (%ibd-wake-all q))
+            (ignore-errors (mapc #'bt:join-thread fetchers))
+            (ignore-errors (vq-stop vq))))))))
 
 (defvar *cb-loop* 0) (defvar *cb-sink* 0) (defvar *cb-struct* 0)   ; instrumentation
 
@@ -556,7 +625,7 @@
       (if coinbase
           (setf coinbase-claimed
                 (reduce #'+ (tx:tx-outputs txn) :key #'tx:txout-value :initial-value 0))
-          (let ((total-in 0))
+          (let ((total-in 0) (tx-coins '()))   ; tx-coins: (value . script) per input
             (loop for in in (tx:tx-inputs txn)
                   for in-i from 0 do
               (let ((coin (u:utxo-spend utxo (tx:txin-prev-hash in) (tx:txin-prev-index in))))
@@ -574,11 +643,16 @@
                 (when (and enforce-locks (>= (tx:tx-version txn) 2))
                   (unless (sequence-lock-ok coin (tx:txin-sequence in) height mtp)
                     (cerr height "tx ~d input ~d: BIP68 relative locktime not met" tx-i in-i)))
-                ;; script verification — deferred and fanned across cores after
-                ;; the sequential pass (scripts don't touch the UTXO set)
-                (when verify-scripts
-                  (push (list txn in-i (u:coin-script coin) (u:coin-value coin) tx-i) checks))
+                (push (cons (u:coin-value coin) (u:coin-script coin)) tx-coins)
                 (incf total-in (u:coin-value coin))))
+            ;; script verification — deferred and fanned across cores after the
+            ;; sequential pass (scripts don't touch the UTXO set).  The taproot
+            ;; (BIP341) sighash commits to ALL of the tx's prevouts, so each check
+            ;; carries the per-tx PV vector #((amount . spk) ...) in input order.
+            (when verify-scripts
+              (let ((pv (coerce (nreverse tx-coins) 'vector)))
+                (dotimes (i (length pv))
+                  (push (list txn i (cdr (aref pv i)) (car (aref pv i)) tx-i pv) checks))))
             ;; value conservation
             (let ((total-out (reduce #'+ (tx:tx-outputs txn) :key #'tx:txout-value :initial-value 0)))
               (when (> total-out total-in)
