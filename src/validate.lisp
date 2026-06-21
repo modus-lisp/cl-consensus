@@ -281,7 +281,7 @@
   (pending (make-hash-table)) (maxreg -1) (verified -1) (next 0)
   (failed nil) (workers nil))
 
-(defun make-vqueue (&key (maxq 400000) (workers 100))
+(defun make-vqueue (&key (maxq 8192) (workers 100))  ; maxq = max in-flight BATCHES (~maxq*chunk inputs)
   (let ((vq (%make-vqueue :space (bt:make-semaphore :count maxq) :items (bt:make-semaphore :count 0))))
     (setf (vqueue-workers vq)
           (loop repeat workers collect
@@ -310,9 +310,9 @@
     (when (plusp n) (setf (gethash height (vqueue-pending vq)) n))
     (%vq-advance vq)))
 
-(defun vq-complete (vq height)     ; worker: one check of HEIGHT done
+(defun vq-complete (vq height &optional (k 1))  ; worker: K checks of HEIGHT done
   (bt:with-lock-held ((vqueue-lock vq))
-    (let ((r (decf (gethash height (vqueue-pending vq)))))
+    (let ((r (decf (gethash height (vqueue-pending vq)) k)))
       (when (<= r 0) (remhash height (vqueue-pending vq)) (%vq-advance vq)))))
 
 (defvar *prefetch-workers* 64
@@ -357,26 +357,44 @@
     (loop
       (let ((job (vq-get vq)))
         (when (eq job :stop) (return))
-        (destructuring-bind (txn in-i script value tx-i height flags) job
+        ;; job = (height flags k . checks); checks = list of (txn in-i script value tx-i).
+        ;; Batched (K inputs per job) so the per-job lock traffic on the queue is
+        ;; ~CHUNK x lower — the single queue lock was the IBD verify bottleneck.
+        (destructuring-bind (height flags k . checks) job
           (unless (vqueue-failed vq)
-            (let ((bad (handler-case
-                           (unless (s:verify-input txn in-i script value :flags flags)
-                             "script verification failed")
-                         (s:script-error (e) (princ-to-string e))
-                         (error (e) (princ-to-string e)))))
-              (when bad
-                (bt:with-lock-held ((vqueue-lock vq))
-                  (unless (vqueue-failed vq) (setf (vqueue-failed vq) (list height tx-i in-i bad)))))))
-          (vq-complete vq height)))))))
+            (dolist (c checks)
+              (destructuring-bind (txn in-i script value tx-i) c
+                (let ((bad (handler-case
+                               (unless (s:verify-input txn in-i script value :flags flags)
+                                 "script verification failed")
+                             (s:script-error (e) (princ-to-string e))
+                             (error (e) (princ-to-string e)))))
+                  (when bad
+                    (bt:with-lock-held ((vqueue-lock vq))
+                      (unless (vqueue-failed vq) (setf (vqueue-failed vq) (list height tx-i in-i bad))))
+                    (return))))))
+          (vq-complete vq height k)))))))
+
+(defparameter *vq-chunk* 128
+  "Inputs per verify-queue job.  Batching amortizes the single queue lock across
+   CHUNK inputs (producer + ~100 workers all serialize through it); per-input
+   enqueue made that lock the IBD verify bottleneck (the dominant `sink` cost).")
 
 (defun vq-sink (vq)
-  "The CHECK-SINK closure for connect-block: register the height, enqueue jobs."
+  "The CHECK-SINK closure for connect-block: register the height, enqueue jobs in
+   CHUNK-sized batches.  Each job = (height flags k . checks)."
   (lambda (checks height flags)
     (let ((n (length checks)))
       (vq-register vq height n)
-      (dolist (c checks)
-        (when (vqueue-failed vq) (return))
-        (vq-put vq (list* (first c) (second c) (third c) (fourth c) (fifth c) height (list flags)))))))
+      (loop with grp = '() and k = 0
+            for c in checks do
+              (push c grp) (incf k)
+              (when (= k *vq-chunk*)
+                (when (vqueue-failed vq) (return))
+                (vq-put vq (list* height flags k grp))
+                (setf grp '() k 0))
+            finally (when (and (plusp k) (not (vqueue-failed vq)))
+                      (vq-put vq (list* height flags k grp)))))))
 
 (defun vq-drained-p (vq h) (or (vqueue-failed vq) (>= (vqueue-verified vq) h)))
 (defun vq-stop (vq)
@@ -385,7 +403,7 @@
 
 (defun run-ibd-async (peer utxo &key (from 1) (to (c:tip-height)) (batch 64)
                                      (assumevalid-below 0) (save-every 10000)
-                                     (workers 100) (progress-every 1000) (maxq 400000))
+                                     (workers 100) (progress-every 1000) (maxq 8192))
   "Pipelined IBD: connect blocks in order (UTXO inline) while WORKERS verify
    scripts asynchronously across all cores.  Below ASSUMEVALID-BELOW scripts are
    skipped.  Checkpoints (every SAVE-EVERY) drain to a fully-verified height

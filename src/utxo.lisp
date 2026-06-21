@@ -39,7 +39,10 @@
   ;; removed).  COUNT/total are kept running; PATH is the meta-file path.
   ;; PREFETCH: a per-block map (outpoint -> coin) of committed coins resolved in
   ;; parallel before the serial pass, so utxo-spend skips the mmap cache-miss.
-  (disk nil) (staging nil) (count 0) (path nil) (prefetch nil))
+  ;; WAL: PATH.wal records the staging delta (fsync'd) BEFORE it is applied to
+  ;; the mmap, so a crash/kill mid-flush is replayable instead of corrupting the
+  ;; store (the mmap is mutated in place; the marker commits last).
+  (disk nil) (staging nil) (count 0) (path nil) (prefetch nil) (wal nil))
 
 (defun utxo-disk-p (set) (and (utxo-set-disk set) t))
 (defun make-utxo-set () (%make-utxo-set))
@@ -118,7 +121,11 @@
    (values utxo-set height) — height 0 for a fresh store, else the marker."
   (let* ((db (d:open-udb udb-path capacity))
          (meta-path (concatenate 'string (namestring udb-path) ".meta"))
+         (wal-path (concatenate 'string (namestring udb-path) ".wal"))
          (height 0) (total 0) (count 0))
+    ;; crash recovery: an interrupted flush left a .wal — re-apply it (idempotent)
+    ;; and advance the marker BEFORE we trust the marker below.
+    (%replay-wal db meta-path wal-path)
     (when (probe-file meta-path)
       (with-open-file (s meta-path :element-type '(unsigned-byte 8))
         (let* ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
@@ -127,13 +134,81 @@
             (setf height (w:r-u32 r) total (w:r-u64 r) count (w:r-u64 r))
             (setf (d::udb-count db) count)))))
     (values (%make-utxo-set :disk db :staging (make-hash-table :test 'equalp)
-                            :total-value total :count count :path meta-path)
+                            :total-value total :count count :path meta-path :wal wal-path)
             height)))
+
+(defun %write-marker (meta-path height total count)
+  "Atomically commit the marker (height + totals) via temp file + rename."
+  (let ((wr (w:make-writer)) (tmp (concatenate 'string meta-path ".tmp")))
+    (w:w-u32 wr height) (w:w-u64 wr total) (w:w-u64 wr count)
+    (with-open-file (s tmp :direction :output :element-type '(unsigned-byte 8)
+                           :if-exists :supersede :if-does-not-exist :create)
+      (write-sequence (w:writer-bytes wr) s)
+      (finish-output s)
+      (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd s))))
+    (rename-file tmp meta-path)))
+
+(defun %write-wal (set height)
+  "Durably serialize the staging delta + the post-flush (height,total,count) to
+   PATH.wal (fsync'd, atomic via temp+rename) BEFORE applying it to the mmap."
+  (let* ((wr (w:make-writer)) (st (utxo-set-staging set))
+         (wal (utxo-set-wal set)) (tmp (concatenate 'string wal ".tmp")))
+    (w:w-u32 wr height) (w:w-u64 wr (utxo-set-total-value set)) (w:w-u64 wr (utxo-set-count set))
+    (w:w-u64 wr (hash-table-count st))
+    (maphash (lambda (key v)
+               (w:w-bytes wr (car key)) (w:w-u32 wr (cdr key))
+               (if (eq v :spent)
+                   (w:w-u8 wr 0)
+                   (progn (w:w-u8 wr 1)
+                          (w:w-u64 wr (coin-value v)) (w:w-u32 wr (coin-height v))
+                          (w:w-u8 wr (if (coin-coinbase-p v) 1 0))
+                          (w:w-u32 wr (length (coin-script v))) (w:w-bytes wr (coin-script v)))))
+             st)
+    (with-open-file (s tmp :direction :output :element-type '(unsigned-byte 8)
+                           :if-exists :supersede :if-does-not-exist :create)
+      (write-sequence (w:writer-bytes wr) s)
+      (finish-output s)
+      (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd s))))
+    (rename-file tmp wal)))               ; a COMPLETE .wal now exists, or none
+
+(defun %apply-wal-bytes (db v)
+  "Apply a serialized WAL (idempotent udb-put/udb-del) to DB.  Returns
+   (values height total count)."
+  (let* ((r (w:make-reader v))
+         (height (w:r-u32 r)) (total (w:r-u64 r)) (count (w:r-u64 r))
+         (n (w:r-u64 r)))
+    (dotimes (i n)
+      (let ((txid (w:r-bytes r 32)) (index (w:r-u32 r)) (tag (w:r-u8 r)))
+        (if (zerop tag)
+            (d:udb-del db txid index)
+            (let* ((value (w:r-u64 r)) (h (w:r-u32 r)) (cb (= 1 (w:r-u8 r)))
+                   (slen (w:r-u32 r)) (script (w:r-bytes r slen)))
+              (d:udb-put db txid index value h cb script)))))
+    (values height total count)))
+
+(defun %replay-wal (db meta-path wal-path)
+  "If WAL-PATH exists, the previous flush was interrupted: re-apply it (idempotent
+   — putting/deleting the same outpoint twice is a no-op), sync, advance the
+   marker, then delete the WAL.  Leaves the store consistent at the WAL's height."
+  (when (probe-file wal-path)
+    (let ((v (with-open-file (s wal-path :element-type '(unsigned-byte 8))
+               (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                 (read-sequence b s) b))))
+      (multiple-value-bind (height total count) (%apply-wal-bytes db v)
+        (setf (d::udb-count db) count)
+        (d:udb-sync db)
+        (%write-marker meta-path height total count)
+        (delete-file wal-path)
+        (format t "~&[utxo] replayed interrupted flush from WAL -> height ~d~%" height)
+        (force-output)
+        height))))
 
 (defun flush-utxo (set height)
   "Apply the staging buffer to the mmap, msync, and atomically write the marker
-   at HEIGHT — leaving the on-disk store consistent at a verified height."
+   at HEIGHT — leaving the on-disk store consistent at a verified height.  The
+   delta is WAL-logged first so an interrupted flush is replayable, not corrupting."
   (let ((db (utxo-set-disk set)))
+    (%write-wal set height)             ; durable delta BEFORE mutating the mmap
     (maphash (lambda (key v)
                (let ((txid (car key)) (index (cdr key)))
                  (if (eq v :spent)
@@ -143,13 +218,8 @@
              (utxo-set-staging set))
     (clrhash (utxo-set-staging set))
     (d:udb-sync db)
-    ;; marker: temp file + rename = atomic commit point
-    (let ((wr (w:make-writer)) (tmp (concatenate 'string (utxo-set-path set) ".tmp")))
-      (w:w-u32 wr height) (w:w-u64 wr (utxo-set-total-value set)) (w:w-u64 wr (utxo-set-count set))
-      (with-open-file (s tmp :direction :output :element-type '(unsigned-byte 8)
-                             :if-exists :supersede :if-does-not-exist :create)
-        (write-sequence (w:writer-bytes wr) s))
-      (rename-file tmp (utxo-set-path set)))
+    (%write-marker (utxo-set-path set) height (utxo-set-total-value set) (utxo-set-count set))
+    (ignore-errors (delete-file (utxo-set-wal set)))   ; flush complete: drop the WAL
     height))
 
 (defun close-utxo (set)
