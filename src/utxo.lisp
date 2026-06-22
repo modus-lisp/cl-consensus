@@ -338,7 +338,7 @@
 ;;; ----------------------------------------------------------------------------
 
 (defun save-utxo (set path height)
-  (when (utxo-set-disk set)            ; disk backend: flush + marker, ignore PATH
+  (when (utxo-backed-p set)            ; disk/pagetree backend: flush + commit meta, ignore PATH
     (return-from save-utxo (flush-utxo set height)))
   (ensure-directories-exist path)
   (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
