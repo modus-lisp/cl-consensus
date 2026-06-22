@@ -23,7 +23,7 @@
 (in-package #:cl-consensus.peer)
 
 (defparameter *protocol-version* 70016)
-(defparameter *default-user-agent* "/battle-btc:0.1/")
+(defparameter *default-user-agent* "/cl-consensus:0.1/")
 
 (defstruct peer
   host port socket stream
