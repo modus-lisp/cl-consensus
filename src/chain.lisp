@@ -360,12 +360,12 @@
     (serious-condition () nil)))
 
 (defun data-dir ()
-  "Prefer the big volume; fall back to ~/.battle until it's writable."
+  "Prefer the big volume; fall back to ~/.cl-consensus until it's writable."
   (let ((env #+sbcl (sb-ext:posix-getenv "BITCOIND_DATADIR") #-sbcl nil))
     (cond (env (pathname (if (char= #\/ (char env (1- (length env)))) env
                              (concatenate 'string env "/"))))
           ((writable-dir-p #p"/mnt/lisp/bitcoind/") #p"/mnt/lisp/bitcoind/")
-          (t (merge-pathnames ".battle/bitcoind/" (user-homedir-pathname))))))
+          (t (merge-pathnames ".cl-consensus/bitcoind/" (user-homedir-pathname))))))
 
 (defun headers-file () (merge-pathnames "headers.dat" (data-dir)))
 

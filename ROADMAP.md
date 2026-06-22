@@ -19,7 +19,7 @@ trust our own output where we can diff it against Bitcoin Core.
 ## Environment
 
 - Storage: `/mnt/lisp/bitcoind/` (1.5 TB ZFS). Headers (~80 MB) can live under
-  `~/.battle/bitcoind/` until the volume is chown'd writable. Full blocks (~650 GB)
+  `~/.cl-consensus/bitcoind/` until the volume is chown'd writable. Full blocks (~650 GB)
   and the UTXO set need `/mnt/lisp`.
 - SBCL 2.2.9. Libs: `usocket`, `bordeaux-threads`, `ironclad`, `sqlite`,
   `com.inuoe.jzon`. Existing reusable crypto in `shared/crypto/`
@@ -43,7 +43,7 @@ shared/bitcoind/
   inspect/       persistent REPL inspectors (--load)
 ```
 
-Packages: `battle.btc.<layer>`, nicknames `btc-wire`, `btc-peer`, ...
+Packages: `cl-consensus.<layer>`, nicknames `btc-wire`, `btc-peer`, ...
 
 ## Phases
 
