@@ -13,13 +13,15 @@
 (defpackage #:cl-consensus.utxo
   (:use #:cl)
   (:nicknames #:btc-utxo)
-  (:local-nicknames (#:w #:cl-consensus.wire) (#:d #:cl-consensus.utxo-disk))
+  (:local-nicknames (#:w #:cl-consensus.wire) (#:d #:cl-consensus.utxo-disk)
+                    (#:pt #:cl-consensus.utxo-pagetree))
   (:export
    #:coin #:make-coin #:coin-value #:coin-script #:coin-height #:coin-coinbase-p
    #:utxo-set #:make-utxo-set #:utxo-count #:utxo-set-total-value
    #:utxo-get #:utxo-add #:utxo-spend #:utxo-key #:utxo-digest
    #:save-utxo #:load-utxo
    #:open-disk-utxo #:flush-utxo #:close-utxo #:utxo-disk-p #:+udb-tip-capacity+
+   #:open-pagetree-utxo #:utxo-pagetree-p
    #:prefetch-resolve #:set-prefetch #:clear-prefetch))
 
 (in-package #:cl-consensus.utxo)
@@ -42,9 +44,16 @@
   ;; WAL: PATH.wal records the staging delta (fsync'd) BEFORE it is applied to
   ;; the mmap, so a crash/kill mid-flush is replayable instead of corrupting the
   ;; store (the mmap is mutated in place; the marker commits last).
-  (disk nil) (staging nil) (count 0) (path nil) (prefetch nil) (wal nil))
+  (disk nil) (staging nil) (count 0) (path nil) (prefetch nil) (wal nil)
+  ;; Alternative disk backend: a pagetree (CoW B+tree) store handle.  When PT is
+  ;; non-nil this set is pagetree-backed; it shares the same STAGING/COUNT/total
+  ;; write-back machinery as the udb backend, but committed coins live in the
+  ;; B+tree instead of the mmap slot table.  PT and DISK are mutually exclusive.
+  (pt nil))
 
 (defun utxo-disk-p (set) (and (utxo-set-disk set) t))
+(defun utxo-pagetree-p (set) (and (utxo-set-pt set) t))
+(defun utxo-backed-p (set) (or (utxo-set-disk set) (utxo-set-pt set)))
 (defun make-utxo-set () (%make-utxo-set))
 
 (declaim (inline utxo-key))
@@ -55,21 +64,30 @@
   (cons txid-bytes index))
 
 (defun utxo-count (set)
-  (if (utxo-set-disk set) (utxo-set-count set) (hash-table-count (utxo-set-map set))))
+  (if (utxo-backed-p set) (utxo-set-count set) (hash-table-count (utxo-set-map set))))
+
+(defun %committed-get (set txid-bytes index)
+  "Read a coin from whichever committed backend this set uses (udb or pagetree),
+   or NIL if absent.  Does NOT consult the staging buffer."
+  (cond
+    ((utxo-set-disk set)
+     (multiple-value-bind (found v h cb s) (d:udb-get (utxo-set-disk set) txid-bytes index)
+       (and found (make-coin :value v :height h :coinbase-p cb :script s))))
+    ((utxo-set-pt set)
+     (multiple-value-bind (found v h cb s) (pt:ptu-get (utxo-set-pt set) txid-bytes index)
+       (and found (make-coin :value v :height h :coinbase-p cb :script s))))))
 
 (defun utxo-get (set txid-bytes index)
-  (if (utxo-set-disk set)
+  (if (utxo-backed-p set)
       (let ((st (gethash (utxo-key txid-bytes index) (utxo-set-staging set) :miss)))
         (cond ((eq st :spent) nil)
-              ((eq st :miss)
-               (multiple-value-bind (found v h cb s) (d:udb-get (utxo-set-disk set) txid-bytes index)
-                 (and found (make-coin :value v :height h :coinbase-p cb :script s))))
+              ((eq st :miss) (%committed-get set txid-bytes index))
               (t st)))                  ; staged fresh coin
       (gethash (utxo-key txid-bytes index) (utxo-set-map set))))
 
 (defun utxo-add (set txid-bytes index coin)
   (cond
-    ((utxo-set-disk set)
+    ((utxo-backed-p set)
      (setf (gethash (utxo-key txid-bytes index) (utxo-set-staging set)) coin)
      (incf (utxo-set-count set)))
     (t (setf (gethash (utxo-key txid-bytes index) (utxo-set-map set)) coin)))
@@ -79,12 +97,12 @@
 (defun utxo-spend (set txid-bytes index)
   "Remove and return the coin at this outpoint, or NIL if absent (double-spend
    / missing input — the caller treats NIL as a consensus failure)."
-  (if (utxo-set-disk set)
+  (if (utxo-backed-p set)
       (let* ((key (utxo-key txid-bytes index))
              (st (gethash key (utxo-set-staging set) :miss)))
         (cond
           ((eq st :spent) nil)
-          ((eq st :miss)                ; spend a coin that lives in the mmap
+          ((eq st :miss)                ; spend a coin that lives in the committed store
            (let ((pc (let ((pf (utxo-set-prefetch set))) (and pf (gethash key pf)))))
              (cond
                (pc                       ; resolved in parallel — no mmap touch here
@@ -92,11 +110,11 @@
                 (decf (utxo-set-total-value set) (coin-value pc)) (decf (utxo-set-count set))
                 pc)
                (t
-                (multiple-value-bind (found v h cb s) (d:udb-get (utxo-set-disk set) txid-bytes index)
-                  (when found
+                (let ((c (%committed-get set txid-bytes index)))
+                  (when c
                     (setf (gethash key (utxo-set-staging set)) :spent)
-                    (decf (utxo-set-total-value set) v) (decf (utxo-set-count set))
-                    (make-coin :value v :height h :coinbase-p cb :script s)))))))
+                    (decf (utxo-set-total-value set) (coin-value c)) (decf (utxo-set-count set))
+                    c))))))
           (t                            ; spend a still-staged fresh coin (never flushed)
            (remhash key (utxo-set-staging set))
            (decf (utxo-set-total-value set) (coin-value st)) (decf (utxo-set-count set))
@@ -207,6 +225,14 @@
   "Apply the staging buffer to the mmap, msync, and atomically write the marker
    at HEIGHT — leaving the on-disk store consistent at a verified height.  The
    delta is WAL-logged first so an interrupted flush is replayable, not corrupting."
+  ;; pagetree backend: one CoW write txn (atomic meta swap = crash-safe, no WAL).
+  (when (utxo-set-pt set)
+    (pt:ptu-flush (utxo-set-pt set) (utxo-set-staging set) height
+                  (utxo-set-total-value set) (utxo-set-count set)
+                  :coin-value #'coin-value :coin-height #'coin-height
+                  :coin-coinbase-p #'coin-coinbase-p :coin-script #'coin-script)
+    (clrhash (utxo-set-staging set))
+    (return-from flush-utxo height))
   (let ((db (utxo-set-disk set)))
     (%write-wal set height)             ; durable delta BEFORE mutating the mmap
     (maphash (lambda (key v)
@@ -223,7 +249,24 @@
     height))
 
 (defun close-utxo (set)
-  (when (utxo-set-disk set) (d:close-udb (utxo-set-disk set))))
+  (cond
+    ((utxo-set-disk set) (d:close-udb (utxo-set-disk set)))
+    ((utxo-set-pt set) (pt:ptu-close (utxo-set-pt set)))))
+
+;;; ----------------------------------------------------------------------------
+;;; pagetree backend opener — mirrors OPEN-DISK-UTXO's contract: returns
+;;; (values utxo-set height), height = the last committed flush (0 for fresh).
+;;; ----------------------------------------------------------------------------
+
+(defun open-pagetree-utxo (path &key page-size cache-bytes)
+  "Open/create a pagetree-backed UTXO set at PATH (NIL => in-RAM mem store, for
+   tests).  Shares the same staging/flush write-back machinery as the udb
+   backend; committed coins live in a CoW B+tree.  Returns (values set height)."
+  (let ((ptu (pt:open-pagetree-utxo path :page-size page-size :cache-bytes cache-bytes)))
+    (values (%make-utxo-set :pt ptu :staging (make-hash-table :test 'equalp)
+                            :total-value (pt:ptu-total ptu)
+                            :count (pt:ptu-count ptu) :path path)
+            (pt:ptu-height ptu))))
 
 ;;; Parallel UTXO-lookup prefetch.  Input lookups are independent read-only mmap
 ;;; accesses (cache-miss + coin alloc) — the bulk of the single-threaded
@@ -273,6 +316,17 @@
                (unless (nth-value 1 (gethash (cons txid index) staging))   ; in staging? skip (handled below)
                  (add (cons txid index) (make-coin :value v :height h :coinbase-p cb :script s)))))
            ;; staged fresh adds (coins); staged :spent contribute nothing
+           (maphash (lambda (k v) (unless (eq v :spent) (add k v))) staging)))
+        ((utxo-set-pt set)
+         ;; committed B+tree coins (ordered cursor scan), masking staged overrides,
+         ;; then staged fresh adds — same shape as the udb branch.  The per-coin
+         ;; commitment uses the IDENTICAL coin fields, so this is byte-identical to
+         ;; the udb/in-RAM digest for any equal logical coin set.
+         (let ((staging (utxo-set-staging set)))
+           (pt:ptu-map-coins (utxo-set-pt set)
+             (lambda (txid index v h cb s)
+               (unless (nth-value 1 (gethash (cons txid index) staging))
+                 (add (cons txid index) (make-coin :value v :height h :coinbase-p cb :script s)))))
            (maphash (lambda (k v) (unless (eq v :spent) (add k v))) staging)))
         (t (maphash #'add (utxo-set-map set)))))
     (let ((out (make-array 32 :element-type '(unsigned-byte 8))))

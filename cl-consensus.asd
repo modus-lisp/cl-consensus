@@ -6,7 +6,7 @@
                 script test suite."
   :version "0.1.0"
   :license "MIT"
-  :depends-on ("secp256k1-fast" "ironclad" "usocket" "bordeaux-threads" "com.inuoe.jzon" "hunchentoot")
+  :depends-on ("secp256k1-fast" "pagetree" "ironclad" "usocket" "bordeaux-threads" "com.inuoe.jzon" "hunchentoot")
   :serial t
   :components
   ((:module "src"
@@ -23,7 +23,8 @@
      (:file "discovery")   ; DNS seeds + getaddr-driven peer pool
      (:file "chain")       ; header chain: PoW, retarget, MTP, sync
      (:file "utxo-disk")   ; mmap open-addressing slot table (disk UTXO core)
-     (:file "utxo")        ; UTXO set (in-RAM + disk-backed via utxo-disk)
+     (:file "utxo-pagetree") ; pagetree CoW-B+tree UTXO backend (modus-portable A/B)
+     (:file "utxo")        ; UTXO set (in-RAM + disk-backed via utxo-disk / pagetree)
      (:file "block")       ; block parse, merkle root, block download
      (:file "script")      ; the Script interpreter + sighash (the consensus core)
      (:file "validate")    ; connect/disconnect-block, consensus rules, IBD
