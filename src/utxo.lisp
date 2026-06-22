@@ -21,7 +21,7 @@
    #:utxo-get #:utxo-add #:utxo-spend #:utxo-key #:utxo-digest
    #:save-utxo #:load-utxo
    #:open-disk-utxo #:flush-utxo #:close-utxo #:utxo-disk-p #:+udb-tip-capacity+
-   #:open-pagetree-utxo #:utxo-pagetree-p
+   #:open-pagetree-utxo #:utxo-pagetree-p #:open-utxo-backend
    #:prefetch-resolve #:set-prefetch #:clear-prefetch))
 
 (in-package #:cl-consensus.utxo)
@@ -267,6 +267,17 @@
                             :total-value (pt:ptu-total ptu)
                             :count (pt:ptu-count ptu) :path path)
             (pt:ptu-height ptu))))
+
+(defun open-utxo-backend (path &key (backend :udb) page-size cache-bytes)
+  "Open a disk-backed UTXO set with the selected BACKEND, returning (values set
+   height) — the resumable, interchangeable entry point used by the IBD driver:
+     :udb       legacy mmap open-addressing slot table (utxo-disk.lisp)
+     :pagetree  CoW B+tree (utxo-pagetree.lisp) — modus-portable, compact, the
+                Pi target; digest-equivalent to :udb (proven on real IBD).
+   PAGE-SIZE/CACHE-BYTES apply to :pagetree only."
+  (ecase backend
+    (:udb (open-disk-utxo path))
+    (:pagetree (open-pagetree-utxo path :page-size page-size :cache-bytes cache-bytes))))
 
 ;;; Parallel UTXO-lookup prefetch.  Input lookups are independent read-only mmap
 ;;; accesses (cache-miss + coin alloc) — the bulk of the single-threaded
