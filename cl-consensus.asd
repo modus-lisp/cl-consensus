@@ -28,5 +28,6 @@
      (:file "block")       ; block parse, merkle root, block download
      (:file "script")      ; the Script interpreter + sighash (the consensus core)
      (:file "validate")    ; connect/disconnect-block, consensus rules, IBD
+     (:file "reorg")       ; tip reorg / best-chain activation
      (:file "mempool")     ; mempool acceptance
      (:file "node")))))    ; daemon: JSON-RPC + control socket

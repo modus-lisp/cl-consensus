@@ -26,6 +26,8 @@
    ;; store
    #:*genesis* #:init-chain #:add-header #:tip #:tip-height #:header-at-height
    #:get-header #:chain-height #:build-locator #:median-time-past
+   ;; reorg / best-chain activation
+   #:best-header #:fork-point #:active-header-p #:activate-headers!
    ;; sync + persistence
    #:sync-headers #:*pow-limit*
    #:save-headers #:load-headers #:data-dir #:headers-file))
@@ -260,6 +262,62 @@
           (when (> (header-chainwork h) (header-chainwork *tip*))
             (setf *tip* h)))
         h))))
+
+;;; ----------------------------------------------------------------------------
+;;; Reorg / best-chain activation helpers
+;;; ----------------------------------------------------------------------------
+;;;
+;;; ADD-HEADER already stores competing-fork headers in *by-hash* with correct
+;;; cumulative chainwork, but only ever ACTIVATES (extends *by-height*/*tip*) a
+;;; header whose parent IS the current tip.  These helpers expose the best-work
+;;; header across all known branches, the common ancestor of two branches, and an
+;;; explicit "activate this branch" mutation — so the reorg layer can switch the
+;;; active chain to a heavier competing branch.
+
+(defun best-header ()
+  "The known header (incl. competing forks in *by-hash*) with the greatest
+   cumulative chainwork.  Starts from *tip* so an equal-work tip is never displaced;
+   first-seen wins ties among forks (a residual gap vs Core's lowest-hash rule)."
+  (let ((best *tip*))
+    (maphash (lambda (hex h)
+               (declare (ignore hex))
+               (when (or (null best) (> (header-chainwork h) (header-chainwork best)))
+                 (setf best h)))
+             *by-hash*)
+    best))
+
+(defun fork-point (a b)
+  "The lowest common ancestor header of A and B: walk the deeper one up to equal
+   height, then both back in lockstep until the SAME header object (headers are
+   interned in *by-hash*, so EQ identifies the common ancestor)."
+  (loop while (> (header-height a) (header-height b))
+        do (setf a (get-header (header-prev a))))
+  (loop while (> (header-height b) (header-height a))
+        do (setf b (get-header (header-prev b))))
+  (loop until (eq a b)
+        do (setf a (get-header (header-prev a))
+                 b (get-header (header-prev b))))
+  a)
+
+(defun active-header-p (h)
+  "T iff H is the header currently active at its height on *by-height*."
+  (eq h (header-at-height (header-height h))))
+
+(defun activate-headers! (branch-headers)
+  "Splice BRANCH-HEADERS (ascending by height, contiguous from some fork+1) into the
+   active chain *by-height*, overwriting any headers previously active at those
+   heights, truncate any now-stale higher tail, and set *tip* to the last.  Pure
+   header-store mutation — the UTXO reorg is the caller's job.  Returns the new tip."
+  (dolist (h branch-headers)
+    (let ((ht (header-height h)))
+      (if (< ht (fill-pointer *by-height*))
+          (setf (aref *by-height* ht) h)
+          (vector-push-extend h *by-height*))))
+  (when branch-headers
+    (let ((new-tip (car (last branch-headers))))
+      (setf (fill-pointer *by-height*) (1+ (header-height new-tip))
+            *tip* new-tip)))
+  *tip*)
 
 ;;; ----------------------------------------------------------------------------
 ;;; Block locator (dense near tip, exponential back-off, ending at genesis)
