@@ -16,7 +16,7 @@
   (:export
    #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
    #:peer-services #:peer-alive-p #:peer-connected-at
-   #:connect-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
+   #:connect-peer #:accept-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
    #:*default-user-agent* #:*protocol-version*))
 
@@ -149,12 +149,13 @@
     ((string= command "ping")
      (send p "pong" payload) t)          ; echo the nonce
     ((member command '("alert" "feefilter" "sendheaders" "sendcmpct"
-                       "getheaders" "wtxidrelay")
+                       "wtxidrelay")
              :test #'string=)
      t)                                   ; ignore for now
-    ;; NOTE: "addr"/"addrv2" are intentionally NOT swallowed here — they dispatch
-    ;; to a registered handler (peer discovery, see ENABLE-DISCOVERY); with no
-    ;; handler installed, DISPATCH simply no-ops, so this stays safe by default.
+    ;; NOTE: "addr"/"addrv2"/"getheaders"/"getdata" are intentionally NOT swallowed
+    ;; here — they dispatch to a registered handler (peer discovery; serving headers/
+    ;; blocks).  With no handler installed DISPATCH simply no-ops, so this stays safe
+    ;; by default (a pure leech ignores them; the serving daemon installs handlers).
     (t nil)))
 
 (defun read-loop (p)
@@ -222,6 +223,46 @@
     (setf (peer-thread p)
           (bt:make-thread (lambda () (read-loop p))
                           :name (format nil "btc-peer ~a" (peer-addr p))))
+    p))
+
+(defun %inbound-addr (socket)
+  "Best-effort dotted IP of an accepted SOCKET's remote end (for logging)."
+  (handler-case
+      (let ((a (usocket:get-peer-address socket)))
+        (if (vectorp a) (format nil "~{~a~^.~}" (coerce a 'list)) (format nil "~a" a)))
+    (serious-condition () "inbound")))
+
+(defun accept-peer (socket &key (services (logior w:+services-network+ w:+services-witness+))
+                                (start-height 0) (verbose nil))
+  "Wrap an ACCEPTED inbound TCP SOCKET as a live peer: complete the version/verack
+   handshake in INBOUND order (read THEIR version first, then send ours advertising
+   SERVICES + verack), clear the read timeout, and spawn the read loop.  Returns the
+   live peer, or signals on a bad/!aborted handshake (caller closes the socket)."
+  (let* ((stream (usocket:socket-stream socket))
+         (p (make-peer :host (%inbound-addr socket)
+                       :port (handler-case (usocket:get-peer-port socket) (serious-condition () 0))
+                       :socket socket :stream stream :verbose verbose
+                       :connected-at (get-universal-time))))
+    (let ((got-version nil) (got-verack nil))
+      (loop until (and got-version got-verack) do
+        (multiple-value-bind (command payload) (read-message p)
+          (unless command (error "inbound peer ~a closed during handshake" (peer-addr p)))
+          (peer-log p "<- ~a (~d bytes)" command (length payload))
+          (cond
+            ((string= command "version")
+             (multiple-value-bind (v s sv h) (parse-version-payload payload)
+               (setf (peer-version p) v (peer-services p) s
+                     (peer-subver p) sv (peer-height p) h))
+             (setf got-version t)
+             ;; respond with OUR version (advertising SERVICES) then verack.
+             (send p "version" (build-version-payload :services services :start-height start-height))
+             (send p "verack" #()))
+            ((string= command "verack") (setf got-verack t))
+            (t nil)))))                  ; ignore wtxidrelay/sendaddrv2/etc. during handshake
+    #+sbcl (ignore-errors (setf (sb-impl::fd-stream-timeout (peer-stream p)) nil))
+    (setf (peer-thread p)
+          (bt:make-thread (lambda () (read-loop p))
+                          :name (format nil "btc-inbound ~a" (peer-addr p))))
     p))
 
 (defun disconnect (p)

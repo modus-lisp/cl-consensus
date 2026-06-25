@@ -30,4 +30,5 @@
      (:file "validate")    ; connect/disconnect-block, consensus rules, IBD
      (:file "reorg")       ; tip reorg / best-chain activation
      (:file "mempool")     ; mempool acceptance
-     (:file "node")))))    ; daemon: JSON-RPC + control socket
+     (:file "node")       ; daemon: JSON-RPC + control socket
+     (:file "serve")))))  ; network citizen: inbound listener + serve headers/blocks
