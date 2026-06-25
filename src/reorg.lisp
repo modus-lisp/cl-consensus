@@ -19,11 +19,14 @@
   (:nicknames #:btc-reorg)
   (:local-nicknames (#:c #:cl-consensus.chain) (#:v #:cl-consensus.validate)
                     (#:blk #:cl-consensus.block) (#:u #:cl-consensus.utxo)
+                    (#:ptu #:cl-consensus.utxo-pagetree) (#:pt #:pagetree)
                     (#:w #:cl-consensus.wire))
   (:export #:activate-best-chain #:reorg-error #:deep-reorg-halt #:reorg-depth
-           ;; undo-store protocol + in-RAM impl
+           ;; undo-store protocol + impls
            #:undo-get #:undo-put #:undo-del #:undo-prune
-           #:mem-undo-store #:make-mem-undo-store))
+           #:mem-undo-store #:make-mem-undo-store
+           #:pt-undo-store #:open-pt-undo-store #:close-pt-undo-store #:undo-commit
+           #:serialize-undo #:deserialize-undo))
 (in-package #:cl-consensus.reorg)
 
 ;;; ----------------------------------------------------------------------------
@@ -61,6 +64,88 @@
   (let ((tab (mem-undo-store-tab s)) (dead '()))
     (maphash (lambda (h u) (declare (ignore u)) (when (< h below) (push h dead))) tab)
     (dolist (h dead) (remhash h tab))))
+
+;;; ----------------------------------------------------------------------------
+;;; block-undo (de)serialization + a PERSISTENT (pagetree-backed) undo-store.
+;;;
+;;; The undo lives in its OWN small pagetree store (keyed by big-endian u32 height),
+;;; separate from the live UTXO store — so the reorg machinery never touches the
+;;; UTXO flush path, and a slightly-stale undo (committed a checkpoint behind the
+;;; UTXO) just makes a reorg fail SAFE (REORG-ERROR -> halt), never corrupts.  Undo
+;;; for the last K blocks is what a realistic reorg needs; deeper is guarded by
+;;; MAX-DEPTH regardless.
+;;; ----------------------------------------------------------------------------
+
+(defun serialize-undo (created spent)
+  "Serialize a block-undo's CREATED (list of (txid . index)) and SPENT (list of
+   (txid index coin)) into a byte vector.  Coins use the compact pagetree codec."
+  (let ((wr (w:make-writer)))
+    (w:w-varint wr (length created))
+    (dolist (cr created) (w:w-bytes wr (car cr)) (w:w-u32 wr (cdr cr)))
+    (w:w-varint wr (length spent))
+    (dolist (sp spent)
+      (destructuring-bind (txid index coin) sp
+        (w:w-bytes wr txid) (w:w-u32 wr index)
+        (let ((cb (ptu:encode-coin (u:coin-value coin) (u:coin-height coin)
+                                   (u:coin-coinbase-p coin) (u:coin-script coin))))
+          (w:w-varint wr (length cb)) (w:w-bytes wr cb))))
+    (w:writer-bytes wr)))
+
+(defun deserialize-undo (bytes)
+  "Inverse of SERIALIZE-UNDO.  Returns (values created spent)."
+  (let* ((r (w:make-reader bytes))
+         (nc (w:r-varint r))
+         (created (loop repeat nc collect (cons (w:r-bytes r 32) (w:r-u32 r))))
+         (ns (w:r-varint r))
+         (spent (loop repeat ns collect
+                      (let ((txid (w:r-bytes r 32)) (index (w:r-u32 r)))
+                        (multiple-value-bind (v h cb s) (ptu:decode-coin (w:r-bytes r (w:r-varint r)))
+                          (list txid index (u:make-coin :value v :height h :coinbase-p cb :script s)))))))
+    (values created spent)))
+
+(defun %ukey (height)
+  "4-byte big-endian height key (heights sort/scan in order)."
+  (let ((k (make-array 4 :element-type '(unsigned-byte 8))))
+    (dotimes (i 4 k) (setf (aref k i) (logand (ash height (* -8 (- 3 i))) #xff)))))
+
+(defstruct (pt-undo-store (:constructor %make-pt-undo-store))
+  store
+  (buf (make-hash-table)))           ; height -> serialized-bytes | :deleted (uncommitted)
+
+(defun open-pt-undo-store (path &key cache-bytes)
+  "Open/create the undo store at PATH (NIL => in-RAM mem store, for tests)."
+  (%make-pt-undo-store :store (pt:open-store path :cache-bytes cache-bytes :create t)))
+(defun close-pt-undo-store (s) (pt:close-store (pt-undo-store-store s)))
+
+(defun %undo->block-undo (bytes)
+  (multiple-value-bind (cr sp) (deserialize-undo bytes)
+    (v:make-block-undo :created cr :spent sp)))
+
+(defmethod undo-get ((s pt-undo-store) height)
+  (let ((v (gethash height (pt-undo-store-buf s))))
+    (cond ((eq v :deleted) nil)
+          (v (%undo->block-undo v))
+          (t (let ((bytes (pt:with-read-txn (txn (pt-undo-store-store s))
+                            (pt:tget txn (%ukey height)))))
+               (when bytes (%undo->block-undo bytes)))))))
+(defmethod undo-put ((s pt-undo-store) height undo)
+  (setf (gethash height (pt-undo-store-buf s))
+        (serialize-undo (v:block-undo-created undo) (v:block-undo-spent undo))))
+(defmethod undo-del ((s pt-undo-store) height)
+  (setf (gethash height (pt-undo-store-buf s)) :deleted))
+(defmethod undo-prune ((s pt-undo-store) below)
+  (declare (ignore below)) nil)       ; kept simple in 1b; bounded pruning is Phase 4
+
+(defun undo-commit (s)
+  "Persist buffered puts/deletes into the undo store as ONE crash-safe write txn."
+  (when (plusp (hash-table-count (pt-undo-store-buf s)))
+    (pt:with-write-txn (txn (pt-undo-store-store s))
+      (maphash (lambda (h v)
+                 (if (eq v :deleted)
+                     (pt:tdel txn (%ukey h))
+                     (pt:tput txn (%ukey h) v)))
+               (pt-undo-store-buf s)))
+    (clrhash (pt-undo-store-buf s))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; activate-best-chain

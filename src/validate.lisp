@@ -24,7 +24,7 @@
    #:block-subsidy #:connect-block #:disconnect-block #:consensus-error
    #:run-ibd #:resume-ibd #:run-ibd-async #:chainstate-path #:consensus-flags
    #:*verify-workers*
-   #:block-undo #:block-undo-spent #:block-undo-created
+   #:block-undo #:make-block-undo #:block-undo-spent #:block-undo-created
    #:block-weight #:count-sigops
    #:+bip16-height+ #:+segwit-height+ #:+taproot-height+ #:+bip34-height+
    #:*coinbase-maturity* #:*max-block-weight* #:*max-block-sigops*))
@@ -494,7 +494,7 @@
 (defun run-ibd-async (peer-or-peers utxo &key (from 1) (to (c:tip-height)) (batch 64)
                                      (assumevalid-below 0) (save-every 10000)
                                      (workers 100) (progress-every 1000) (maxq 8192)
-                                     max-inflight peer-source)
+                                     max-inflight peer-source undo-sink undo-checkpoint)
   "Pipelined IBD: N fetcher threads (one per peer in PEER-OR-PEERS — pass a single
    peer or a list) download blocks in parallel while connect runs them in order
    and WORKERS verify scripts asynchronously across all cores.  Below
@@ -535,8 +535,13 @@
                 (loop for b across blocks for h from bh do
                   (unless b (cerr h "peer did not return block"))
                   (let ((cn0 (get-internal-real-time)))
-                    (connect-block b h utxo :verify-scripts (>= h assumevalid-below)
-                                           :check-sink sink :skip-structural t)
+                    (multiple-value-bind (fees undo)
+                        (connect-block b h utxo :verify-scripts (>= h assumevalid-below)
+                                               :check-sink sink :skip-structural t)
+                      (declare (ignore fees))
+                      ;; record per-block undo for reorg roll-back (sink buffers it;
+                      ;; UNDO-CHECKPOINT persists it in lockstep with the UTXO save).
+                      (when undo-sink (funcall undo-sink h undo)))
                     (incf cn (- (get-internal-real-time) cn0)))
                   (setf last h)
                   (when (zerop (mod h progress-every))
@@ -551,11 +556,13 @@
                   (when (and save-every (zerop (mod h save-every)))
                     (loop until (vq-drained-p vq h) do (sleep 0.02))
                     (fail-check) (u:save-utxo utxo (chainstate-path) h)
+                    (when undo-checkpoint (funcall undo-checkpoint))
                     (format t "~&[ibd] checkpoint @ ~d (verified)~%" h) (force-output)))))
             (when (ibd-q-err q) (error (ibd-q-err q)))
             (loop until (vq-drained-p vq last) do (sleep 0.02))
             (fail-check)
-            (when save-every (u:save-utxo utxo (chainstate-path) last))
+            (when save-every (u:save-utxo utxo (chainstate-path) last)
+                  (when undo-checkpoint (funcall undo-checkpoint)))
             last)
           (progn
             ;; force any still-running fetchers to exit, then reap them

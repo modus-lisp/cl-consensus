@@ -30,7 +30,7 @@
                     (:blk :cl-consensus.block) (:tx :cl-consensus.tx)
                     (:u :cl-consensus.utxo) (:w :cl-consensus.wire)
                     (:r :cl-consensus.reorg))
-  (:export #:run))
+  (:export #:run #:run-persistent #:run-all))
 (in-package :reorg-equiv)
 
 (defparameter *bits* #x1d00ffff)            ; mainnet min-difficulty nBits (any fixed value)
@@ -157,3 +157,41 @@
     (format t "~&reorg-equiv: ~a~%"
             (if ok "ALL EQUIVALENT — reorg == fresh winning branch (both directions)" "FAILED"))
     ok))
+
+(defun run-persistent ()
+  "Same A->B reorg but with the PERSISTENT pagetree-backed undo store, committed and
+   then CLOSED + REOPENED from disk before the reorg — proving the undo survives the
+   per-poll-process boundary (a reorg detected in a fresh process reads undo written
+   by a prior one)."
+  (let ((v:*coinbase-maturity* 0) (ok t)
+        (upath "/mnt/lisp/ptchain/test/undo.pt")
+        common last3 a-blocks b-blocks b-tip)
+    (ensure-directories-exist "/mnt/lisp/ptchain/test/")
+    (dolist (e (list "" ".rebuild")) (ignore-errors (delete-file (concatenate 'string upath e))))
+    (c:init-chain)
+    (multiple-value-setq (common last3) (build-segment (c:tip) 0 3 10))
+    (multiple-value-setq (a-blocks) (build-segment last3 3 2 20))
+    (multiple-value-setq (b-blocks b-tip) (build-segment last3 3 3 40))
+    (let ((set (u:open-pagetree-utxo nil))
+          (undo (r:open-pt-undo-store upath))
+          (fetch-b (let ((tab (index-blocks common b-blocks))) (lambda (h) (gethash (c:header-hash-hex h) tab)))))
+      ;; connect common+A, stage undo, COMMIT to disk
+      (connect-all set (append common a-blocks) undo)
+      (r:undo-commit undo)
+      ;; CLOSE + REOPEN the undo store: the reorg below must read A's undo from DISK
+      (r:close-pt-undo-store undo)
+      (setf undo (r:open-pt-undo-store upath))
+      (multiple-value-bind (nh reorged depth) (r:activate-best-chain set 5 undo fetch-b :verify-scripts nil)
+        (r:undo-commit undo)
+        (let ((ref-b (u:open-pagetree-utxo nil)))
+          (connect-all ref-b (append common b-blocks) nil)
+          (unless (and reorged (= nh (c:header-height b-tip)) (= depth 2) (snap= (snap set) (snap ref-b)))
+            (setf ok nil) (format t "  *** persistent reorg mismatch~%"))
+          (format t "~&[persist] reorg A->B via undo read from DISK (reopened) == fresh B: ~a (count ~d)~%"
+                  (snap= (snap set) (snap ref-b)) (second (snap set)))))
+      (r:close-pt-undo-store undo) (u:close-utxo set))
+    (dolist (e (list "" ".rebuild")) (ignore-errors (delete-file (concatenate 'string upath e))))
+    (format t "reorg-equiv-persistent: ~a~%" (if ok "OK — undo survives disk reopen; reorg correct" "FAILED"))
+    ok))
+
+(defun run-all () (let ((a (run)) (b (run-persistent))) (and a b)))
