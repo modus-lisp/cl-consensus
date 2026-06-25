@@ -21,6 +21,7 @@
    #:utxo-get #:utxo-add #:utxo-spend #:utxo-key #:utxo-digest
    #:save-utxo #:load-utxo
    #:open-disk-utxo #:flush-utxo #:close-utxo #:utxo-disk-p #:+udb-tip-capacity+
+   #:*utxo-flush-method*
    #:open-pagetree-utxo #:utxo-pagetree-p #:open-utxo-backend
    #:prefetch-resolve #:set-prefetch #:clear-prefetch))
 
@@ -221,14 +222,22 @@
         (force-output)
         height))))
 
+(defvar *utxo-flush-method* :auto
+  "How FLUSH-UTXO applies the pagetree staging buffer: :incremental | :rebuild |
+   :auto (default).  The IBD driver binds this per catch-up based on backlog depth —
+   :rebuild (merge + bulk-build a fresh compacted store) wins for a DEEP backlog,
+   :incremental for steady-state.  No effect on the udb backend.")
+
 (defun flush-utxo (set height)
   "Apply the staging buffer to the mmap, msync, and atomically write the marker
    at HEIGHT — leaving the on-disk store consistent at a verified height.  The
    delta is WAL-logged first so an interrupted flush is replayable, not corrupting."
-  ;; pagetree backend: one CoW write txn (atomic meta swap = crash-safe, no WAL).
+  ;; pagetree backend: one CoW write txn (atomic meta swap = crash-safe, no WAL),
+  ;; OR a merge-rebuild for a huge (deep-backlog) staging — per *utxo-flush-method*.
   (when (utxo-set-pt set)
     (pt:ptu-flush (utxo-set-pt set) (utxo-set-staging set) height
                   (utxo-set-total-value set) (utxo-set-count set)
+                  :method *utxo-flush-method*
                   :coin-value #'coin-value :coin-height #'coin-height
                   :coin-coinbase-p #'coin-coinbase-p :coin-script #'coin-script)
     (clrhash (utxo-set-staging set))

@@ -33,6 +33,7 @@
    ;; raw helpers reused by utxo.lisp's dispatcher
    #:ptu #:make-ptu #:ptu-store #:ptu-height #:ptu-total #:ptu-count #:ptu-path
    #:ptu-get #:ptu-put #:ptu-del #:ptu-flush #:ptu-close #:ptu-map-coins
+   #:ptu-incremental-flush #:ptu-rebuild-flush #:*pt-rebuild-ratio*
    #:encode-coin #:decode-coin #:encode-key))
 (in-package #:cl-consensus.utxo-pagetree)
 
@@ -195,29 +196,120 @@
         (when (> x y) (return-from %key< nil))))
     (< (length a) (length b))))
 
-(defun ptu-flush (ptu staging height total count
-                  &key coin-value coin-height coin-coinbase-p coin-script)
-  "Apply STAGING to the store as ONE atomic batched write txn — sorted bulk apply
-   (~7-20x faster than per-key), then commit the (height,total,count) meta in the
-   SAME txn (CoW + atomic meta swap = crash-safe, no WAL).  COIN-* are accessors
-   so this stays decoupled from the COIN struct in utxo.lisp."
+(defparameter *pt-rebuild-ratio* 0.25
+  "When METHOD is :auto, PTU-FLUSH rebuilds instead of incrementally applying once
+   staging changes reach this fraction of the committed coin count — roughly the
+   point where an incremental CoW flush costs ~2x a full rebuild.  (The IBD driver
+   normally picks the method explicitly from the backlog depth; :auto is a fallback
+   for callers that don't.)")
+
+(defun %staging->sorted-ops (staging coin-value coin-height coin-coinbase-p coin-script)
+  "Materialize STAGING into a SIMPLE-VECTOR of (encoded-key . (encoded-coin |
+   :delete)) sorted ascending by key (staging keys are unique)."
   (let ((ops (make-array (hash-table-count staging))) (i 0))
     (maphash
      (lambda (key v)
-       (let ((ek (encode-key (car key) (cdr key))))
-         (setf (aref ops i)
-               (cons ek (if (eq v :spent)
-                            :delete
-                            (encode-coin (funcall coin-value v) (funcall coin-height v)
-                                         (funcall coin-coinbase-p v) (funcall coin-script v)))))
-         (incf i)))
+       (setf (aref ops i)
+             (cons (encode-key (car key) (cdr key))
+                   (if (eq v :spent)
+                       :delete
+                       (encode-coin (funcall coin-value v) (funcall coin-height v)
+                                    (funcall coin-coinbase-p v) (funcall coin-script v)))))
+       (incf i))
      staging)
-    (sort ops #'%key< :key #'car)        ; staging keys are unique (one entry per outpoint)
+    (sort ops #'%key< :key #'car)))
+
+(defun ptu-incremental-flush (ptu staging height total count
+                              &key coin-value coin-height coin-coinbase-p coin-script)
+  "Apply STAGING as ONE atomic batched CoW write txn (sorted bulk apply), then commit
+   the (height,total,count) meta in the SAME txn (atomic meta swap = crash-safe, no
+   WAL).  Fast for small/moderate staging; the steady-state path."
+  (let ((ops (%staging->sorted-ops staging coin-value coin-height coin-coinbase-p coin-script)))
     (pt:with-write-txn (txn (ptu-store ptu))
       (pt:tapply-batch txn ops :sorted t)
       (%write-meta txn height total count)))
   (setf (ptu-height ptu) height (ptu-total ptu) total (ptu-count ptu) count)
   height)
+
+(defun ptu-rebuild-flush (ptu staging height total count
+                          &key coin-value coin-height coin-coinbase-p coin-script)
+  "Flush STAGING by MERGE-REBUILD: stream the committed B+tree (ordered cursor)
+   merged with the sorted staging change-set into a FRESH, compacted store built
+   bottom-up (tbulk-build-stream), then atomically swap it in (single-file rename).
+   Cost is O(committed set) sequential and INDEPENDENT of staging size — the fast
+   path when staging is huge (a deep backlog), where incremental random CoW would be
+   far slower and memory-heavy.  Also un-bloats the CoW-grown file.  Crash-safe: the
+   live store is untouched until the atomic rename; a crash before it just resumes
+   from the last committed height (the window's blocks are re-applied)."
+  (let ((ops (%staging->sorted-ops staging coin-value coin-height coin-coinbase-p coin-script))
+        (ns (hash-table-count staging))
+        (path (ptu-path ptu))
+        (cb (ptu-cache-bytes ptu))
+        (ps (ptu-page-size ptu)))
+    (let ((tmp (concatenate 'string path ".rebuild")))
+      (ignore-errors (delete-file tmp))
+      (let ((new (pt:open-store tmp :page-size ps :cache-bytes cb :create t)))
+        (unwind-protect
+             (pt:with-read-txn (rtxn (ptu-store ptu))
+               (let ((cur (pt:tcursor rtxn)) (oi 0) (have nil))
+                 (setf have (pt:cursor-first cur))
+                 ;; skip the leading reserved meta key (#(0), not a 36-byte outpoint)
+                 (loop while (and have (/= (length (pt:cursor-key cur)) 36))
+                       do (setf have (pt:cursor-next cur)))
+                 (labels
+                     ((next ()
+                        ;; merge the committed cursor with the sorted staging ops:
+                        ;; committed coin kept unless staging overrides (overwrite) or
+                        ;; deletes it; staging adds emitted in key order.  Yields
+                        ;; (key . encoded-value) strictly ascending, no duplicates.
+                        (loop
+                          (let ((ck (and have (pt:cursor-key cur)))
+                                (ok (and (< oi ns) (car (aref ops oi)))))
+                            (cond
+                              ((and (null ck) (null ok)) (return nil))
+                              ((or (null ck) (and ok (%key< ok ck)))         ; staged add
+                               (let ((v (cdr (aref ops oi)))) (incf oi)
+                                 (unless (eq v :delete) (return (cons ok v)))))
+                              ((or (null ok) (%key< ck ok))                  ; keep committed
+                               (let ((kv (cons (copy-seq ck) (pt:cursor-value cur))))
+                                 (setf have (pt:cursor-next cur))
+                                 (return kv)))
+                              (t                                             ; ck = ok: override
+                               (let ((v (cdr (aref ops oi)))) (incf oi)
+                                 (setf have (pt:cursor-next cur))
+                                 (unless (eq v :delete) (return (cons ok v))))))))))
+                   (pt:with-write-txn (wtxn new)
+                     (pt:tbulk-build-stream wtxn #'next)
+                     (%write-meta wtxn height total count)))))
+          (pt:close-store new)))
+      ;; atomic single-file swap, then reopen the live handle on the fresh store
+      (pt:close-store (ptu-store ptu))
+      (sb-posix:rename tmp path)
+      (setf (ptu-store ptu) (pt:open-store path :page-size ps :cache-bytes cb))))
+  (setf (ptu-height ptu) height (ptu-total ptu) total (ptu-count ptu) count)
+  height)
+
+(defun ptu-flush (ptu staging height total count
+                  &key coin-value coin-height coin-coinbase-p coin-script (method :auto))
+  "Flush STAGING to the committed store + commit the (height,total,count) meta.
+   METHOD selects the strategy: :incremental (sorted CoW tapply-batch — steady-state
+   default), :rebuild (merge + bulk-build a fresh compacted store, swapped in
+   atomically — the deep-backlog path, O(set) and staging-size-independent), or
+   :auto (pick by the staging/committed ratio vs *pt-rebuild-ratio*).  Both paths
+   leave the store crash-safe at HEIGHT."
+  (let ((rebuild (ecase method
+                   (:incremental nil)
+                   (:rebuild t)
+                   (:auto (and (plusp count)
+                               (>= (hash-table-count staging)
+                                   (floor (* *pt-rebuild-ratio* count))))))))
+    (if rebuild
+        (ptu-rebuild-flush ptu staging height total count
+                           :coin-value coin-value :coin-height coin-height
+                           :coin-coinbase-p coin-coinbase-p :coin-script coin-script)
+        (ptu-incremental-flush ptu staging height total count
+                               :coin-value coin-value :coin-height coin-height
+                               :coin-coinbase-p coin-coinbase-p :coin-script coin-script))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Ordered scan over all committed coins (skips the reserved meta key).
