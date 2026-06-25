@@ -15,7 +15,7 @@
   (:local-nicknames (#:w #:cl-consensus.wire) (#:bt #:bordeaux-threads))
   (:export
    #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
-   #:peer-services #:peer-alive-p #:peer-connected-at
+   #:peer-services #:peer-alive-p #:peer-connected-at #:peer-prefers-headers
    #:connect-peer #:accept-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
    #:*default-user-agent* #:*protocol-version*))
@@ -34,6 +34,7 @@
   ;; peer-reported handshake info
   version services subver height
   (connected-at 0)
+  (prefers-headers nil)   ; peer sent BIP130 "sendheaders" -> announce blocks via headers
   (verbose nil))
 
 (defun peer-addr (p) (format nil "~a:~d" (peer-host p) (peer-port p)))
@@ -148,8 +149,9 @@
   (cond
     ((string= command "ping")
      (send p "pong" payload) t)          ; echo the nonce
-    ((member command '("alert" "feefilter" "sendheaders" "sendcmpct"
-                       "wtxidrelay")
+    ((string= command "sendheaders")
+     (setf (peer-prefers-headers p) t) t) ; BIP130: announce new blocks via headers
+    ((member command '("alert" "feefilter" "sendcmpct" "wtxidrelay")
              :test #'string=)
      t)                                   ; ignore for now
     ;; NOTE: "addr"/"addrv2"/"getheaders"/"getdata" are intentionally NOT swallowed

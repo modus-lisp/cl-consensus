@@ -17,6 +17,7 @@
                     (#:bt #:bordeaux-threads))
   (:export #:parse-getheaders #:build-headers-message #:serve-getheaders
            #:parse-getdata #:serve-getdata #:*block-store*
+           #:build-inv-message #:announce-block #:*max-relay-advance*
            #:install-serving-handlers #:start-listener #:serve-daemon
            #:*inbound-peers*))
 (in-package #:cl-consensus.serve)
@@ -176,14 +177,71 @@
 ;;; The serving daemon
 ;;; ----------------------------------------------------------------------------
 
+;;; ----------------------------------------------------------------------------
+;;; Block relay — announce new blocks to inbound peers (Phase 3a)
+;;; ----------------------------------------------------------------------------
+
+(defparameter *max-relay-advance* 8
+  "Only RELAY a tip advance of at most this many blocks.  A bigger jump is catch-up
+   (e.g. the initial header sync), not live propagation — those blocks are covered by
+   the recent-window backfill, not the per-block relay path.")
+
+(defun build-inv-message (entries)
+  "Serialize an 'inv' payload from a list of (type . hash) inventory entries (same
+   wire layout as getdata)."
+  (let ((wr (w:make-writer)))
+    (w:w-varint wr (length entries))
+    (dolist (e entries) (w:w-u32 wr (car e)) (w:w-hash wr (cdr e)))
+    (w:writer-bytes wr)))
+
+(defun announce-block (header)
+  "Announce HEADER to every live inbound peer: a BIP130 'headers' announcement to
+   peers that sent sendheaders, an 'inv' (MSG_BLOCK) to the rest.  Per-peer error
+   isolation; the peer follows up with getdata, which serve-getdata answers from the
+   block store."
+  (let ((peers (bt:with-lock-held (*inbound-lock*) (copy-list *inbound-peers*)))
+        (hash (c:header-hash header)))
+    (dolist (pr peers)
+      (when (p:peer-alive-p pr)
+        (handler-case
+            (if (p:peer-prefers-headers pr)
+                (p:send pr "headers" (build-headers-message (list header)))
+                (p:send pr "inv" (build-inv-message (list (cons blk:+msg-block+ hash)))))
+          (serious-condition (e)
+            (format t "~&[serve] announce to ~a failed: ~a~%" (p:peer-addr pr) e) (force-output)))))))
+
+(defun %relay-range (out from to)
+  "For each new live block height in [FROM..TO]: fetch its raw bytes from OUT, store
+   them (so we can serve the getdata), and announce the header to inbound peers."
+  (loop for ht from from to to do
+    (let ((hdr (c:header-at-height ht)))
+      (when hdr
+        (handler-case
+            (let ((hx (c:header-hash-hex hdr)))
+              (unless (and *block-store* (bs:block-store-has-p *block-store* hx))
+                (when *block-store*
+                  (bs:store-block *block-store* (blk:get-block-raw out (c:header-hash hdr) :timeout 30))))
+              (announce-block hdr)
+              (format t "~&[serve] relayed block ~d ~a to ~d peer(s)~%"
+                      ht hx (length *inbound-peers*)) (force-output))
+          (serious-condition (e)
+            (format t "~&[serve] relay block ~d failed: ~a~%" ht e) (force-output)))))))
+
 (defun %follow-headers (out)
   "Install live header-following handlers on the OUTBOUND peer so the chain stays
-   current (we serve the freshest headers)."
+   current (we serve the freshest headers) AND relay newly-connected blocks to our
+   inbound peers.  A large advance (initial sync) is followed but NOT relayed per-block
+   — only small live advances propagate."
   (p:on out "headers"
         (lambda (pr payload)
-          (dolist (h (c::parse-headers-message payload))
-            (handler-case (c:add-header h) (serious-condition () nil)))
-          (p:send pr "getheaders" (c::build-getheaders-payload (c:build-locator)))))
+          (let ((before (c:tip-height)))
+            (dolist (h (c::parse-headers-message payload))
+              (handler-case (c:add-header h) (serious-condition () nil)))
+            (let* ((after (c:tip-height)) (delta (- after before)))
+              (when (and (plusp delta) (<= delta *max-relay-advance*))
+                (%relay-range out (1+ before) after))
+              (when (plusp delta)
+                (p:send pr "getheaders" (c::build-getheaders-payload (c:build-locator))))))))
   (p:on out "inv"
         (lambda (pr payload)
           (declare (ignore payload))
