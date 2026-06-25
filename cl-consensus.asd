@@ -26,6 +26,7 @@
      (:file "utxo-pagetree") ; pagetree CoW-B+tree UTXO backend (modus-portable A/B)
      (:file "utxo")        ; UTXO set (in-RAM + disk-backed via utxo-disk / pagetree)
      (:file "block")       ; block parse, merkle root, block download
+     (:file "blockstore")  ; append-only raw-block store (serve blocks we've fetched)
      (:file "script")      ; the Script interpreter + sighash (the consensus core)
      (:file "validate")    ; connect/disconnect-block, consensus rules, IBD
      (:file "reorg")       ; tip reorg / best-chain activation

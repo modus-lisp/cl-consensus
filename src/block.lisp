@@ -18,7 +18,7 @@
   (:export
    #:block* #:block-header #:block-txs #:block-hash #:block-hash-hex
    #:parse-block #:merkle-root #:compute-merkle-root #:verify-merkle
-   #:get-block #:get-block-at-height #:get-blocks
+   #:get-block #:get-block-raw #:get-block-at-height #:get-blocks
    #:+msg-block+ #:+msg-witness-block+ #:witness-commitment))
 
 (in-package #:cl-consensus.block)
@@ -122,6 +122,24 @@
     (unless (bt:wait-on-semaphore done :timeout timeout)
       (error "timed out waiting for block ~a" (w:hash->hex hash)))
     (when err (error err))
+    result))
+
+(defun get-block-raw (peer hash &key (timeout 30) (witness t))
+  "Like GET-BLOCK but return the RAW block wire bytes (the 'block' message payload),
+   not a parsed BLOCK*.  Verifies the 80-byte header hashes to HASH before accepting.
+   Used by the block store to keep the exact serialized bytes for re-serving."
+  (let ((result nil) (done (bt:make-semaphore)))
+    (p:on peer "block"
+          (lambda (pr payload)
+            (declare (ignore pr))
+            (when (and (>= (length payload) 80)
+                       (equalp (w:hash256 (subseq payload 0 80)) hash))
+              (setf result payload)
+              (bt:signal-semaphore done))))
+    (p:send peer "getdata"
+            (build-getdata-payload (if witness +msg-witness-block+ +msg-block+) hash))
+    (unless (bt:wait-on-semaphore done :timeout timeout)
+      (error "timed out waiting for raw block ~a" (w:hash->hex hash)))
     result))
 
 (defun get-block-at-height (peer height &key (witness t))

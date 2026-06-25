@@ -17,9 +17,16 @@
   (:use :cl)
   (:local-nicknames (:c :cl-consensus.chain) (:p :cl-consensus.peer)
                     (:w :cl-consensus.wire) (:s :cl-consensus.serve)
+                    (:bs :cl-consensus.blockstore) (:blk :cl-consensus.block)
                     (:bt :bordeaux-threads))
   (:export #:run))
 (in-package :serve-test)
+
+(defun fake-raw-block (hdr)
+  "A raw block for synthetic HDR: its 80-byte serialized header + an empty tx-count.
+   The block hash is taken over the 80-byte header, so it matches HDR's hash."
+  (let ((hb (c:serialize-header hdr)))
+    (concatenate '(simple-array (unsigned-byte 8) (*)) hb #(0))))
 
 (defun make-hdr (prev-header height)
   "A synthetic header building on PREV-HEADER (PoW/difficulty skipped via validate nil;
@@ -66,6 +73,35 @@
                (unless (equalp (c:header-hash hdr) (c:header-hash (c:header-at-height ht)))
                  (setf ok nil) (format t "  *** header at height ~d mismatch~%" ht)))
              (format t "[serve-test] all ~d served headers match our chain: ~a~%" n ok))))
+      ;; ---- getdata(block) round-trip ----
+      (let* ((path "/tmp/serve-test-blocks.dat")
+             (target (c:header-at-height 3))
+             (raw (fake-raw-block target))
+             (gotblk nil) (bdone nil))
+        (ignore-errors (delete-file path))
+        (setf s:*block-store* (bs:open-block-store path))
+        ;; store all n synthetic blocks; we'll request height 3
+        (loop for ht from 1 to n do (bs:store-block s:*block-store* (fake-raw-block (c:header-at-height ht))))
+        (p:on out "block" (lambda (pr payload) (declare (ignore pr)) (setf gotblk payload bdone t)))
+        (p:send out "getdata"
+                (cl-consensus.block::build-getdata-payload blk:+msg-witness-block+ (c:header-hash target)))
+        (loop repeat 50 until bdone do (sleep 0.1))
+        (cond
+          ((not bdone) (setf ok nil) (format t "  *** no block response to getdata~%"))
+          ((not (equalp gotblk raw)) (setf ok nil) (format t "  *** served block bytes mismatch~%"))
+          (t (format t "[serve-test] getdata(block) round-trip exact bytes: OK~%")))
+        ;; getdata for an unknown block -> notfound
+        (let ((nf nil) (nfdone nil)
+              (unknown (make-array 32 :element-type '(unsigned-byte 8) :initial-element 99)))
+          (p:on out "notfound" (lambda (pr payload) (declare (ignore pr)) (setf nf payload nfdone t)))
+          (p:send out "getdata"
+                  (cl-consensus.block::build-getdata-payload blk:+msg-witness-block+ unknown))
+          (loop repeat 50 until nfdone do (sleep 0.1))
+          (if (and nfdone nf) (format t "[serve-test] unknown getdata -> notfound: OK~%")
+              (progn (setf ok nil) (format t "  *** expected notfound for unknown block~%"))))
+        (ignore-errors (bs:close-block-store s:*block-store*))
+        (setf s:*block-store* nil)
+        (ignore-errors (delete-file path)))
       (ignore-errors (p:disconnect out)))
-    (format t "~&serve-test: ~a~%" (if ok "OK — inbound handshake + getheaders served correctly" "FAILED"))
+    (format t "~&serve-test: ~a~%" (if ok "OK — inbound handshake + getheaders + getdata served correctly" "FAILED"))
     ok))
