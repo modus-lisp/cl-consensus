@@ -500,6 +500,11 @@
    and WORKERS verify scripts asynchronously across all cores.  Below
    ASSUMEVALID-BELOW scripts are skipped.  Checkpoints (every SAVE-EVERY) drain to
    a fully-verified height first.  Returns the last verified height."
+  ;; Nothing to do (already at/after the tip): return immediately.  Otherwise the
+  ;; final drain loop (until vq-drained-p ... last) would spin forever, because no
+  ;; blocks => no verify jobs => the queue never reaches LAST.
+  (when (> from to)
+    (return-from run-ibd-async (1- from)))
   (let* ((peers (if (listp peer-or-peers) peer-or-peers (list peer-or-peers)))
          (n (length peers))
          (mi (or max-inflight (max (* 2 n) 4)))
