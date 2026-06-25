@@ -107,6 +107,8 @@
   "4-byte big-endian height key (heights sort/scan in order)."
   (let ((k (make-array 4 :element-type '(unsigned-byte 8))))
     (dotimes (i 4 k) (setf (aref k i) (logand (ash height (* -8 (- 3 i))) #xff)))))
+(defun %key->height (k)
+  (logior (ash (aref k 0) 24) (ash (aref k 1) 16) (ash (aref k 2) 8) (aref k 3)))
 
 (defstruct (pt-undo-store (:constructor %make-pt-undo-store))
   store
@@ -134,7 +136,23 @@
 (defmethod undo-del ((s pt-undo-store) height)
   (setf (gethash height (pt-undo-store-buf s)) :deleted))
 (defmethod undo-prune ((s pt-undo-store) below)
-  (declare (ignore below)) nil)       ; kept simple in 1b; bounded pruning is Phase 4
+  "Delete persisted undo for heights < BELOW (bound the on-disk window — a full
+   block's undo is ~hundreds of KB, so an unbounded store would grow ~tens of GB/yr;
+   only the last ~max-depth blocks are ever needed for a reorg).  Keys are u32-be
+   height so the cursor yields them in ascending order — stop at the first >= BELOW."
+  (when (plusp below)
+    (let ((dead '()))
+      (pt:with-read-txn (txn (pt-undo-store-store s))
+        (let ((c (pt:tcursor txn)))
+          (when (pt:cursor-first c)
+            (loop (let ((k (pt:cursor-key c)))
+                    (when (>= (%key->height k) below) (return))
+                    (push (copy-seq k) dead))
+                  (unless (pt:cursor-next c) (return))))))
+      (when dead
+        (pt:with-write-txn (txn (pt-undo-store-store s))
+          (dolist (k dead) (pt:tdel txn k))))
+      (length dead))))
 
 (defun undo-commit (s)
   "Persist buffered puts/deletes into the undo store as ONE crash-safe write txn."
