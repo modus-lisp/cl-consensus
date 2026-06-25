@@ -210,38 +210,43 @@
           (serious-condition (e)
             (format t "~&[serve] announce to ~a failed: ~a~%" (p:peer-addr pr) e) (force-output)))))))
 
-(defun %relay-range (out from to)
-  "For each new live block height in [FROM..TO]: fetch its raw bytes from OUT, store
-   them (so we can serve the getdata), and announce the header to inbound peers."
-  (loop for ht from from to to do
-    (let ((hdr (c:header-at-height ht)))
-      (when hdr
-        (handler-case
-            (let ((hx (c:header-hash-hex hdr)))
-              (unless (and *block-store* (bs:block-store-has-p *block-store* hx))
-                (when *block-store*
-                  (bs:store-block *block-store* (blk:get-block-raw out (c:header-hash hdr) :timeout 30))))
+(defun %announce-new (last-announced)
+  "MAIN-THREAD relay step.  Announce blocks newly available above LAST-ANNOUNCED, in
+   order, returning the new high-water mark.  Only blocks we actually have STORED are
+   announced (so the peer's getdata is answerable); a contiguous run stops at the first
+   not-yet-stored height and retries next tick.  A large gap (> *max-relay-advance*) is
+   catch-up, not live propagation: jump the mark to tip WITHOUT announcing (those blocks
+   are covered by the recent-window backfill).
+
+   This runs on the daemon's main loop, NEVER inside the read-loop dispatch handler — a
+   synchronous getdata there would deadlock the very thread that must deliver the reply."
+  (let ((tip (c:tip-height)))
+    (when (> (- tip last-announced) *max-relay-advance*)
+      (return-from %announce-new tip))            ; catch-up: skip relay
+    (loop for ht from (1+ last-announced) to tip do
+      (let ((hdr (c:header-at-height ht)))
+        (if (and hdr *block-store*
+                 (bs:block-store-has-p *block-store* (c:header-hash-hex hdr)))
+            (progn
               (announce-block hdr)
               (format t "~&[serve] relayed block ~d ~a to ~d peer(s)~%"
-                      ht hx (length *inbound-peers*)) (force-output))
-          (serious-condition (e)
-            (format t "~&[serve] relay block ~d failed: ~a~%" ht e) (force-output)))))))
+                      ht (c:header-hash-hex hdr) (length *inbound-peers*)) (force-output)
+              (setf last-announced ht))
+            (return))))                            ; not stored yet -> retry next tick
+    last-announced))
 
 (defun %follow-headers (out)
-  "Install live header-following handlers on the OUTBOUND peer so the chain stays
-   current (we serve the freshest headers) AND relay newly-connected blocks to our
-   inbound peers.  A large advance (initial sync) is followed but NOT relayed per-block
-   — only small live advances propagate."
+  "Keep the chain current from the OUTBOUND peer: on any headers/inv, add and
+   re-request.  Block FETCH + relay happen on the main daemon loop (see %announce-new) —
+   we deliberately do NO synchronous getdata here, since this runs on the read-loop
+   thread and blocking it would deadlock against the reply it must itself read."
   (p:on out "headers"
         (lambda (pr payload)
           (let ((before (c:tip-height)))
             (dolist (h (c::parse-headers-message payload))
               (handler-case (c:add-header h) (serious-condition () nil)))
-            (let* ((after (c:tip-height)) (delta (- after before)))
-              (when (and (plusp delta) (<= delta *max-relay-advance*))
-                (%relay-range out (1+ before) after))
-              (when (plusp delta)
-                (p:send pr "getheaders" (c::build-getheaders-payload (c:build-locator))))))))
+            (when (> (c:tip-height) before)
+              (p:send pr "getheaders" (c::build-getheaders-payload (c:build-locator)))))))
   (p:on out "inv"
         (lambda (pr payload)
           (declare (ignore payload))
@@ -293,11 +298,20 @@
     (%follow-headers out)
     (format t "~&[serve] following headers via ~a; tip ~d~%" peer-host (c:tip-height)) (force-output)
     (start-listener :port listen-port :max-peers max-peers)
-    (loop
-      (handler-case (%backfill-recent out :recent recent-blocks)
-        (serious-condition (e) (format t "~&[serve] backfill error: ~a~%" e) (force-output)))
-      (sleep 60)
-      (format t "~&[serve] tip ~d, ~d inbound peers, ~d blocks stored~%"
-              (c:tip-height) (%reap-inbound)
-              (if *block-store* (bs:block-store-count *block-store*) 0))
-      (force-output))))
+    ;; main loop: store the recent window + relay newly-stored blocks.  Both block
+    ;; fetches (getdata) happen HERE, serialized on this thread, so they never deadlock
+    ;; the read-loop and never race each other for the single 'block' handler slot.
+    ;; last-announced starts at the boot tip so the backfilled window isn't re-announced.
+    (let ((last-announced (c:tip-height)) (ticks 0))
+      (loop
+        (handler-case (%backfill-recent out :recent recent-blocks)
+          (serious-condition (e) (format t "~&[serve] backfill error: ~a~%" e) (force-output)))
+        (handler-case (setf last-announced (%announce-new last-announced))
+          (serious-condition (e) (format t "~&[serve] announce error: ~a~%" e) (force-output)))
+        (when (>= (incf ticks) 12)                 ; status every ~60s (12 * 5s)
+          (setf ticks 0)
+          (format t "~&[serve] tip ~d, ~d inbound peers, ~d blocks stored~%"
+                  (c:tip-height) (%reap-inbound)
+                  (if *block-store* (bs:block-store-count *block-store*) 0))
+          (force-output))
+        (sleep 5)))))
