@@ -14,7 +14,7 @@
   (:use :cl)
   (:local-nicknames (:enc :cl-consensus.encoding) (:b32 :cl-consensus.bip32)
                     (:w :cl-consensus.wire) (:wal :cl-consensus.wallet)
-                    (:tx :cl-consensus.tx) (:u :cl-consensus.utxo))
+                    (:tx :cl-consensus.tx) (:u :cl-consensus.utxo) (:s :cl-consensus.script))
   (:export #:run))
 (in-package :wallet-test)
 
@@ -112,6 +112,27 @@
   ;; ---- P2PKH wallet derives legacy addresses ----
   (let ((wpk (wal:make-wallet-from-seed (hx "000102030405060708090a0b0c0d0e0f") :type :p2pkh)))
     (checkt "p2pkh address starts with 1" (char= (char (wal:wallet-receive-address wpk 0) 0) #\1)))
+  ;; ---- Phase 3: build + sign a spend; our own interpreter must accept each input ----
+  (flet ((spend-check (type dest)
+           (let* ((wal (wal:make-wallet-from-seed (hx "000102030405060708090a0b0c0d0e0f") :type type))
+                  (spk (wal::waddr-script (aref (wal:wallet-receive wal) 0)))
+                  (fund (mk-tx (list (cons (hx "ab") 0)) (list (cons 1000000 spk)))))
+             (wal:wallet-process-tx wal fund 200)
+             (let ((txn (wal:create-tx wal (list (cons dest 400000)) :feerate 2)))
+               (checkt (format nil "~a: one input selected" type) (= 1 (length (tx:tx-inputs txn))))
+               (checkt (format nil "~a: dest + change outputs" type) (>= (length (tx:tx-outputs txn)) 2))
+               ;; the spend must verify under OUR Core-differential-tested interpreter
+               (handler-case
+                   (checkt (format nil "~a: input 0 verifies (sig+sighash correct)" type)
+                           (s:verify-input txn 0 spk 1000000))
+                 (s:script-error (e)
+                   (setf *ok* nil) (format t "  *** ~a verify raised: ~a~%" type e)))
+               ;; fee is positive and conservation holds (in=out+fee)
+               (let ((out-sum (reduce #'+ (tx:tx-outputs txn) :key #'tx:txout-value)))
+                 (checkt (format nil "~a: fee positive + conserved" type)
+                         (< 0 (- 1000000 out-sum) 100000)))))))
+    (spend-check :p2wpkh "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+    (spend-check :p2pkh "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"))
   (format t "~&wallet-test: ~a~%"
-          (if *ok* "OK — base58check + bech32/bech32m + BIP32 + watch/balance" "FAILED"))
+          (if *ok* "OK — encodings + BIP32 + watch/balance + build/sign/verify" "FAILED"))
   *ok*)

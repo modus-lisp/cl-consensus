@@ -19,8 +19,9 @@
    #:wallet-receive-address #:wallet-change-address #:wallet-addresses
    #:wallet-process-tx #:wallet-process-block #:wallet-rescan-utxo
    #:waddr #:waddr-address #:waddr-script #:waddr-index #:waddr-chain
-   #:wcoin #:wcoin-value #:wcoin-txid #:wcoin-vout #:wcoin-script
-   #:script-for #:purpose-for))
+   #:waddr-xkey #:waddr-pubkey
+   #:wcoin #:wcoin-value #:wcoin-txid #:wcoin-vout #:wcoin-script #:wcoin-waddr
+   #:script-for #:purpose-for #:address->script #:create-tx #:sign-input))
 
 (in-package #:cl-consensus.wallet)
 
@@ -164,3 +165,117 @@
              (incf found)))))
      map)
     found))
+
+;;; ----------------------------------------------------------------------------
+;;; Phase 3 — spend: build, sign (ECDSA + legacy/BIP143 sighash), ready to broadcast
+;;; ----------------------------------------------------------------------------
+
+(defun %int->be (n)
+  "Minimal big-endian bytes of a non-negative integer (at least one byte)."
+  (let ((out '()))
+    (loop while (plusp n) do (push (logand n #xff) out) (setf n (ash n -8)))
+    (or out (list 0))))
+
+(defun %der-int (n)
+  "DER INTEGER for N: 0x02 len <minimal big-endian, 0x00-prefixed if high bit set>."
+  (let ((b (%int->be n)))
+    (when (logbitp 7 (first b)) (push 0 b))
+    (list* #x02 (length b) b)))
+
+(defun der-encode-sig (r s)
+  "DER-encode an ECDSA signature (r,s) -> byte vector (no sighash byte)."
+  (let ((body (append (%der-int r) (%der-int s))))
+    (coerce (list* #x30 (length body) body) '(vector (unsigned-byte 8)))))
+
+(defun %push-data (bytes)
+  "A scriptSig push of BYTES (only the small direct-push form, sufficient for sigs +
+   compressed pubkeys, both < 76 bytes)."
+  (let ((n (length bytes)))
+    (assert (< n 76))
+    (concatenate '(vector (unsigned-byte 8)) (vector n) bytes)))
+
+(defun sign-input (wallet txn i coin)
+  "Sign input I of TXN (which spends COIN, one of our wallet coins) — sets the witness
+   (P2WPKH) or scriptSig (P2PKH).  SIGHASH_ALL."
+  (declare (ignore wallet))
+  (let* ((wa (wcoin-waddr coin))
+         (priv (b32:xkey-key (waddr-xkey wa)))
+         (pubkey (waddr-pubkey wa))
+         (script-code (p2pkh-script (w:hash160 pubkey)))   ; same for P2PKH spk & P2WPKH scriptCode
+         (type (wallet-type-of-script (wcoin-script coin))))
+    (ecase type
+      (:p2wpkh
+       (let ((sighash (s:bip143-sighash txn i script-code (wcoin-value coin) s:+sighash-all+)))
+         (multiple-value-bind (r ss) (secp:ecdsa-sign-raw priv sighash)
+           (let ((sig (concatenate '(vector (unsigned-byte 8))
+                                   (der-encode-sig r ss) (vector s:+sighash-all+))))
+             (setf (nth i (tx:tx-witnesses txn)) (list sig pubkey))))))
+      (:p2pkh
+       (let ((sighash (s:legacy-sighash txn i script-code s:+sighash-all+)))
+         (multiple-value-bind (r ss) (secp:ecdsa-sign-raw priv sighash)
+           (let ((sig (concatenate '(vector (unsigned-byte 8))
+                                   (der-encode-sig r ss) (vector s:+sighash-all+))))
+             (setf (tx:txin-script (nth i (tx:tx-inputs txn)))
+                   (concatenate '(vector (unsigned-byte 8))
+                                (%push-data sig) (%push-data pubkey))))))))))
+
+(defun wallet-type-of-script (script)
+  "Classify a scriptPubKey we own as :p2wpkh or :p2pkh."
+  (cond ((and (= (length script) 22) (= (aref script 0) 0) (= (aref script 1) #x14)) :p2wpkh)
+        ((and (= (length script) 25) (= (aref script 0) #x76)) :p2pkh)
+        (t (error "unsupported coin script type for signing"))))
+
+(defun address->script (addr)
+  "scriptPubKey for a destination ADDRESS (bech32/bech32m segwit or base58 P2PKH/P2SH)."
+  (if (and (>= (length addr) 3)
+           (string-equal (subseq addr 0 (min 3 (length addr))) "bc1"))
+      (multiple-value-bind (witver program) (enc:segwit-decode addr)
+        (concatenate '(vector (unsigned-byte 8))
+                     (vector (if (zerop witver) 0 (+ #x50 witver)) (length program)) program))
+      (let* ((payload (enc:base58check-decode addr)) (ver (aref payload 0))
+             (h (subseq payload 1)))
+        (cond ((= ver #x00) (p2pkh-script h))
+              ((= ver #x05) (concatenate '(vector (unsigned-byte 8)) #(#xa9 #x14) h #(#x87)))
+              (t (error "unsupported address version ~d" ver))))))
+
+(defun %unspent-coins (wallet)
+  (sort (loop for c being the hash-values of (wallet-coins wallet) collect c)
+        #'> :key #'wcoin-value))
+
+(defun %est-vsize (type nin nout)
+  (ecase type
+    (:p2wpkh (+ 11 (* 68 nin) (* 31 nout)))
+    (:p2pkh  (+ 10 (* 148 nin) (* 34 nout)))))
+
+(defun %dust (type) (ecase type (:p2wpkh 294) (:p2pkh 546)))
+
+(defun create-tx (wallet recipients &key (feerate 2))
+  "Build + sign a tx paying RECIPIENTS (a list of (address-string . value-sat)) from the
+   wallet's coins, with change back to the wallet.  FEERATE is sat/vB.  Returns a signed
+   TX ready to broadcast (e.g. via the node mempool / sendrawtransaction).  Greedy
+   largest-first coin selection."
+  (let* ((type (wallet-type wallet))
+         (target (reduce #'+ recipients :key #'cdr :initial-value 0))
+         (coins (%unspent-coins wallet)) (sel '()) (sum 0) (fee 0) (nrec (length recipients)))
+    ;; select largest-first until inputs cover target + fee (fee grows with input count)
+    (dolist (c coins)
+      (push c sel) (incf sum (wcoin-value c))
+      (setf fee (ceiling (* (%est-vsize type (length sel) (1+ nrec)) feerate)))
+      (when (>= sum (+ target fee)) (return)))
+    (when (< sum (+ target fee)) (error "insufficient funds: have ~d, need ~d + fee" sum target))
+    (let* ((change (- sum target fee))
+           (outs (mapcar (lambda (r) (tx:make-txout :value (cdr r) :script (address->script (car r))))
+                         recipients)))
+      (when (> change (%dust type))
+        (let ((cs (waddr-script (aref (ensure-addresses wallet 1 0) 0))))
+          (setf outs (append outs (list (tx:make-txout :value change :script cs))))))
+      (let ((txn (tx:make-tx :version 2
+                   :inputs (mapcar (lambda (c) (tx:make-txin :prev-hash (wcoin-txid c)
+                                                             :prev-index (wcoin-vout c)
+                                                             :script #() :sequence #xfffffffd))
+                                   sel)
+                   :outputs outs :witnesses (make-list (length sel))
+                   :locktime 0 :segwit-p (eq type :p2wpkh))))
+        (loop for c in sel for i from 0 do (sign-input wallet txn i c))
+        (tx:finalize-tx txn)
+        txn))))
