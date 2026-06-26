@@ -73,7 +73,60 @@
                                     :prevouts (vector (cons amount spk))))
           (s:script-error (e)
             (setf *ok* nil) (format t "  *** verify raised: ~a~%" e)))))))
+  ;; ==========================================================================
+  ;; Multi-leaf taptrees: 2 leaves and 3 leaves, DISTINCT key per leaf, spend
+  ;; EACH leaf in turn and assert every script-path spend verifies.
+  ;; ==========================================================================
+  (let* ((leaf-privs (mapcar (lambda (h) (secp:bytes-to-int (hx h)))
+                             '("0000000000000000000000000000000000000000000000000000000000000003"
+                               "0000000000000000000000000000000000000000000000000000000000000005"
+                               "0000000000000000000000000000000000000000000000000000000000000007")))
+         ;; internal key distinct from every leaf key
+         (internal-priv (secp:bytes-to-int
+                         (hx "00000000000000000000000000000000000000000000000000000000000000aa")))
+         (internal-xonly (sch:pubkey-xonly internal-priv))
+         (leaf-scripts (mapcar (lambda (lp) (tps:checksig-leaf-script (sch:pubkey-xonly lp)))
+                               leaf-privs))
+         (amount 1000000)
+         (prev-txid (hx "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")))
+    (flet ((spend-each (label scripts privs n-leaves expected-depths)
+             ;; expected-depths: per-leaf control-path sibling count for the shape.
+             (multiple-value-bind (spk q-parity)
+                 (tps:taproot-output-spk internal-xonly scripts)
+               (declare (ignore q-parity))
+               (checkt (format nil "~a: spk is OP_1 0x20 Qx" label)
+                       (and (= (length spk) 34) (= (aref spk 0) #x51) (= (aref spk 1) #x20)))
+               (dotimes (li n-leaves)
+                 (let* ((path (tps:taptree-leaf-path scripts li))
+                        (txn (tps:build-script-path-spend
+                              prev-txid 0 amount spk (nth li privs)
+                              :leaf-scripts scripts :leaf-index li
+                              :internal-priv internal-priv)))
+                   (checkt (format nil "~a leaf ~d: path depth = ~d"
+                                   label li (nth li expected-depths))
+                           (= (length path) (nth li expected-depths)))
+                   (let* ((wit (first (tx:tx-witnesses txn)))
+                          (ctrl (third wit)))
+                     (checkt (format nil "~a leaf ~d: witness has 3 items" label li)
+                             (= (length wit) 3))
+                     (checkt (format nil "~a leaf ~d: leaf script revealed" label li)
+                             (equalp (second wit) (nth li scripts)))
+                     (checkt (format nil "~a leaf ~d: control block = 33 + 32*depth" label li)
+                             (= (length ctrl) (+ 33 (* 32 (nth li expected-depths)))))
+                     (checkt (format nil "~a leaf ~d: control carries internal key" label li)
+                             (equalp (subseq ctrl 1 33) internal-xonly)))
+                   (handler-case
+                       (checkt (format nil "~a leaf ~d: script-path spend VERIFIES" label li)
+                               (s:verify-input txn 0 spk amount
+                                               :prevouts (vector (cons amount spk))))
+                     (s:script-error (e)
+                       (setf *ok* nil)
+                       (format t "  *** ~a leaf ~d verify raised: ~a~%" label li e))))))))
+      ;; 2-leaf balanced tree: root = TapBranch(L0,L1); both leaves at depth 1.
+      (spend-each "2-leaf" (subseq leaf-scripts 0 2) leaf-privs 2 '(1 1))
+      ;; 3-leaf balanced (documented shape): L0,L1 at depth 2; L2 at depth 1.
+      (spend-each "3-leaf" leaf-scripts leaf-privs 3 '(2 2 1))))
   (format t "~&taproot-script-test: ~a~%"
-          (if *ok* "OK — tapleaf-hash + output-spk + control-block + signed script-path spend verifies"
+          (if *ok* "OK — single-leaf + 2-leaf + 3-leaf taptree script-path spends all verify"
               "FAILED"))
   *ok*)

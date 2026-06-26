@@ -6,9 +6,12 @@
 ;;;;
 ;;;;   sbcl --non-interactive --load inspect/wallet-store-test.lisp --eval '(wallet-store-test:run)'
 (require :asdf)
-;; This worktree's repo root (NOT the canonical /home/claude/cl-consensus), so we build the
-;; wallet-store under test rather than the checked-in tree.
-(pushnew #p"/home/claude/cl-consensus-wallet-store/" asdf:*central-registry* :test #'equal)
+;; Derive THIS worktree's repo root portably: the test file lives at <root>/inspect/, so the
+;; root is the parent of its directory.  We build the wallet-store under test (whichever
+;; worktree we're loaded from) rather than the canonical checked-in tree.
+(let ((root (make-pathname :directory (butlast (pathname-directory *load-truename*))
+                           :name nil :type nil)))
+  (pushnew root asdf:*central-registry* :test #'equal))
 (pushnew #p"/home/claude/secp256k1-fast/" asdf:*central-registry* :test #'equal)
 (pushnew #p"/home/claude/pagetree/" asdf:*central-registry* :test #'equal)
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-consensus"))
@@ -49,7 +52,7 @@
       (wal:wallet-process-tx wal funding 100))
     (check "original balance" (wal:wallet-balance wal) 250000)
     (check "original coin count" (hash-table-count (wal:wallet-coins wal)) 1)
-    ;; save + load
+    ;; (1) PLAINTEXT save + load — back-compat
     (ws:save-wallet wal path :seed seed)
     (let ((loaded (ws:load-wallet path)))
       (check "loaded balance matches" (wal:wallet-balance loaded) (wal:wallet-balance wal))
@@ -58,7 +61,30 @@
              (hash-table-count (wal:wallet-coins wal)))
       (check "loaded receive-address(0) matches"
              (wal:wallet-receive-address loaded 0) (wal:wallet-receive-address wal 0))
-      (check "loaded type matches" (wal:wallet-type loaded) (wal:wallet-type wal))))
+      (check "loaded type matches" (wal:wallet-type loaded) (wal:wallet-type wal)))
+    ;; (2) ENCRYPTED save + load with the CORRECT passphrase round-trips
+    (let ((epath "/tmp/wallet-store-test-enc.wallet")
+          (pass  "correct horse battery staple"))
+      (ws:save-wallet wal epath :seed seed :passphrase pass :kdf-iterations 100000)
+      ;; sanity: the on-disk plaintext seed must be gone, encrypted-p flag present
+      (let ((blob (with-open-file (in epath) (read in))))
+        (check "encrypted file: no plaintext seed" (getf blob :seed) nil)
+        (check "encrypted file: encrypted-p set" (and (getf blob :encrypted-p) t) t))
+      (let ((loaded (ws:load-wallet epath :passphrase pass)))
+        (check "enc loaded balance matches" (wal:wallet-balance loaded) (wal:wallet-balance wal))
+        (check "enc loaded coin count matches"
+               (hash-table-count (wal:wallet-coins loaded))
+               (hash-table-count (wal:wallet-coins wal)))
+        (check "enc loaded receive-address(0) matches"
+               (wal:wallet-receive-address loaded 0) (wal:wallet-receive-address wal 0)))
+      ;; (3) WRONG passphrase must signal an error (never a wrong wallet)
+      (let ((raised (handler-case (progn (ws:load-wallet epath :passphrase "wrong passphrase") nil)
+                      (error () t))))
+        (check "wrong passphrase signals error" raised t))
+      ;; missing passphrase on an encrypted wallet must also error
+      (let ((raised (handler-case (progn (ws:load-wallet epath) nil)
+                      (error () t))))
+        (check "missing passphrase signals error" raised t))))
   (format t "~&wallet-store-test: ~a~%" (if *ok* "OK — save/load round-trips balance+coins+address" "FAILED"))
   (unless *ok* (sb-ext:exit :code 1))
   *ok*)

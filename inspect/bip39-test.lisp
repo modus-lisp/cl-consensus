@@ -99,5 +99,49 @@
     (checkt "wallet has a receive address"
             (stringp (wal:wallet-receive-address wal 0))))
 
+  ;; secure generation -------------------------------------------------------
+  ;; (1) generate-mnemonic produces valid 12-word and 24-word phrases.
+  (let ((mn12 (b39:generate-mnemonic 128))
+        (mn24 (b39:generate-mnemonic 256)))
+    (check  "generate-mnemonic 128 -> 12 words"
+            (length (b39::split-words mn12)) 12)
+    (checkt "generate-mnemonic 128 validates" (b39:validate-mnemonic mn12))
+    (check  "generate-mnemonic 256 -> 24 words"
+            (length (b39::split-words mn24)) 24)
+    (checkt "generate-mnemonic 256 validates" (b39:validate-mnemonic mn24)))
+
+  ;; generate-entropy returns the requested width.
+  (checkt "generate-entropy 128 -> 16 bytes" (= 16 (length (b39:generate-entropy 128))))
+  (checkt "generate-entropy 256 -> 32 bytes" (= 32 (length (b39:generate-entropy 256))))
+  (checkt "generate-entropy rejects bad width"
+          (not (ignore-errors (b39:generate-entropy 130))))
+
+  ;; (2) passphrase ("25th word") changes the seed AND the addresses.
+  (let* ((mn (b39:generate-mnemonic 128))
+         (seed-empty (b39:mnemonic->seed mn ""))
+         (seed-pass  (b39:mnemonic->seed mn "hunter2"))
+         (w-empty (b39:make-wallet-from-mnemonic mn :passphrase ""))
+         (w-pass  (b39:make-wallet-from-mnemonic mn :passphrase "hunter2")))
+    (checkt "passphrase: seeds are 64 bytes"
+            (and (= 64 (length seed-empty)) (= 64 (length seed-pass))))
+    (checkt "passphrase: empty vs hunter2 -> different seeds"
+            (not (equalp seed-empty seed-pass)))
+    (checkt "passphrase: empty vs hunter2 -> different receive[0]"
+            (string/= (wal:wallet-receive-address w-empty 0)
+                      (wal:wallet-receive-address w-pass 0))))
+
+  ;; (3) generate-wallet yields a usable wallet + a validating backup phrase.
+  (multiple-value-bind (gw gmn) (b39:generate-wallet :type :p2wpkh)
+    (checkt "generate-wallet yields a wallet" (wal:wallet-p gw))
+    (checkt "generate-wallet mnemonic validates" (b39:validate-mnemonic gmn))
+    (let ((addr (wal:wallet-receive-address gw 0)))
+      (checkt "generate-wallet receive[0] is a bech32/base58 address"
+              (and (stringp addr) (plusp (length addr))
+                   (let ((c (char addr 0))) (or (char= c #\b) (char= c #\1)))))))
+
+  ;; (4) randomness: two generate-mnemonic calls differ.
+  (checkt "generate-mnemonic is non-deterministic"
+          (string/= (b39:generate-mnemonic 128) (b39:generate-mnemonic 128)))
+
   (format t "~&~a~%" (if *ok* "OK   BIP39 gate passed" "FAIL BIP39 gate"))
   *ok*)

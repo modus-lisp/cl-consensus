@@ -13,7 +13,8 @@
                     (#:ic #:ironclad))
   (:export
    #:*wordlist* #:mnemonic-from-entropy #:mnemonic->seed
-   #:validate-mnemonic #:make-wallet-from-mnemonic))
+   #:validate-mnemonic #:make-wallet-from-mnemonic
+   #:generate-entropy #:generate-mnemonic #:generate-wallet))
 
 (in-package #:cl-consensus.bip39)
 
@@ -116,6 +117,49 @@
         (salt (ic:ascii-string-to-byte-array
                (concatenate 'string "mnemonic" passphrase))))
     (ic:derive-key kdf pw salt 2048 64)))
+
+;;; ----------------------------------------------------------------------------
+;;; secure generation (fresh entropy -> mnemonic -> wallet)
+;;; ----------------------------------------------------------------------------
+;;;
+;;; CL:RANDOM is deliberately NOT used here: the standard *RANDOM-STATE* PRNG is
+;;; a non-cryptographic generator (typically a Mersenne-Twister-class algorithm)
+;;; whose output is predictable from observed values — catastrophic for seed
+;;; material that guards real funds.  We draw from the OS CSPRNG (/dev/urandom)
+;;; and fall back to ironclad's Fortuna PRNG (itself OS-seeded) only if the
+;;; device is unavailable (e.g. a non-Unix host).
+
+(defun generate-entropy (bits)
+  "Fresh cryptographically-strong entropy: a (BITS/8)-byte vector drawn from the
+   OS CSPRNG.  BITS must be one of 128/160/192/224/256 (the BIP39 strengths).
+   Reads /dev/urandom; on hosts without it, falls back to ironclad's Fortuna
+   PRNG (which is itself seeded from OS randomness)."
+  (unless (member bits '(128 160 192 224 256))
+    (error "BIP39 entropy strength must be 128/160/192/224/256 bits, got ~d" bits))
+  (let* ((nbytes (/ bits 8))
+         (buf (make-array nbytes :element-type '(unsigned-byte 8))))
+    (or (ignore-errors
+          (with-open-file (f "/dev/urandom" :element-type '(unsigned-byte 8)
+                                            :if-does-not-exist nil)
+            (when f
+              (let ((n (read-sequence buf f)))
+                (when (= n nbytes) buf)))))
+        ;; Fallback: ironclad's strong PRNG (Fortuna), OS-seeded at make time.
+        (ic:random-data nbytes (ic:make-prng :fortuna)))))
+
+(defun generate-mnemonic (&optional (bits 128))
+  "A brand-new random BIP39 mnemonic of strength BITS (default 128 -> 12 words;
+   256 -> 24 words).  Draws fresh CSPRNG entropy and encodes it with the
+   SHA256 checksum, so the result always passes VALIDATE-MNEMONIC."
+  (mnemonic-from-entropy (generate-entropy bits)))
+
+(defun generate-wallet (&key (type :p2wpkh) (passphrase "") (bits 128))
+  "Mint a brand-new HD wallet from fresh randomness, returning (VALUES WALLET
+   MNEMONIC).  The mnemonic is the backup phrase; persist it (and, if non-empty,
+   the PASSPHRASE) — they are the only way to recover the wallet."
+  (let ((mnemonic (generate-mnemonic bits)))
+    (values (make-wallet-from-mnemonic mnemonic :type type :passphrase passphrase)
+            mnemonic)))
 
 ;;; ----------------------------------------------------------------------------
 ;;; wallet bridge
