@@ -5,7 +5,9 @@ A from-scratch, clean-room **Bitcoin consensus engine and full node in Common Li
 It speaks the P2P protocol, syncs and validates the header chain, parses blocks
 and transactions, runs a complete Script interpreter, maintains a UTXO set with
 full consensus validation and reorg handling, accepts transactions into a
-mempool, and serves a bitcoind-compatible JSON-RPC API.
+relay-policy mempool, **serves and relays** to other peers, drives an **HD
+wallet** (BIP39/32, send + receive), and serves a bitcoind-compatible JSON-RPC
+API — with a **regtest** harness that mines and confirms its own transactions.
 
 The point of difference from existing wrappers (e.g. an FFI binding to libsecp /
 Bitcoin Core) is that **nothing here wraps Core** — the consensus rules, the
@@ -13,6 +15,15 @@ script interpreter, secp256k1/ECDSA and BIP340 Schnorr are all re-implemented in
 Lisp. It's the open analog of `libbitcoinkernel` ("Core's consensus, extracted"),
 except independently derived and **differential-tested to 100% agreement with
 Bitcoin Core's `script_tests.json` (1217/1217)**.
+
+## ⚠️ Status & disclaimer
+
+cl-consensus is a **clean-room, from-scratch** implementation — differential-tested
+to 100% agreement with Bitcoin Core's `script_tests` and exercised against mainnet —
+but it has **NOT been audited or hardened for production**. It is **research /
+educational software**. Do **not** rely on it as your only validator, and do **not**
+use the wallet to custody real funds. The crypto is optimized for speed, not
+constant-time side-channel resistance. No warranty of any kind (see [LICENSE](LICENSE)).
 
 ## Status
 
@@ -27,7 +38,22 @@ Bitcoin Core's `script_tests.json` (1217/1217)**.
 - **Validation** — connect/disconnect-block, no-double-spend, coinbase maturity,
   value conservation, subsidy/halving, weight + sigop limits, BIP30/34/68/113/141,
   CLTV/CSV, witness-commitment, height-gated soft-fork activation, resumable IBD.
-- **Node** — mempool acceptance, JSON-RPC daemon, control socket, live chain-follow.
+- **Reorg** — best-chain activation by cumulative work, disconnect/reconnect with a
+  persistent undo store; digest-exact vs a fresh build of the winning branch.
+- **Network peer** — inbound listener; serve headers + blocks (getheaders/getdata);
+  **relay** new blocks (BIP130 headers / inv) and transactions; advertise NODE_NETWORK.
+- **Mempool** — relay policy: min-relay feerate + dynamic floor, dust/weight/finality
+  standardness, BIP125 opt-in RBF, parent/child packages, size-cap eviction, expiry,
+  and **persistence** across restarts (`mempool.dat`, re-validated on load).
+- **Wallet** — BIP39 mnemonics (generate + restore + passphrase), BIP32 HD; P2PKH /
+  P2WPKH / P2TR (taproot **key-path and script-path**, incl. multi-leaf taptrees);
+  coin selection, fee estimation, signing, broadcast; encrypted at-rest persistence.
+- **Node** — a consolidated **single-writer** daemon that validates each block to the
+  tip (reorg-aware) while serving + relaying with a tip-current UTXO + mempool;
+  bitcoind-compatible JSON-RPC (incl. wallet methods), control socket, live follow.
+- **Regtest** — a real harness: select the regtest network, **mine** blocks (real
+  nonce-grinding), and drive the full loop — mine → fund a wallet → build a spend →
+  accept to the mempool → mine it into a block → confirm — plus real-mined reorgs.
 
 For the full inventory of how correctness is validated — every layer, every
 harness, every number — see **[VERIFICATIONS.md](VERIFICATIONS.md)**.
@@ -37,24 +63,52 @@ harness, every number — see **[VERIFICATIONS.md](VERIFICATIONS.md)**.
 ```
 cl-consensus.asd        ASDF system
 src/
-  crypto/secp256k1.lisp ECDSA over secp256k1 (no FFI)
-  crypto/schnorr.lisp   BIP340 Schnorr
-  wire tx peer chain utxo block script validate mempool node   (the layers)
+  crypto/                secp256k1 ECDSA + BIP340 Schnorr shims over secp256k1-fast
+  wire tx peer chain     P2P, serialization, header chain
+  utxo block script      UTXO set, block/merkle, the Script interpreter + sighash
+  validate reorg         connect/disconnect-block, IBD, best-chain activation
+  mempool serve node     relay-policy mempool, serve/relay layer, the daemon
+  encoding bip32 bip39    base58check/bech32(m), HD derivation, mnemonics
+  wallet wallet-store     HD wallet (addresses/balance/spend) + (encrypted) persistence
+  rpc-wallet taproot-script  wallet JSON-RPC; taproot script-path construction
 inspect/
-  conformance.lisp      run Core's script_tests.json through our interpreter
-  block-sweep.lisp      stable regression: verify a confirmed block's in-block spends
-  difftest.lisp         live differential vs a Core node's mempool (RPC oracle)
-  core-diff.lisp        differential vs Core's compiled libbitcoinkernel (FFI)
-  oracle.lisp           ground-truth cross-check vs Core RPC
-  regression.sh         one-command: fetch vectors, run the gates, PASS/FAIL
+  run-all.sh            ONE command: the full OFFLINE gate suite (no Core/network)
+  regression.sh         differential vs Core: fetch vectors, conformance + block sweep
+  conformance / core-diff / oracle / difftest   the vs-Core harnesses (need a peer/FFI)
+  *-test.lisp           the offline gates (wallet, mempool, regtest, reorg, serve, …)
 VERIFICATIONS.md        the full correctness-validation inventory
 bin/cl-consensus.lisp   run the daemon
+```
+
+## Dependencies
+
+Pure SBCL + a few Quicklisp libs (`ironclad`, `usocket`, `bordeaux-threads`,
+`com.inuoe.jzon`, `hunchentoot`) — **plus two sibling repos** that are not yet on
+Quicklisp: [`secp256k1-fast`](../secp256k1-fast) (the crypto) and
+[`pagetree`](../pagetree) (the disk-backed UTXO store). Clone all three side by side
+so ASDF finds them:
+
+```
+parent/
+  cl-consensus/   secp256k1-fast/   pagetree/
+```
+
+Point ASDF at the parent (or symlink the three into `~/quicklisp/local-projects/`):
+
+```sh
+export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$PWD/..\") :inherit-configuration)"
 ```
 
 ## Quick start
 
 ```lisp
 (asdf:load-system "cl-consensus")
+```
+
+Run the full offline gate suite (wallet, mempool, regtest, reorg, serve/relay, …):
+
+```sh
+inspect/run-all.sh
 ```
 
 Run the daemon (JSON-RPC on :8432, control socket on :4008):
