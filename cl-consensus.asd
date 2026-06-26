@@ -17,6 +17,8 @@
       :components ((:file "secp256k1")    ; ECDSA over secp256k1
                    (:file "schnorr")))    ; BIP340 schnorr (taproot)
      (:file "wire")        ; serialization, message envelope, network params
+     (:file "encoding")    ; base58check + bech32/bech32m (addresses, xprv/xpub)
+     (:file "bip32")       ; HD key derivation (master/CKD, xprv/xpub)
      (:file "tx")          ; transactions (legacy + segwit), txid/wtxid
      (:file "peer")        ; P2P: handshake, message loop
      (:file "addrman")     ; address pool (dedup) for peer discovery
