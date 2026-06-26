@@ -424,12 +424,13 @@
     (serious-condition () nil)))
 
 (defun data-dir ()
-  "Prefer the big volume; fall back to ~/.cl-consensus until it's writable."
+  "Data directory for headers.dat etc.: $BITCOIND_DATADIR if set, else
+   ~/.cl-consensus/bitcoind/."
   (let ((env #+sbcl (sb-ext:posix-getenv "BITCOIND_DATADIR") #-sbcl nil))
-    (cond (env (pathname (if (char= #\/ (char env (1- (length env)))) env
-                             (concatenate 'string env "/"))))
-          ((writable-dir-p #p"/mnt/lisp/bitcoind/") #p"/mnt/lisp/bitcoind/")
-          (t (merge-pathnames ".cl-consensus/bitcoind/" (user-homedir-pathname))))))
+    (if env
+        (pathname (if (char= #\/ (char env (1- (length env)))) env
+                      (concatenate 'string env "/")))
+        (merge-pathnames ".cl-consensus/bitcoind/" (user-homedir-pathname)))))
 
 (defun headers-file () (merge-pathnames "headers.dat" (data-dir)))
 

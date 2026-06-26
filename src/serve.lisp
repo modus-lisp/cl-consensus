@@ -385,8 +385,9 @@
       fetched)))
 
 (defun serve-daemon (&key (listen-port (w:net-port w:*network*))
-                          (peer-host "epyc-docker.lan") (max-peers 64)
-                          (block-store-path "/mnt/lisp/ptchain/blocks.dat")
+                          (peer-host "127.0.0.1") (max-peers 64)
+                          (block-store-path (namestring (merge-pathnames ".cl-consensus/blocks.dat"
+                                                                         (user-homedir-pathname))))
                           (recent-blocks *recent-blocks*))
   "Long-lived network-citizen daemon: follow the header tip from an OUTBOUND peer,
    keep a rolling window of the most-recent blocks stored, and SERVE inbound

@@ -236,7 +236,7 @@
           (declare (ignore payload))
           (p:send pr "getheaders" (c::build-getheaders-payload (c:build-locator))))))
 
-(defun start-follow (&optional (host "epyc-docker.lan"))
+(defun start-follow (&optional (host "127.0.0.1"))
   "Connect a peer, sync headers to the tip, then follow new blocks live."
   (setf *peer* (p:connect-peer host :start-height (c:tip-height)))
   (c:sync-headers *peer*)               ; catch up to the peer's tip
@@ -308,17 +308,21 @@
         (handler-case (mp:save-mempool *mempool* *mempool-path*) (serious-condition () nil)))
       (sleep poll))))
 
-(defun serve-node (&key (store "/mnt/lisp/ptchain/live.pt")
-                        (block-store "/mnt/lisp/ptchain/blocks.dat")
-                        (peer-host "epyc-docker.lan") (conns 2) (cache-gb 24)
+(defun serve-node (&key (store (namestring (merge-pathnames ".cl-consensus/live.pt"
+                                                            (user-homedir-pathname))))
+                        (block-store (namestring (merge-pathnames ".cl-consensus/blocks.dat"
+                                                                  (user-homedir-pathname))))
+                        (peer-host "127.0.0.1") (conns 2) (cache-gb 24)
                         (listen-port (w:net-port w:*network*)) (rpc-port *rpc-port*)
                         (max-peers 64) (poll 30)
-                        (mempool-path "/mnt/lisp/ptchain/mempool.dat"))
+                        (mempool-path (namestring (merge-pathnames ".cl-consensus/mempool.dat"
+                                                                   (user-homedir-pathname)))))
   "THE consolidated node: own the pagetree UTXO (single writer), validate new blocks to
    the tip (reorg-aware), and SERVE headers/blocks + RELAY txs to inbound peers with a
    tip-current UTXO + mempool, plus JSON-RPC + the control socket.  Replaces the
    keep-current poll AND the header-only serve-daemon.  Blocks forever."
   (setf *rpc-port* rpc-port *start-time* (get-universal-time))
+  (ensure-directories-exist store)              ; create the data dir for a fresh node
   (c:init-chain) (c:load-headers)
   (let* ((peers (loop repeat conns collect (p:connect-peer peer-host :start-height (c:tip-height))))
          (undo (r:open-pt-undo-store (concatenate 'string store ".undo"))))
