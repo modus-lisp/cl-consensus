@@ -172,13 +172,46 @@ End-to-end results from running the engine (**MILESTONE** unless noted):
   a real transaction.
 - **Live chain-follow** — the node tracks Core's tip in real time; caught up over
   a range of new blocks with matching hashes.
+- **Network peer** — serves headers + blocks and relays new blocks/txs to inbound
+  peers; the consolidated `serve-node` validates each block to the tip while serving
+  (run on mainnet; loopback-gated, see below).
+- **Wallet** — HD derivation + every spend type, gated below; a built+signed spend
+  must verify under our own (Core-differential-tested) `verify-input`.
+
+---
+
+## 6. Self-contained gates — the offline suite (**GATE**)
+
+Beyond the vs-Core consensus differential, the node/wallet/relay layers each have a
+self-contained, offline gate (no Core, no network). `inspect/run-all.sh` runs them
+all and exits non-zero on any failure.
+
+| Gate | Checks |
+|---|---|
+| `wallet-test` | Base58Check + bech32/bech32m, BIP32 (vs BIP test vectors), watch/balance, build/sign/verify (P2PKH/WPKH/TR) |
+| `bip39-test` | BIP39 mnemonic ⇄ seed vs the official Trezor vectors; generation + passphrase |
+| `taproot-script-test` | BIP341 taproot script-path spends (multi-leaf taptrees) verify under our interpreter |
+| `wallet-store-test` | wallet persistence round-trip, incl. passphrase-encrypted |
+| `rpc-wallet-test` | wallet JSON-RPC (getnewaddress/getbalance/listunspent/sendtoaddress/…) |
+| `mempool-test` | relay policy, BIP125 RBF, package links, eviction, expiry, on-block, persistence |
+| `blockstore-test` | append-only block store round-trip + torn-tail recovery |
+| `serve-test` / `relay-test` / `tx-relay-test` | inbound handshake; serve headers/blocks; relay blocks (BIP130/inv) + txs + orphans (loopback) |
+| `reorg-equiv` | a reorg's UTXO is digest-identical to a fresh build of the winning branch |
+| `regtest-test` | real-mined: regtest genesis + nonce-grinding, mine → fund → spend → mine → confirm, and a real-mined reorg |
+
+A signed spend (wallet, taproot script-path) is "verified" by passing our own
+`verify-input` — which is itself differential-tested to 0 divergence vs Core — so a
+spend that verifies would verify under Core.
 
 ---
 
 ## How to reproduce
 
 ```sh
-# Standing gates (conformance + block sweep + compiled-Core FFI differential):
+# The full offline gate suite (wallet, mempool, serve/relay, reorg, regtest, …):
+inspect/run-all.sh
+
+# Standing differential-vs-Core gates (conformance + block sweep + compiled-Core FFI):
 inspect/regression.sh
 
 # Just the static conformance suite:
