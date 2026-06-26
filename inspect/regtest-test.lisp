@@ -17,8 +17,9 @@
   (:use :cl)
   (:local-nicknames (:w :cl-consensus.wire) (:c :cl-consensus.chain) (:tx :cl-consensus.tx)
                     (:blk :cl-consensus.block) (:v :cl-consensus.validate) (:u :cl-consensus.utxo)
-                    (:mp :cl-consensus.mempool) (:wal :cl-consensus.wallet) (:s :cl-consensus.script))
-  (:export #:run #:mine #:setup-regtest))
+                    (:mp :cl-consensus.mempool) (:wal :cl-consensus.wallet) (:s :cl-consensus.script)
+                    (:r :cl-consensus.reorg))
+  (:export #:run #:run-reorg #:mine #:setup-regtest))
 (in-package :regtest-test)
 
 (defparameter *op-true* (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
@@ -38,17 +39,21 @@
 
 (defun le-int (bytes) (loop for i below 32 sum (ash (aref bytes i) (* 8 i))))
 
-(defun bip34-scriptsig (height)
-  "Coinbase scriptSig carrying the block height (BIP34), heights < 128 (1-byte push)."
-  (concatenate '(vector (unsigned-byte 8)) (vector 1 height)))
+(defun bip34-scriptsig (height tag)
+  "Coinbase scriptSig: push the block height (BIP34, heights < 128) then a branch TAG
+   byte so coinbases on competing branches differ (distinct txids -> distinct blocks)."
+  (concatenate '(vector (unsigned-byte 8)) (vector 1 height 1 tag)))
 
-(defun coinbase-tx (height value script)
+(defun coinbase-tx (height value script &optional (tag 0))
   (let ((cb (tx:make-tx :version 1
               :inputs (list (tx:make-txin :prev-hash (zeros 32) :prev-index #xffffffff
-                                          :script (bip34-scriptsig height) :sequence #xffffffff))
+                                          :script (bip34-scriptsig height tag) :sequence #xffffffff))
               :outputs (list (tx:make-txout :value value :script script))
               :witnesses nil :locktime 0 :segwit-p nil)))
     (tx:finalize-tx cb) cb))
+
+(defparameter *blocks* (make-hash-table :test 'equal)
+  "hash-hex -> block*, so a reorg's fetch-block can retrieve any mined block.")
 
 (defun block-bytes (header-bytes txs)
   (let ((wr (w:make-writer)))
@@ -57,24 +62,46 @@
     (dolist (txn txs) (w:w-bytes wr (tx:serialize-tx txn :witness t)))
     (w:writer-bytes wr)))
 
-(defun mine (utxo &key txs (coinbase-script *op-true*) wallet)
-  "Mine the next block (real nonce-grinding) with optional TXS, connect it to UTXO, and
-   (with WALLET) update the wallet.  Returns the block*."
-  (let* ((tip (c:tip)) (height (1+ (c:tip-height)))
-         (cb (coinbase-tx height (v:block-subsidy height) coinbase-script))
-         (all (cons cb txs))
-         (bits #x207fffff) (target (c::compact->target bits))
-         (version #x20000000) (prev (c:header-hash tip)) (time (1+ (c:header-time tip)))
-         (merkle (blk:compute-merkle-root (mapcar #'tx:tx-txid all))))
+(defun grind (version prev merkle time bits)
+  "Find a nonce whose header hash meets the (trivial, regtest) target; return the block
+   bytes.  Regtest target is huge so this is ~1-2 hashes."
+  (let ((target (c::compact->target bits)))
     (loop for nonce from 0 below 100000
           for hb = (hdr-bytes version prev merkle time bits nonce)
-          when (<= (le-int (w:hash256 hb)) target) do
-            (let ((blk (blk:parse-block (block-bytes hb all))))
-              (c:add-header (blk:block-header blk))
-              (v:connect-block blk height utxo)
-              (when wallet (wal:wallet-process-block wallet blk height))
-              (return-from mine blk)))
-    (error "could not mine block ~d" height)))
+          when (<= (le-int (w:hash256 hb)) target) do (return-from grind hb))
+    (error "grind failed")))
+
+(defun mine (utxo &key txs (coinbase-script *op-true*) wallet undo (tag 0))
+  "Mine the next block on the current tip (real nonce-grinding) with optional TXS,
+   connect it to UTXO (recording per-height undo into UNDO if given), and (with WALLET)
+   update the wallet.  Stores the block for later fetch.  Returns the block*."
+  (let* ((tip (c:tip)) (height (1+ (c:tip-height)))
+         (cb (coinbase-tx height (v:block-subsidy height) coinbase-script tag))
+         (all (cons cb txs))
+         (merkle (blk:compute-merkle-root (mapcar #'tx:tx-txid all)))
+         (hb (grind #x20000000 (c:header-hash tip) merkle (1+ (c:header-time tip)) #x207fffff))
+         (blk (blk:parse-block (block-bytes hb all))))
+    (c:add-header (blk:block-header blk))
+    (multiple-value-bind (fees u) (v:connect-block blk height utxo)
+      (declare (ignore fees))
+      (when undo (r:undo-put undo height u)))
+    (setf (gethash (c:header-hash-hex (blk:block-header blk)) *blocks*) blk)
+    (when wallet (wal:wallet-process-block wallet blk height))
+    blk))
+
+(defun mine-header-only (prev &key (tag 1))
+  "Mine a coinbase-only block on PREV (a header, possibly a side branch), add its header
+   to the chain (validate t = real PoW/difficulty/MTP checks), store the block, and
+   return the new header.  Does NOT connect to any UTXO — used to build a competing
+   branch the reorg machinery then activates."
+  (let* ((height (1+ (c:header-height prev)))
+         (cb (coinbase-tx height (v:block-subsidy height) *op-true* tag))
+         (merkle (blk:compute-merkle-root (list (tx:tx-txid cb))))
+         (hb (grind #x20000000 (c:header-hash prev) merkle (1+ (c:header-time prev)) #x207fffff))
+         (blk (blk:parse-block (block-bytes hb (list cb)))))
+    (c:add-header (blk:block-header blk))
+    (setf (gethash (c:header-hash-hex (blk:block-header blk)) *blocks*) blk)
+    (blk:block-header blk)))
 
 (defun setup-regtest ()
   (w:select-network :regtest)
@@ -82,6 +109,8 @@
   (u:make-utxo-set))
 
 ;;; --- the gate -------------------------------------------------------------
+
+(declaim (ftype (function () t) run-reorg))   ; defined below; called by RUN
 
 (defun run ()
   (setf *ok* t)
@@ -125,6 +154,40 @@
                        (> (wal:wallet-balance wallet) 3999000000)))
           (format t "[regtest-test] post-spend wallet balance ~d sat (change)~%"
                   (wal:wallet-balance wallet))))))
+  (run-reorg)
   (format t "~&regtest-test: ~a~%"
-          (if *ok* "OK — regtest genesis + real mining + mine->send->confirm" "FAILED"))
+          (if *ok* "OK — regtest genesis + real mining + mine->send->confirm + reorg" "FAILED"))
   *ok*)
+
+(defun run-reorg ()
+  "Real-mined reorg: branch A (3 connected blocks) is out-weighed by a later, longer
+   branch B (4 blocks) mined as side-chain headers; activate-best-chain must roll the
+   UTXO from A onto B, and the reorged UTXO must equal a fresh connect of B (digest +
+   count) — disconnect/reconnect with REAL proof-of-work blocks."
+  (setf *blocks* (make-hash-table :test 'equal))
+  (let* ((utxo (setup-regtest)) (undo (r:make-mem-undo-store)) (genesis (c:tip)))
+    ;; branch A: 3 connected blocks (tag 0), per-height undo recorded
+    (dotimes (i 3) (mine utxo :undo undo :tag 0))
+    (let ((a-height (c:tip-height)))
+      (check "branch A tip height" a-height 3)
+      (check "utxo has A's 3 coinbases" (u:utxo-count utxo) 3)
+      ;; branch B: 4 header-only blocks on genesis (tag 1) — heavier, but not connected
+      (let ((prev genesis)) (dotimes (i 4) (setf prev (mine-header-only prev :tag 1))))
+      ;; reorg the UTXO A -> B
+      (multiple-value-bind (h2 reorged depth)
+          (r:activate-best-chain utxo a-height undo
+                                 (lambda (hdr) (gethash (c:header-hash-hex hdr) *blocks*)))
+        (checkt "reorged" reorged)
+        (check "new committed height" h2 4)
+        (check "reorg depth" depth 3))
+      (check "tip is now B (height 4)" (c:tip-height) 4)
+      (check "utxo now has B's 4 coinbases" (u:utxo-count utxo) 4)
+      (checkt "A's block-1 coinbase removed"
+              (null (u:utxo-get utxo (tx:tx-txid (coinbase-tx 1 (v:block-subsidy 1) *op-true* 0)) 0)))
+      ;; digest-exact: the reorged UTXO equals a fresh connect of branch B
+      (let ((fresh (u:make-utxo-set)))
+        (loop for h from 1 to 4 do
+          (v:connect-block (gethash (c:header-hash-hex (c:header-at-height h)) *blocks*) h fresh))
+        (checkt "reorg UTXO == fresh-B (digest)" (equalp (u:utxo-digest utxo) (u:utxo-digest fresh)))
+        (check "reorg UTXO count == fresh-B" (u:utxo-count utxo) (u:utxo-count fresh)))
+      (format t "[regtest-test] real-mined reorg A(3)->B(4): UTXO rolled + digest-exact~%"))))
