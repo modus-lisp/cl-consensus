@@ -12,7 +12,7 @@
   (:local-nicknames (#:w #:cl-consensus.wire) (#:tx #:cl-consensus.tx)
                     (#:s #:cl-consensus.script) (#:u #:cl-consensus.utxo)
                     (#:b32 #:cl-consensus.bip32) (#:enc #:cl-consensus.encoding)
-                    (#:secp #:secp256k1-fast))
+                    (#:secp #:secp256k1-fast) (#:sch #:secp256k1-fast.schnorr))
   (:export
    #:wallet #:wallet-p #:make-wallet-from-seed #:wallet-type #:wallet-balance
    #:wallet-coins #:wallet-receive #:wallet-change
@@ -21,7 +21,8 @@
    #:waddr #:waddr-address #:waddr-script #:waddr-index #:waddr-chain
    #:waddr-xkey #:waddr-pubkey
    #:wcoin #:wcoin-value #:wcoin-txid #:wcoin-vout #:wcoin-script #:wcoin-waddr
-   #:script-for #:purpose-for #:address->script #:create-tx #:sign-input))
+   #:script-for #:purpose-for #:address->script #:create-tx #:sign-input
+   #:taproot-output-key #:taproot-tweak))
 
 (in-package #:cl-consensus.wallet)
 
@@ -38,18 +39,29 @@
 
 (defun purpose-for (type) (ecase type (:p2pkh 44) (:p2wpkh 84) (:p2tr 86)))
 
+(defun taproot-tweak (internal-xonly)
+  "BIP341 key-path-only output integer tweak t = tagged_hash(\"TapTweak\", P) mod n."
+  (mod (secp:bytes-to-int (sch:tagged-hash "TapTweak" internal-xonly)) secp:*secp256k1-n*))
+
+(defun taproot-output-key (internal-xonly)
+  "The 32-byte BIP341 output key Q = lift_x(P) + t*G (key-path only, empty merkle root)."
+  (let* ((p-even (sch:lift-x (secp:bytes-to-int internal-xonly)))
+         (q (secp:secp-add-points p-even (secp:secp-pubkey (taproot-tweak internal-xonly)))))
+    (secp:int-to-bytes32 (secp:secp-x q))))
+
 (defun script-for (type pubkey)
-  "scriptPubKey for a compressed PUBKEY under address TYPE."
+  "scriptPubKey for a compressed internal PUBKEY under address TYPE (P2TR applies the
+   taproot output-key tweak)."
   (ecase type
     (:p2pkh  (p2pkh-script (w:hash160 pubkey)))
     (:p2wpkh (p2wpkh-script (w:hash160 pubkey)))
-    (:p2tr   (p2tr-script (subseq pubkey 1)))))   ; x-only = compressed sans prefix
+    (:p2tr   (p2tr-script (taproot-output-key (subseq pubkey 1))))))
 
 (defun address-for (type pubkey)
   (ecase type
     (:p2pkh  (enc:encode-p2pkh (w:hash160 pubkey)))
     (:p2wpkh (enc:encode-p2wpkh (w:hash160 pubkey)))
-    (:p2tr   (enc:encode-p2tr (subseq pubkey 1)))))
+    (:p2tr   (enc:encode-p2tr (taproot-output-key (subseq pubkey 1))))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Wallet model
@@ -194,34 +206,46 @@
     (assert (< n 76))
     (concatenate '(vector (unsigned-byte 8)) (vector n) bytes)))
 
-(defun sign-input (wallet txn i coin)
+(defun sign-input (wallet txn i coin prevouts)
   "Sign input I of TXN (which spends COIN, one of our wallet coins) — sets the witness
-   (P2WPKH) or scriptSig (P2PKH).  SIGHASH_ALL."
+   (P2WPKH BIP143 / P2TR BIP341 key-path) or scriptSig (P2PKH).  PREVOUTS is the vector
+   of (amount . scriptPubKey) for ALL inputs (needed by the taproot sighash)."
   (declare (ignore wallet))
   (let* ((wa (wcoin-waddr coin))
          (priv (b32:xkey-key (waddr-xkey wa)))
          (pubkey (waddr-pubkey wa))
-         (script-code (p2pkh-script (w:hash160 pubkey)))   ; same for P2PKH spk & P2WPKH scriptCode
          (type (wallet-type-of-script (wcoin-script coin))))
     (ecase type
       (:p2wpkh
-       (let ((sighash (s:bip143-sighash txn i script-code (wcoin-value coin) s:+sighash-all+)))
+       (let* ((sc (p2pkh-script (w:hash160 pubkey)))
+              (sighash (s:bip143-sighash txn i sc (wcoin-value coin) s:+sighash-all+)))
          (multiple-value-bind (r ss) (secp:ecdsa-sign-raw priv sighash)
            (let ((sig (concatenate '(vector (unsigned-byte 8))
                                    (der-encode-sig r ss) (vector s:+sighash-all+))))
              (setf (nth i (tx:tx-witnesses txn)) (list sig pubkey))))))
       (:p2pkh
-       (let ((sighash (s:legacy-sighash txn i script-code s:+sighash-all+)))
+       (let* ((sc (p2pkh-script (w:hash160 pubkey)))
+              (sighash (s:legacy-sighash txn i sc s:+sighash-all+)))
          (multiple-value-bind (r ss) (secp:ecdsa-sign-raw priv sighash)
            (let ((sig (concatenate '(vector (unsigned-byte 8))
                                    (der-encode-sig r ss) (vector s:+sighash-all+))))
              (setf (tx:txin-script (nth i (tx:tx-inputs txn)))
                    (concatenate '(vector (unsigned-byte 8))
-                                (%push-data sig) (%push-data pubkey))))))))))
+                                (%push-data sig) (%push-data pubkey)))))))
+      (:p2tr
+       ;; BIP341 key-path: sign the taproot sighash with the tweaked private key.
+       (let* ((pt (secp:secp-pubkey priv))
+              (d-even (if (evenp (secp:secp-y pt)) priv (- secp:*secp256k1-n* priv)))
+              (internal-xonly (secp:int-to-bytes32 (secp:secp-x pt)))
+              (d-tweaked (mod (+ d-even (taproot-tweak internal-xonly)) secp:*secp256k1-n*))
+              (sighash (s:taproot-sighash txn i prevouts 0 :ext-flag 0))   ; SIGHASH_DEFAULT
+              (sig (sch:schnorr-sign d-tweaked sighash)))
+         (setf (nth i (tx:tx-witnesses txn)) (list sig)))))))
 
 (defun wallet-type-of-script (script)
-  "Classify a scriptPubKey we own as :p2wpkh or :p2pkh."
+  "Classify a scriptPubKey we own as :p2wpkh / :p2pkh / :p2tr."
   (cond ((and (= (length script) 22) (= (aref script 0) 0) (= (aref script 1) #x14)) :p2wpkh)
+        ((and (= (length script) 34) (= (aref script 0) #x51) (= (aref script 1) #x20)) :p2tr)
         ((and (= (length script) 25) (= (aref script 0) #x76)) :p2pkh)
         (t (error "unsupported coin script type for signing"))))
 
@@ -245,9 +269,10 @@
 (defun %est-vsize (type nin nout)
   (ecase type
     (:p2wpkh (+ 11 (* 68 nin) (* 31 nout)))
+    (:p2tr   (+ 11 (* 58 nin) (* 43 nout)))
     (:p2pkh  (+ 10 (* 148 nin) (* 34 nout)))))
 
-(defun %dust (type) (ecase type (:p2wpkh 294) (:p2pkh 546)))
+(defun %dust (type) (ecase type (:p2wpkh 294) (:p2tr 330) (:p2pkh 546)))
 
 (defun create-tx (wallet recipients &key (feerate 2))
   "Build + sign a tx paying RECIPIENTS (a list of (address-string . value-sat)) from the
@@ -275,7 +300,11 @@
                                                              :script #() :sequence #xfffffffd))
                                    sel)
                    :outputs outs :witnesses (make-list (length sel))
-                   :locktime 0 :segwit-p (eq type :p2wpkh))))
-        (loop for c in sel for i from 0 do (sign-input wallet txn i c))
+                   :locktime 0 :segwit-p (and (member type '(:p2wpkh :p2tr)) t)))
+            ;; prevouts (amount . spk) for every input, in input order — the taproot
+            ;; sighash commits to all of them.
+            (prevouts (coerce (mapcar (lambda (c) (cons (wcoin-value c) (wcoin-script c))) sel)
+                              'vector)))
+        (loop for c in sel for i from 0 do (sign-input wallet txn i c prevouts))
         (tx:finalize-tx txn)
         txn))))

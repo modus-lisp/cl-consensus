@@ -44,13 +44,29 @@
    byte so coinbases on competing branches differ (distinct txids -> distinct blocks)."
   (concatenate '(vector (unsigned-byte 8)) (vector 1 height 1 tag)))
 
-(defun coinbase-tx (height value script &optional (tag 0))
-  (let ((cb (tx:make-tx :version 1
-              :inputs (list (tx:make-txin :prev-hash (zeros 32) :prev-index #xffffffff
-                                          :script (bip34-scriptsig height tag) :sequence #xffffffff))
-              :outputs (list (tx:make-txout :value value :script script))
-              :witnesses nil :locktime 0 :segwit-p nil)))
-    (tx:finalize-tx cb) cb))
+(defun coinbase-tx (height value script &optional (tag 0) commitment)
+  "Coinbase paying VALUE to SCRIPT.  With COMMITMENT (32 bytes) add the BIP141 witness-
+   commitment OP_RETURN output + the coinbase witness (reserved value = 32 zeros), making
+   it a segwit coinbase (required when the block carries any witness tx)."
+  (let ((outs (list (tx:make-txout :value value :script script))))
+    (when commitment
+      (setf outs (append outs (list (tx:make-txout :value 0
+                    :script (concatenate '(vector (unsigned-byte 8))
+                                         #(#x6a #x24 #xaa #x21 #xa9 #xed) commitment))))))
+    (let ((cb (tx:make-tx :version 1
+                :inputs (list (tx:make-txin :prev-hash (zeros 32) :prev-index #xffffffff
+                                            :script (bip34-scriptsig height tag) :sequence #xffffffff))
+                :outputs outs
+                :witnesses (when commitment (list (list (zeros 32))))
+                :locktime 0 :segwit-p (and commitment t))))
+      (tx:finalize-tx cb) cb)))
+
+(defun witness-commitment-for (txs)
+  "BIP141 commitment HASH256(witness-merkle-root || reserved) for a block whose non-
+   coinbase txs are TXS (coinbase wtxid is defined as 0)."
+  (w:hash256 (concatenate '(vector (unsigned-byte 8))
+                          (blk:compute-merkle-root (cons (zeros 32) (mapcar #'tx:tx-wtxid txs)))
+                          (zeros 32))))
 
 (defparameter *blocks* (make-hash-table :test 'equal)
   "hash-hex -> block*, so a reorg's fetch-block can retrieve any mined block.")
@@ -76,7 +92,8 @@
    connect it to UTXO (recording per-height undo into UNDO if given), and (with WALLET)
    update the wallet.  Stores the block for later fetch.  Returns the block*."
   (let* ((tip (c:tip)) (height (1+ (c:tip-height)))
-         (cb (coinbase-tx height (v:block-subsidy height) coinbase-script tag))
+         (commitment (when (some #'tx:tx-segwit-p txs) (witness-commitment-for txs)))
+         (cb (coinbase-tx height (v:block-subsidy height) coinbase-script tag commitment))
          (all (cons cb txs))
          (merkle (blk:compute-merkle-root (mapcar #'tx:tx-txid all)))
          (hb (grind #x20000000 (c:header-hash tip) merkle (1+ (c:header-time tip)) #x207fffff))
@@ -110,7 +127,7 @@
 
 ;;; --- the gate -------------------------------------------------------------
 
-(declaim (ftype (function () t) run-reorg))   ; defined below; called by RUN
+(declaim (ftype (function () t) run-reorg run-taproot))   ; defined below; called by RUN
 
 (defun run ()
   (setf *ok* t)
@@ -154,10 +171,50 @@
                        (> (wal:wallet-balance wallet) 3999000000)))
           (format t "[regtest-test] post-spend wallet balance ~d sat (change)~%"
                   (wal:wallet-balance wallet))))))
+  (run-taproot)
   (run-reorg)
   (format t "~&regtest-test: ~a~%"
-          (if *ok* "OK — regtest genesis + real mining + mine->send->confirm + reorg" "FAILED"))
+          (if *ok* "OK — mine->send->confirm (P2PKH + P2TR) + reorg" "FAILED"))
   *ok*)
+
+(defun run-taproot ()
+  "End-to-end taproot: mine coins, fund a P2TR (BIP86) wallet, build a KEY-PATH spend,
+   accept it to the mempool, MINE it into a SEGWIT block (witness commitment), and
+   confirm the wallet sees it — exercising the BIP341 output tweak, Schnorr signing, the
+   taproot sighash, and witness-commitment block construction."
+  (setf *blocks* (make-hash-table :test 'equal))
+  (let ((utxo (setup-regtest)))
+    (dotimes (i 101) (mine utxo))                      ; OP_TRUE coinbases (block 1 matures)
+    (let* ((wallet (wal:make-wallet-from-seed (w:hex->bytes "000102030405060708090a0b0c0d0e0f")
+                                              :type :p2tr))
+           (wspk (wal::waddr-script (aref (wal:wallet-receive wallet) 0)))
+           (cb1 (tx:tx-txid (coinbase-tx 1 (v:block-subsidy 1) *op-true* 0)))
+           (funding (tx:make-tx :version 1
+                      :inputs (list (tx:make-txin :prev-hash cb1 :prev-index 0
+                                                  :script #() :sequence #xffffffff))
+                      :outputs (list (tx:make-txout :value 4999990000 :script wspk))
+                      :witnesses nil :locktime 0 :segwit-p nil)))
+      (tx:finalize-tx funding)
+      (mine utxo :txs (list funding) :wallet wallet)   ; legacy block (OP_TRUE input, no witness)
+      (check "P2TR wallet funded" (wal:wallet-balance wallet) 4999990000)
+      (let* ((mpool (mp:make-mempool))
+             (spend (wal:create-tx wallet
+                                   (list (cons (wal:wallet-receive-address wallet 5) 1000000000))
+                                   :feerate 2)))
+        (checkt "P2TR spend is segwit (witness)" (tx:tx-segwit-p spend))
+        ;; broadcast -> mempool (full taproot script verify vs the live UTXO)
+        (mp:accept-tx spend utxo mpool :height (1+ (c:tip-height))
+                                       :mtp (c:median-time-past (c:tip)))
+        (checkt "P2TR spend accepted to mempool" (= 1 (mp:mempool-size mpool)))
+        ;; mine it into a SEGWIT block (coinbase witness commitment required + built)
+        (let ((spend-txn (mp:entry-tx (mp:mempool-get mpool (first (mp:mempool-txids mpool))))))
+          (mine utxo :txs (list spend-txn) :wallet wallet)
+          (mp:mempool-on-block mpool (list spend-txn)))
+        (checkt "P2TR spend confirmed (coin spent, change held)"
+                (and (< (wal:wallet-balance wallet) 4999990000)
+                     (> (wal:wallet-balance wallet) 3999000000)))
+        (format t "[regtest-test] P2TR key-path spend mined into a segwit block; balance ~d~%"
+                (wal:wallet-balance wallet))))))
 
 (defun run-reorg ()
   "Real-mined reorg: branch A (3 connected blocks) is out-weighed by a later, longer

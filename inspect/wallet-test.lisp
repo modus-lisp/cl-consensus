@@ -113,18 +113,20 @@
   (let ((wpk (wal:make-wallet-from-seed (hx "000102030405060708090a0b0c0d0e0f") :type :p2pkh)))
     (checkt "p2pkh address starts with 1" (char= (char (wal:wallet-receive-address wpk 0) 0) #\1)))
   ;; ---- Phase 3: build + sign a spend; our own interpreter must accept each input ----
-  (flet ((spend-check (type dest)
+  (flet ((spend-check (type &optional dest)
            (let* ((wal (wal:make-wallet-from-seed (hx "000102030405060708090a0b0c0d0e0f") :type type))
                   (spk (wal::waddr-script (aref (wal:wallet-receive wal) 0)))
+                  (dest (or dest (wal:wallet-receive-address wal 1)))   ; self-send fallback (P2TR)
                   (fund (mk-tx (list (cons (hx "ab") 0)) (list (cons 1000000 spk)))))
              (wal:wallet-process-tx wal fund 200)
              (let ((txn (wal:create-tx wal (list (cons dest 400000)) :feerate 2)))
                (checkt (format nil "~a: one input selected" type) (= 1 (length (tx:tx-inputs txn))))
                (checkt (format nil "~a: dest + change outputs" type) (>= (length (tx:tx-outputs txn)) 2))
                ;; the spend must verify under OUR Core-differential-tested interpreter
+               ;; (taproot commits to all prevouts, so pass them)
                (handler-case
                    (checkt (format nil "~a: input 0 verifies (sig+sighash correct)" type)
-                           (s:verify-input txn 0 spk 1000000))
+                           (s:verify-input txn 0 spk 1000000 :prevouts (vector (cons 1000000 spk))))
                  (s:script-error (e)
                    (setf *ok* nil) (format t "  *** ~a verify raised: ~a~%" type e)))
                ;; fee is positive and conservation holds (in=out+fee)
@@ -132,7 +134,8 @@
                  (checkt (format nil "~a: fee positive + conserved" type)
                          (< 0 (- 1000000 out-sum) 100000)))))))
     (spend-check :p2wpkh "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
-    (spend-check :p2pkh "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"))
+    (spend-check :p2pkh "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+    (spend-check :p2tr))   ; self-send; exercises BIP341 key-path tweak + Schnorr
   (format t "~&wallet-test: ~a~%"
           (if *ok* "OK — encodings + BIP32 + watch/balance + build/sign/verify" "FAILED"))
   *ok*)
