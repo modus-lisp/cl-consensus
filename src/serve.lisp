@@ -20,7 +20,7 @@
            #:parse-getdata #:serve-getdata #:*block-store*
            #:build-inv-message #:announce-block #:*max-relay-advance*
            #:announce-tx #:handle-inbound-tx #:*mempool* #:*utxo* #:*orphans*
-           #:*tx-relay-enabled* #:add-orphan #:orphans-spending
+           #:*tx-relay-enabled* #:*relay-lock* #:add-orphan #:orphans-spending
            #:install-serving-handlers #:start-listener #:serve-daemon
            #:*inbound-peers*))
 (in-package #:cl-consensus.serve)

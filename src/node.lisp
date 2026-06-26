@@ -16,10 +16,12 @@
                     (#:c #:cl-consensus.chain) (#:tx #:cl-consensus.tx)
                     (#:blk #:cl-consensus.block) (#:u #:cl-consensus.utxo)
                     (#:v #:cl-consensus.validate) (#:mp #:cl-consensus.mempool)
+                    (#:s #:cl-consensus.serve) (#:r #:cl-consensus.reorg)
+                    (#:bs #:cl-consensus.blockstore)
                     (#:ht #:hunchentoot)
                     (#:jzon #:com.inuoe.jzon) (#:bt #:bordeaux-threads))
   (:export #:start #:stop #:reload! #:*rpc-port* #:*control-port* #:rpc-call
-           #:*utxo* #:*mempool*))
+           #:serve-node #:*utxo* #:*mempool*))
 
 (in-package #:cl-consensus.node)
 
@@ -241,6 +243,101 @@
   (install-live-handlers *peer*)
   (format t "~&[bitcoind] following chain via ~a; tip ~d~%" host (c:tip-height))
   *peer*)
+
+;;; ----------------------------------------------------------------------------
+;;; Consolidated node: validate to tip (single UTXO writer) + serve + relay
+;;; ----------------------------------------------------------------------------
+
+(defun %confirm-into-mempool (block)
+  "Drop confirmed + now-conflicting txs from the live mempool when BLOCK connects."
+  (when s:*mempool*
+    (bt:with-lock-held (s:*relay-lock*)
+      (mp:mempool-on-block s:*mempool* (coerce (blk:block-txs block) 'list)))))
+
+(defun %connect-new-blocks (peers utxo undo committed)
+  "Fetch + connect every block from COMMITTED+1 to the header tip into UTXO, recording
+   undo, storing the raw bytes, dropping confirmed mempool txs, and announcing each to
+   inbound peers.  Returns the new committed height.  Synchronous per block — ample at
+   the ~1-block/10-min tip-following rate, and far simpler than the async IBD pipeline."
+  (let ((target (c:tip-height)))
+    (loop for h from (1+ committed) to target do
+      (let* ((hdr (c:header-at-height h))
+             (raw (blk:get-block-raw (first peers) (c:header-hash hdr)))
+             (b (blk:parse-block raw)))
+        (multiple-value-bind (fees undo-rec) (v:connect-block b h utxo)
+          (declare (ignore fees))
+          (r:undo-put undo h undo-rec))
+        (when s:*block-store* (bs:store-block s:*block-store* raw))
+        (%confirm-into-mempool b)
+        (s:announce-block hdr)
+        (setf committed h)
+        (format t "~&[node] connected + served block ~d~%" h) (force-output)))
+    committed))
+
+(defun validating-follow-loop (peers utxo undo start-height &key (poll 30))
+  "Long-lived: keep the UTXO at the header tip (reorg-aware), serving + relaying as we
+   go.  This thread is the SINGLE writer of the UTXO store."
+  (let ((committed start-height))
+    (loop
+      (handler-case
+          (progn
+            (handler-case (c:sync-headers (first peers) :max-batches 50) (serious-condition () nil))
+            (setf u:*utxo-flush-method* :incremental)
+            ;; reorg: roll the UTXO onto the heaviest branch before extending it
+            (multiple-value-bind (h2 reorged depth)
+                (r:activate-best-chain utxo committed undo
+                                       (lambda (hdr) (blk:get-block (first peers) (c:header-hash hdr))))
+              (when reorged
+                (format t "~&[node] *** REORG depth ~d: ~d -> ~d ***~%" depth committed h2) (force-output)
+                (u:flush-utxo utxo h2) (c:save-headers) (r:undo-commit undo)
+                (setf committed h2)))
+            ;; extend forward
+            (when (> (c:tip-height) committed)
+              (setf committed (%connect-new-blocks peers utxo undo committed))
+              (u:flush-utxo utxo committed) (c:save-headers) (r:undo-commit undo)
+              (when (> committed 288) (r:undo-prune undo (- committed 288)))))
+        (r:deep-reorg-halt (e)
+          (format t "~&[node] HALT (deep reorg): ~a~%" e) (force-output) (return))
+        (r:reorg-error (e)
+          (format t "~&[node] HALT (reorg-error): ~a~%" e) (force-output) (return))
+        (serious-condition (e)
+          (format t "~&[node] follow error: ~a~%" e) (force-output)))
+      (sleep poll))))
+
+(defun serve-node (&key (store "/mnt/lisp/ptchain/live.pt")
+                        (block-store "/mnt/lisp/ptchain/blocks.dat")
+                        (peer-host "epyc-docker.lan") (conns 2) (cache-gb 24)
+                        (listen-port (w:net-port w:*network*)) (rpc-port *rpc-port*)
+                        (max-peers 64) (poll 30))
+  "THE consolidated node: own the pagetree UTXO (single writer), validate new blocks to
+   the tip (reorg-aware), and SERVE headers/blocks + RELAY txs to inbound peers with a
+   tip-current UTXO + mempool, plus JSON-RPC + the control socket.  Replaces the
+   keep-current poll AND the header-only serve-daemon.  Blocks forever."
+  (setf *rpc-port* rpc-port *start-time* (get-universal-time))
+  (c:init-chain) (c:load-headers)
+  (let* ((peers (loop repeat conns collect (p:connect-peer peer-host :start-height (c:tip-height))))
+         (undo (r:open-pt-undo-store (concatenate 'string store ".undo"))))
+    (handler-case (c:sync-headers (first peers) :max-batches 50) (serious-condition () nil))
+    (multiple-value-bind (utxo height)
+        (u:open-utxo-backend store :backend :pagetree :cache-bytes (* cache-gb 1024 1024 1024))
+      (setf *utxo* utxo
+            s:*block-store* (bs:open-block-store block-store)
+            s:*utxo* utxo s:*mempool* *mempool* s:*tx-relay-enabled* t)
+      (format t "~&[node] UTXO resume height ~d (~d coins); block store ~d blocks~%"
+              height (u:utxo-count utxo) (bs:block-store-count s:*block-store*)) (force-output)
+      (register-methods)
+      (setf *acceptor* (make-instance 'ht:easy-acceptor :port rpc-port :address "0.0.0.0"))
+      (setf (ht:acceptor-message-log-destination *acceptor*) nil
+            (ht:acceptor-access-log-destination *acceptor*) nil)
+      (ht:define-easy-handler (rpc :uri "/") () (rpc-handler))
+      (ht:start *acceptor*)
+      (unless *control-thread*
+        (setf *control-thread* (bt:make-thread #'control-loop :name "btc-node control")))
+      (s:start-listener :port listen-port :max-peers max-peers)
+      (format t "~&[node] serve-node up: RPC :~d control :~d P2P :~d  follow ~a  tip ~d~%"
+              rpc-port *control-port* listen-port peer-host (c:tip-height)) (force-output)
+      (unwind-protect (validating-follow-loop peers utxo undo height :poll poll)
+        (r:close-pt-undo-store undo)))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Control socket (hot reload), start/stop

@@ -27,7 +27,7 @@
    #:entry #:entry-tx #:entry-fee #:entry-vsize #:entry-time #:entry-feerate
    #:entry-parents #:entry-children #:entry-replaceable
    #:accept-tx #:mempool-get #:mempool-txids #:mempool-conflicts-p #:mempool-remove
-   #:trim-mempool #:expire-mempool #:gather-descendants
+   #:mempool-on-block #:trim-mempool #:expire-mempool #:gather-descendants
    #:*min-relay-feerate* #:*max-standard-tx-weight* #:*max-mempool-bytes*
    #:*mempool-expiry-seconds* #:*max-rbf-replacements* #:dust-threshold #:final-tx-p
    #:rejected #:rejected-reason))
@@ -184,6 +184,24 @@
                  (let ((h (make-hash-table :test 'equal))) (setf (gethash txid-hex h) t) h)))
         (n 0))
     (loop for k being the hash-keys of set do (when (%remove-entry mp k) (incf n)))
+    n))
+
+(defun mempool-on-block (mp txs)
+  "Reconcile the mempool when a block confirms TXS: drop each confirmed tx, and drop any
+   mempool tx that now conflicts (double-spends a just-confirmed input) along with its
+   descendants.  A confirmed tx's in-mempool children stay (they now spend confirmed
+   coins) — %remove-entry unlinks them.  Returns the count removed."
+  (let ((n 0))
+    (dolist (txn txs)
+      (let ((txid-hex (tx:txid-hex txn)))
+        ;; a DIFFERENT mempool tx spending one of this tx's inputs is now a dead double-spend
+        (dolist (in (tx:tx-inputs txn))
+          (let ((spender (gethash (outpoint-key (tx:txin-prev-hash in) (tx:txin-prev-index in))
+                                  (mempool-spent mp))))
+            (when (and spender (not (string= spender txid-hex)))
+              (incf n (mempool-remove mp spender :descendants t)))))
+        (when (gethash txid-hex (mempool-entries mp))
+          (incf n (mempool-remove mp txid-hex)))))
     n))
 
 ;;; ----------------------------------------------------------------------------

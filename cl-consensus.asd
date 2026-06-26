@@ -30,6 +30,6 @@
      (:file "script")      ; the Script interpreter + sighash (the consensus core)
      (:file "validate")    ; connect/disconnect-block, consensus rules, IBD
      (:file "reorg")       ; tip reorg / best-chain activation
-     (:file "mempool")     ; mempool acceptance
-     (:file "node")       ; daemon: JSON-RPC + control socket
-     (:file "serve")))))  ; network citizen: inbound listener + serve headers/blocks
+     (:file "mempool")     ; mempool acceptance + relay policy (fee/dust/RBF/eviction)
+     (:file "serve")       ; network citizen: inbound listener + serve headers/blocks + tx relay
+     (:file "node")))))   ; daemon: JSON-RPC + control socket + consolidated serve-node
