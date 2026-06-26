@@ -34,4 +34,5 @@
      (:file "reorg")       ; tip reorg / best-chain activation
      (:file "mempool")     ; mempool acceptance + relay policy (fee/dust/RBF/eviction)
      (:file "serve")       ; network citizen: inbound listener + serve headers/blocks + tx relay
-     (:file "node")))))   ; daemon: JSON-RPC + control socket + consolidated serve-node
+     (:file "node")        ; daemon: JSON-RPC + control socket + consolidated serve-node
+     (:file "wallet")))))  ; HD wallet: addresses, watch/balance, build+sign+broadcast

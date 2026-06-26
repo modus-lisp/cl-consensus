@@ -13,9 +13,20 @@
 (defpackage :wallet-test
   (:use :cl)
   (:local-nicknames (:enc :cl-consensus.encoding) (:b32 :cl-consensus.bip32)
-                    (:w :cl-consensus.wire))
+                    (:w :cl-consensus.wire) (:wal :cl-consensus.wallet)
+                    (:tx :cl-consensus.tx) (:u :cl-consensus.utxo))
   (:export #:run))
 (in-package :wallet-test)
+
+(defparameter *op-true* (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+(defun mk-tx (prevs outs)
+  "PREVS = list of (txid . idx); OUTS = list of (value . script)."
+  (let ((txn (tx:make-tx :version 2
+               :inputs (mapcar (lambda (p) (tx:make-txin :prev-hash (car p) :prev-index (cdr p)
+                                                         :script #() :sequence #xffffffff)) prevs)
+               :outputs (mapcar (lambda (o) (tx:make-txout :value (car o) :script (cdr o))) outs)
+               :witnesses nil :locktime 0 :segwit-p nil)))
+    (tx:finalize-tx txn) txn))
 
 (defparameter *ok* t)
 (defun check (name got want)
@@ -71,5 +82,36 @@
            (addr (enc:encode-p2wpkh (w:hash160 (b32:xkey-pubkey k)))))
       (checkt "BIP84 receive addr is bech32 mainnet" (string= (subseq addr 0 3) "bc1"))
       (format t "[wallet-test] sample m/84'/0'/0'/0/0 -> ~a~%" addr)))
-  (format t "~&wallet-test: ~a~%" (if *ok* "OK — base58check + bech32/bech32m + BIP32" "FAILED"))
+  ;; ---- Phase 2: watch / balance ----
+  (let* ((seed (hx "000102030405060708090a0b0c0d0e0f"))
+         (wal (wal:make-wallet-from-seed seed :type :p2wpkh)))
+    (checkt "receive[0] is bech32 mainnet" (string= (subseq (wal:wallet-receive-address wal 0) 0 3) "bc1"))
+    (checkt "receive addrs are distinct"
+            (not (string= (wal:wallet-receive-address wal 0) (wal:wallet-receive-address wal 1))))
+    (let* ((spk0 (wal::waddr-script (aref (wal:wallet-receive wal) 0)))
+           (funding (mk-tx (list (cons (hx "aa") 0)) (list (cons 250000 spk0)
+                                                           (cons 999 *op-true*)))))
+      ;; a tx pays our receive[0] -> coin tracked, balance updates
+      (wal:wallet-process-tx wal funding 100)
+      (check "balance after funding" (wal:wallet-balance wal) 250000)
+      (check "one coin tracked" (hash-table-count (wal:wallet-coins wal)) 1)
+      ;; gap window extended past the initial 20 once an address is used
+      (checkt "gap window extended" (> (length (wal:wallet-receive wal)) 20))
+      ;; spend that coin -> balance back to 0
+      (let ((spend (mk-tx (list (cons (tx:tx-txid funding) 0)) (list (cons 240000 *op-true*)))))
+        (wal:wallet-process-tx wal spend 101)
+        (check "balance after spend" (wal:wallet-balance wal) 0)
+        (check "coin removed" (hash-table-count (wal:wallet-coins wal)) 0)))
+    ;; rescan an in-RAM UTXO for our coins
+    (let* ((spk1 (wal::waddr-script (aref (wal:wallet-receive wal) 1)))
+           (utxo (u:make-utxo-set)))
+      (u:utxo-add utxo (hx "bb") 0 (u:make-coin :value 77000 :height 50 :coinbase-p nil :script spk1))
+      (u:utxo-add utxo (hx "cc") 0 (u:make-coin :value 1 :height 50 :coinbase-p nil :script *op-true*))
+      (check "rescan finds our 1 coin" (wal:wallet-rescan-utxo wal utxo) 1)
+      (check "rescan balance" (wal:wallet-balance wal) 77000)))
+  ;; ---- P2PKH wallet derives legacy addresses ----
+  (let ((wpk (wal:make-wallet-from-seed (hx "000102030405060708090a0b0c0d0e0f") :type :p2pkh)))
+    (checkt "p2pkh address starts with 1" (char= (char (wal:wallet-receive-address wpk 0) 0) #\1)))
+  (format t "~&wallet-test: ~a~%"
+          (if *ok* "OK — base58check + bech32/bech32m + BIP32 + watch/balance" "FAILED"))
   *ok*)
