@@ -176,6 +176,33 @@
         (check "child survives a confirmed parent" (mp:mempool-get mp cid))
         (check "surviving child has no mempool parents now"
                (null (mp:entry-parents (mp:mempool-get mp cid)))))))
+  ;; ---- persistence: save -> load round-trip, re-validated against the UTXO ----
+  (multiple-value-bind (utxo h) (fund 12)
+    (let ((mp (mp:make-mempool)) (path "/tmp/mp-test.dat"))
+      (ignore-errors (delete-file path))
+      ;; two independent txs + a parent/child chain
+      (mp:accept-tx (build-tx (list (cons (aref h 0) 0)) (list (- +coin+ 5000))) utxo mp :height 200000 :mtp 1500000000)
+      (mp:accept-tx (build-tx (list (cons (aref h 1) 0)) (list (- +coin+ 5000))) utxo mp :height 200000 :mtp 1500000000)
+      (let ((parent (build-tx (list (cons (aref h 2) 0)) (list (- +coin+ 5000)))))
+        (mp:accept-tx parent utxo mp :height 200000 :mtp 1500000000)
+        (mp:accept-tx (build-tx (list (cons (tx:tx-txid parent) 0)) (list (- +coin+ 10000)))
+                      utxo mp :height 200000 :mtp 1500000000))
+      (check "4 txs before save" (= (mp:mempool-size mp) 4))
+      (mp:save-mempool mp path)
+      ;; reload into a fresh mempool against the SAME utxo -> all 4 restored (incl. the
+      ;; child whose parent is in-mempool, via the dependency-retry loop)
+      (let ((mp2 (mp:make-mempool)))
+        (let ((restored (mp:load-mempool mp2 utxo path :height 200000 :mtp 1500000000)))
+          (check "reload restored all 4" (= restored 4))
+          (check "reloaded mempool size 4" (= (mp:mempool-size mp2) 4))
+          (check "same txids restored"
+                 (null (set-difference (mp:mempool-txids mp) (mp:mempool-txids mp2) :test #'string=)))))
+      ;; a coin spent while "down" -> its tx (no descendants) is dropped on reload
+      (u:utxo-spend utxo (aref h 0) 0)
+      (let ((mp3 (mp:make-mempool)))
+        (check "reload drops tx whose input is now gone"
+               (= (mp:load-mempool mp3 utxo path :height 200000 :mtp 1500000000) 3)))
+      (ignore-errors (delete-file path))))
   (format t "~&mempool-test: ~a~%"
-          (if *ok* "OK — policy + RBF + links + eviction + expiry + on-block" "FAILED"))
+          (if *ok* "OK — policy + RBF + links + eviction + expiry + on-block + persistence" "FAILED"))
   *ok*)

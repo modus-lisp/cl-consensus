@@ -31,6 +31,7 @@
 (defvar *control-thread* nil)
 (defvar *utxo* nil "Attached UTXO set, if validation state is loaded.")
 (defvar *mempool* (mp:make-mempool))
+(defvar *mempool-path* nil "If set, persist/restore the mempool here across restarts.")
 (defvar *start-time* 0)
 
 ;;; ----------------------------------------------------------------------------
@@ -302,13 +303,17 @@
           (format t "~&[node] HALT (reorg-error): ~a~%" e) (force-output) (return))
         (serious-condition (e)
           (format t "~&[node] follow error: ~a~%" e) (force-output)))
+      ;; persist the mempool each tick so a crash/respawn keeps the unconfirmed set
+      (when *mempool-path*
+        (handler-case (mp:save-mempool *mempool* *mempool-path*) (serious-condition () nil)))
       (sleep poll))))
 
 (defun serve-node (&key (store "/mnt/lisp/ptchain/live.pt")
                         (block-store "/mnt/lisp/ptchain/blocks.dat")
                         (peer-host "epyc-docker.lan") (conns 2) (cache-gb 24)
                         (listen-port (w:net-port w:*network*)) (rpc-port *rpc-port*)
-                        (max-peers 64) (poll 30))
+                        (max-peers 64) (poll 30)
+                        (mempool-path "/mnt/lisp/ptchain/mempool.dat"))
   "THE consolidated node: own the pagetree UTXO (single writer), validate new blocks to
    the tip (reorg-aware), and SERVE headers/blocks + RELAY txs to inbound peers with a
    tip-current UTXO + mempool, plus JSON-RPC + the control socket.  Replaces the
@@ -325,6 +330,14 @@
             s:*utxo* utxo s:*mempool* *mempool* s:*tx-relay-enabled* t)
       (format t "~&[node] UTXO resume height ~d (~d coins); block store ~d blocks~%"
               height (u:utxo-count utxo) (bs:block-store-count s:*block-store*)) (force-output)
+      ;; restore the mempool (re-validated against the just-loaded UTXO)
+      (setf *mempool-path* mempool-path)
+      (when mempool-path
+        (handler-case
+            (let ((n (mp:load-mempool *mempool* utxo mempool-path
+                                      :height (1+ (c:tip-height)) :mtp (c:median-time-past (c:tip)))))
+              (format t "~&[node] mempool restored: ~d tx~%" n) (force-output))
+          (serious-condition (e) (format t "~&[node] mempool restore skipped: ~a~%" e) (force-output))))
       (register-methods)
       (setf *acceptor* (make-instance 'ht:easy-acceptor :port rpc-port :address "0.0.0.0"))
       (setf (ht:acceptor-message-log-destination *acceptor*) nil
@@ -337,6 +350,7 @@
       (format t "~&[node] serve-node up: RPC :~d control :~d P2P :~d  follow ~a  tip ~d~%"
               rpc-port *control-port* listen-port peer-host (c:tip-height)) (force-output)
       (unwind-protect (validating-follow-loop peers utxo undo height :poll poll)
+        (when *mempool-path* (ignore-errors (mp:save-mempool *mempool* *mempool-path*)))
         (r:close-pt-undo-store undo)))))
 
 ;;; ----------------------------------------------------------------------------

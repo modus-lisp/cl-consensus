@@ -28,6 +28,7 @@
    #:entry-parents #:entry-children #:entry-replaceable
    #:accept-tx #:mempool-get #:mempool-txids #:mempool-conflicts-p #:mempool-remove
    #:mempool-on-block #:trim-mempool #:expire-mempool #:gather-descendants
+   #:save-mempool #:load-mempool
    #:*min-relay-feerate* #:*max-standard-tx-weight* #:*max-mempool-bytes*
    #:*mempool-expiry-seconds* #:*max-rbf-replacements* #:dust-threshold #:final-tx-p
    #:rejected #:rejected-reason))
@@ -369,3 +370,67 @@
                   ;; a just-inserted tx can itself be trimmed if it's the cheapest leaf
                   (if (gethash txid-hex (mempool-entries mp)) e
                       (rej "mempool full: feerate below eviction floor"))))))))))
+
+;;; ----------------------------------------------------------------------------
+;;; Persistence — survive a restart (re-validated against the current UTXO)
+;;; ----------------------------------------------------------------------------
+
+(defparameter +mempool-file-version+ 1)
+
+(defun %read-file-bytes (path)
+  (with-open-file (f path :element-type '(unsigned-byte 8))
+    (let ((buf (make-array (file-length f) :element-type '(unsigned-byte 8))))
+      (read-sequence buf f) buf)))
+
+(defun save-mempool (mp path)
+  "Write MP to PATH atomically (temp + rename): u32 version, varint count, then per tx
+   [u64 entry-time, varint len, raw witness tx bytes].  Returns the count written.
+   Policy/links/fees are NOT stored — they're recomputed on load by re-accepting."
+  (let ((wr (w:make-writer)))
+    (w:w-u32 wr +mempool-file-version+)
+    (w:w-varint wr (mempool-size mp))
+    (maphash (lambda (k e)
+               (declare (ignore k))
+               (let ((b (tx:serialize-tx (entry-tx e) :witness t)))
+                 (w:w-u64 wr (entry-time e))
+                 (w:w-varint wr (length b))
+                 (w:w-bytes wr b)))
+             (mempool-entries mp))
+    (let ((tmp (concatenate 'string (namestring path) ".tmp")))
+      (with-open-file (f tmp :direction :output :element-type '(unsigned-byte 8)
+                             :if-exists :supersede :if-does-not-exist :create)
+        (write-sequence (w:writer-bytes wr) f)
+        (finish-output f))
+      (sb-posix:rename tmp (namestring path)))
+    (mempool-size mp)))
+
+(defun load-mempool (mp utxo path &key (height most-positive-fixnum) (mtp 0))
+  "Re-populate MP from PATH, re-validating every tx against UTXO + current policy at
+   HEIGHT/MTP — txs that no longer apply (inputs spent/confirmed while down, now below
+   the fee floor, etc.) are silently dropped.  Each tx keeps its original entry-time.
+   Re-adds in dependency order (retry rounds until no further progress, so a child saved
+   before its in-mempool parent still lands).  Returns the count restored."
+  (unless (probe-file path) (return-from load-mempool 0))
+  (let* ((r (w:make-reader (%read-file-bytes path)))
+         (ver (w:r-u32 r)))
+    (unless (= ver +mempool-file-version+)
+      (warn "mempool file version ~d (expected ~d); ignoring" ver +mempool-file-version+)
+      (return-from load-mempool 0))
+    (let ((n (w:r-varint r)) (pending '()))
+      (dotimes (i n)
+        (let* ((tm (w:r-u64 r)) (len (w:r-varint r)) (b (w:r-bytes r len))
+               (txn (handler-case (tx:parse-tx (w:make-reader b)) (serious-condition () nil))))
+          (when txn (push (cons tm txn) pending))))
+      (let ((added 0))
+        (loop
+          (let ((progress nil) (still '()))
+            (dolist (pt pending)
+              (handler-case
+                  (progn (accept-tx (cdr pt) utxo mp :height height :time (car pt) :mtp mtp :trim nil)
+                         (incf added) (setf progress t))
+                (rejected (e)
+                  (when (search "missing-inputs" (rejected-reason e)) (push pt still)))
+                (serious-condition () nil)))   ; any other failure -> drop that tx
+            (setf pending still)
+            (unless (and progress pending) (return))))
+        added))))
