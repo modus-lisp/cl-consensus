@@ -111,6 +111,20 @@ Run the full offline gate suite (wallet, mempool, regtest, reorg, serve/relay, â
 inspect/run-all.sh
 ```
 
+Make a wallet and an address (REPL):
+
+```lisp
+(multiple-value-bind (wallet mnemonic)
+    (cl-consensus.bip39:generate-wallet :type :p2wpkh)   ; fresh BIP39 + BIP84 wallet
+  (format t "~&backup phrase: ~a~%" mnemonic)
+  (format t "receive address: ~a~%" (cl-consensus.wallet:wallet-receive-address wallet 0)))
+;; backup phrase: legal winner thank year wave ...
+;; receive address: bc1q...
+```
+
+Restore it later with
+`(cl-consensus.bip39:make-wallet-from-mnemonic "<phrase>" :type :p2wpkh)`.
+
 Run the daemon (JSON-RPC on :8432, control socket on :4008):
 
 ```sh
