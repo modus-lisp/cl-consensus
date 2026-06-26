@@ -13,11 +13,14 @@
   (:nicknames #:btc-serve)
   (:local-nicknames (#:c #:cl-consensus.chain) (#:p #:cl-consensus.peer)
                     (#:w #:cl-consensus.wire) (#:blk #:cl-consensus.block)
-                    (#:bs #:cl-consensus.blockstore)
+                    (#:bs #:cl-consensus.blockstore) (#:mp #:cl-consensus.mempool)
+                    (#:tx #:cl-consensus.tx) (#:u #:cl-consensus.utxo)
                     (#:bt #:bordeaux-threads))
   (:export #:parse-getheaders #:build-headers-message #:serve-getheaders
            #:parse-getdata #:serve-getdata #:*block-store*
            #:build-inv-message #:announce-block #:*max-relay-advance*
+           #:announce-tx #:handle-inbound-tx #:*mempool* #:*utxo* #:*orphans*
+           #:*tx-relay-enabled* #:add-orphan #:orphans-spending
            #:install-serving-handlers #:start-listener #:serve-daemon
            #:*inbound-peers*))
 (in-package #:cl-consensus.serve)
@@ -97,30 +100,133 @@
       (w:w-hash wr (cdr e)))
     (w:writer-bytes wr)))
 
+(defconstant +msg-tx+ 1)
+(defconstant +msg-witness-tx+ #x40000001)
+
+(defun %tx-getdata-p (type) (= (logand type #x3fffffff) +msg-tx+))
+
 (defun serve-getdata (peer payload)
-  "Answer a peer's getdata for blocks: for each MSG_BLOCK/MSG_WITNESS_BLOCK entry we
-   have stored, send the raw 'block' bytes; collect the misses and reply 'notfound'.
-   Non-block inventory types (tx) are left to other handlers / ignored here."
+  "Answer a peer's getdata: MSG_BLOCK/MSG_WITNESS_BLOCK from the block store (raw
+   'block'), MSG_TX/MSG_WITNESS_TX from the mempool ('tx'); collect the misses and reply
+   'notfound'."
   (let ((entries (parse-getdata payload))
-        (misses '()) (served 0))
+        (misses '()) (blocks 0) (txs 0))
     (dolist (e entries)
       (let ((type (car e)) (hash (cdr e)))
         (cond
-          ((not (%block-getdata-p type)) nil)   ; not a block request; ignore here
-          (t
-           (let ((raw (and *block-store*
-                           (bs:get-block-bytes *block-store* (w:hash->hex hash)))))
-             (if raw
-                 (progn (p:send peer "block" raw) (incf served))
-                 (push e misses)))))))
+          ((%block-getdata-p type)
+           (let ((raw (and *block-store* (bs:get-block-bytes *block-store* (w:hash->hex hash)))))
+             (if raw (progn (p:send peer "block" raw) (incf blocks)) (push e misses))))
+          ((%tx-getdata-p type)
+           (let ((ent (and *mempool*
+                           (bt:with-lock-held (*relay-lock*)
+                             (mp:mempool-get *mempool* (w:hash->hex hash))))))
+             (if ent
+                 (progn (p:send peer "tx" (tx:serialize-tx (mp:entry-tx ent) :witness t)) (incf txs))
+                 (push e misses))))
+          (t nil))))                              ; unknown inv type: ignore
     (when misses
       (p:send peer "notfound" (build-notfound-message (nreverse misses))))
-    (p:peer-log peer "served ~d block(s), ~d notfound" served (length misses))))
+    (p:peer-log peer "served ~d block(s) ~d tx(s), ~d notfound" blocks txs (length misses))))
+
+;;; ----------------------------------------------------------------------------
+;;; Tx relay — accept inbound txs into the mempool, announce + serve them (Phase 3b)
+;;; ----------------------------------------------------------------------------
+
+(defvar *mempool* nil "The shared mempool tx relay accepts into (nil = no tx relay).")
+(defvar *utxo* nil "Confirmed coin set used to validate inbound txs (nil = none).")
+(defvar *relay-lock* (bt:make-lock "tx-relay")
+  "Guards *mempool* + *orphans*: inbound peers run on separate read-loop threads.")
+(defparameter *tx-relay-enabled* nil
+  "Only accept/serve txs when a mempool + UTXO are wired (else every real tx is a
+   missing-inputs orphan).  serve-daemon sets this when it has a UTXO.")
+
+;; Orphan pool: txs whose inputs aren't all known yet (out-of-order relay arrival).
+(defstruct orphan-pool (txs (make-hash-table :test 'equal)) (max 100))
+(defvar *orphans* (make-orphan-pool))
+
+(defun %unix-now () (- (get-universal-time) 2208988800))
+(defun %accept-height () (1+ (c:tip-height)))
+(defun %accept-mtp () (handler-case (c:median-time-past (c:tip)) (serious-condition () 0)))
+
+(defun add-orphan (txn)
+  "Park TXN in the orphan pool, evicting an arbitrary orphan if at capacity."
+  (let ((tbl (orphan-pool-txs *orphans*)))
+    (when (>= (hash-table-count tbl) (orphan-pool-max *orphans*))
+      (let ((victim (block pick (maphash (lambda (k v) (declare (ignore v)) (return-from pick k)) tbl))))
+        (when victim (remhash victim tbl))))
+    (setf (gethash (tx:txid-hex txn) tbl) txn)))
+
+(defun orphans-spending (parent-txid-hex)
+  "Orphan txns that spend an output of PARENT-TXID-HEX (candidates to retry now that the
+   parent is in the mempool)."
+  (loop for txn being the hash-values of (orphan-pool-txs *orphans*)
+        when (some (lambda (in) (string= (w:hash->hex (tx:txin-prev-hash in)) parent-txid-hex))
+                   (tx:tx-inputs txn))
+        collect txn))
+
+(defun announce-tx (txid-hex &optional source-peer)
+  "inv(MSG_TX) TXID-HEX to every live inbound peer except SOURCE-PEER (don't echo it
+   back to the peer that sent it).  Per-peer error isolation."
+  (let ((peers (bt:with-lock-held (*inbound-lock*) (copy-list *inbound-peers*)))
+        (hash (w:hex->hash txid-hex)))
+    (dolist (pr peers)
+      (when (and (p:peer-alive-p pr) (not (eq pr source-peer)))
+        (handler-case (p:send pr "inv" (build-inv-message (list (cons +msg-tx+ hash))))
+          (serious-condition () nil))))))
+
+(defun request-parents (peer txn)
+  "Ask PEER for any of TXN's parents we don't yet have (getdata MSG_WITNESS_TX).  Best
+   effort — the parent arrives later as its own 'tx' message (no blocking wait here)."
+  (dolist (in (tx:tx-inputs txn))
+    (let* ((ph (tx:txin-prev-hash in)) (phx (w:hash->hex ph)))
+      (unless (or (and *utxo* (u:utxo-get *utxo* ph (tx:txin-prev-index in)))
+                  (mp:mempool-get *mempool* phx))
+        (handler-case
+            (p:send peer "getdata" (build-inv-message (list (cons +msg-witness-tx+ ph))))
+          (serious-condition () nil))))))
+
+(defun %try-accept (txn source-peer)
+  "Accept TXN into the mempool (caller holds *relay-lock*).  On success announce it and
+   recursively retry any orphans that were waiting on it; on missing-inputs park it as an
+   orphan and request its parents; other rejects drop it.  Returns T if accepted."
+  (let ((txid-hex (tx:txid-hex txn)))
+    (handler-case
+        (progn
+          (mp:accept-tx txn *utxo* *mempool*
+                        :height (%accept-height) :mtp (%accept-mtp) :time (%unix-now))
+          (announce-tx txid-hex source-peer)
+          ;; this tx may unblock parked orphans
+          (dolist (orphan (orphans-spending txid-hex))
+            (remhash (tx:txid-hex orphan) (orphan-pool-txs *orphans*))
+            (%try-accept orphan source-peer))
+          t)
+      (mp:rejected (e)
+        (when (search "missing-inputs" (mp:rejected-reason e))
+          (add-orphan txn)
+          (when source-peer (request-parents source-peer txn)))
+        nil))))
+
+(defun handle-inbound-tx (peer payload)
+  "Dispatch handler for an inbound 'tx': parse, validate, and relay.  Runs on the peer's
+   read-loop thread but never blocks on a reply (accept is CPU-only; announce/getdata are
+   non-blocking sends), so it can't deadlock the read-loop."
+  (when *tx-relay-enabled*
+    (handler-case
+        (let ((txn (tx:parse-tx (w:make-reader payload))))
+          (tx:finalize-tx txn)
+          (bt:with-lock-held (*relay-lock*)
+            (unless (mp:mempool-get *mempool* (tx:txid-hex txn))
+              (%try-accept txn peer))))
+      (serious-condition (e)
+        (format t "~&[serve] inbound tx error: ~a~%" e) (force-output)))))
 
 (defun install-serving-handlers (peer)
-  "Register the read-only serving responders on PEER: getheaders and getdata."
+  "Register the read-only serving responders on PEER: getheaders, getdata, and (when tx
+   relay is enabled) inbound tx."
   (p:on peer "getheaders" #'serve-getheaders)
-  (p:on peer "getdata" #'serve-getdata))
+  (p:on peer "getdata" #'serve-getdata)
+  (p:on peer "tx" #'handle-inbound-tx))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Inbound listener
