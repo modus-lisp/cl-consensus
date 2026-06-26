@@ -35,4 +35,9 @@
      (:file "mempool")     ; mempool acceptance + relay policy (fee/dust/RBF/eviction)
      (:file "serve")       ; network citizen: inbound listener + serve headers/blocks + tx relay
      (:file "node")        ; daemon: JSON-RPC + control socket + consolidated serve-node
-     (:file "wallet")))))  ; HD wallet: addresses, watch/balance, build+sign+broadcast
+     (:file "wallet")      ; HD wallet: addresses, watch/balance, build+sign+broadcast
+     (:file "bip39")       ; BIP39 mnemonic seed phrases (entropy<->words, seed)
+     (:file "bip39-wordlist") ; canonical 2048-word English list (order matters)
+     (:file "wallet-store")   ; persist/restore a wallet (seed + tracked coins)
+     (:file "rpc-wallet")     ; wallet-backed JSON-RPC (getnewaddress/sendtoaddress/...)
+     (:file "taproot-script")))))  ; BIP341 taproot script-path spend construction
