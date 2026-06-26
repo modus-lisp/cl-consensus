@@ -109,6 +109,10 @@
       (incf size))
     (logior compact (ash size 24))))
 
+(defun pow-limit ()
+  "The active network's maximum target (easiest difficulty)."
+  (compact->target (w:net-pow-limit-bits w:*network*)))
+
 (defun hash->int-le (hash)
   "Interpret a 32-byte hash as a little-endian integer (for PoW comparison)."
   (let ((acc 0))
@@ -121,7 +125,7 @@
    difficulty is no easier than the network minimum."
   (let ((target (compact->target (header-bits h))))
     (and (plusp target)
-         (<= target *pow-limit*)
+         (<= target (pow-limit))
          (<= (hash->int-le (header-hash h)) target))))
 
 (defun block-work (bits)
@@ -140,6 +144,8 @@
 
 (defun next-work-required (prev-header)
   "The nBits that the block *following* PREV-HEADER must carry."
+  (when (w:net-no-retarget w:*network*)        ; regtest: difficulty is constant
+    (return-from next-work-required (header-bits prev-header)))
   (let ((next-height (1+ (header-height prev-header))))
     (if (/= 0 (mod next-height +retarget-interval+))
         ;; not a boundary: difficulty unchanged
@@ -154,7 +160,7 @@
           (let ((new-target (floor (* (compact->target (header-bits prev-header))
                                       timespan)
                                    +target-timespan+)))
-            (target->compact (min new-target *pow-limit*)))))))
+            (target->compact (min new-target (pow-limit))))))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Median time past — median of the last 11 headers' timestamps (BIP113)
@@ -207,7 +213,7 @@
   (setf *by-hash* (make-hash-table :test 'equal)
         *by-height* (make-array 0 :adjustable t :fill-pointer 0)
         *tip* nil)
-  (let ((g (parse-header (w:make-reader (w:hex->bytes *genesis-header-hex*)))))
+  (let ((g (parse-header (w:make-reader (w:hex->bytes (w:net-genesis-hex w:*network*))))))
     (setf (header-height g) 0
           (header-chainwork g) (block-work (header-bits g))
           *genesis* g)

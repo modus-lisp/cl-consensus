@@ -65,16 +65,21 @@
 (defconstant +cltv-height+ 388381)      ; BIP65
 (defconstant +csv-height+ 419328)       ; BIP112
 
+(defun height-of (fork)
+  "Activation height of FORK (:p2sh :dersig :cltv :csv :bip34 :segwit :taproot) on the
+   active network (mainnet's real schedule; early on regtest/testnet)."
+  (getf (w:net-heights w:*network*) fork))
+
 (defun consensus-flags (height)
-  "The SCRIPT_VERIFY flags that are consensus-active at HEIGHT (mainnet).
+  "The SCRIPT_VERIFY flags consensus-active at HEIGHT on the active network.
    Policy-only flags (LOW_S, STRICTENC, MINIMALDATA) are intentionally excluded."
   (let ((f '()))
-    (when (>= height +bip16-height+) (push :p2sh f))
-    (when (>= height +bip66-height+) (push :dersig f))
-    (when (>= height +cltv-height+) (push :cltv f))
-    (when (>= height +csv-height+) (push :csv f))
-    (when (>= height +segwit-height+) (push :witness f) (push :nulldummy f))
-    (when (>= height +taproot-height+) (push :taproot f))
+    (when (>= height (height-of :p2sh)) (push :p2sh f))
+    (when (>= height (height-of :dersig)) (push :dersig f))
+    (when (>= height (height-of :cltv)) (push :cltv f))
+    (when (>= height (height-of :csv)) (push :csv f))
+    (when (>= height (height-of :segwit)) (push :witness f) (push :nulldummy f))
+    (when (>= height (height-of :taproot)) (push :taproot f))
     f))
 
 (defun block-subsidy (height)
@@ -180,7 +185,7 @@
 (defun check-witness-commitment (block height)
   "Enforce BIP141: if the block carries any witness data (segwit active), the
    coinbase must commit to HASH256(witness-merkle-root || reserved-value)."
-  (when (>= height +segwit-height+)
+  (when (>= height (height-of :segwit))
     (let* ((txs (blk:block-txs block))
            (has-witness (some #'tx:tx-segwit-p txs))
            (coinbase (aref txs 0))
@@ -623,7 +628,7 @@
   (let* ((txs (blk:block-txs block))
          (flags (consensus-flags height))
          (mtp (block-mtp height))
-         (enforce-locks (>= height +bip113-height+))
+         (enforce-locks (>= height (height-of :csv)))
          (total-fees 0)
          (coinbase-claimed 0)
          (checks '())                   ; deferred script-verification jobs
@@ -637,7 +642,7 @@
     ;; coinbase structure + BIP34 (coinbase must encode its own height)
     (let ((cb (aref txs 0)))
       (unless (tx:tx-coinbase-p cb) (cerr height "first tx is not a coinbase"))
-      (when (>= height +bip34-height+)
+      (when (>= height (height-of :bip34))
         (let ((ss (tx:txin-script (first (tx:tx-inputs cb)))))
           (unless (bip34-height-ok ss height)
             (cerr height "BIP34: coinbase does not encode height ~d" height)))))
@@ -696,7 +701,7 @@
           ;; in coinbase) makes duplicate txids impossible above its activation,
           ;; so — like Core — skip the per-output lookup there (the two
           ;; pre-BIP34 duplicate-coinbase blocks are the *-exceptions*).
-          (when (and (< height +bip34-height+)
+          (when (and (< height (height-of :bip34))
                      (not (member height *bip30-exceptions*))
                      (u:utxo-get utxo (tx:tx-txid txn) vout))
             (cerr height "BIP30: duplicate unspent outpoint ~a:~d"

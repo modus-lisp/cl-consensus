@@ -30,6 +30,7 @@
    ;; network params
    #:*network* #:select-network #:net-name #:net-magic #:net-port
    #:net-default-version #:net-genesis-hash
+   #:net-genesis-hex #:net-pow-limit-bits #:net-no-retarget #:net-heights
    #:+services-none+ #:+services-network+ #:+services-witness+))
 
 (in-package #:cl-consensus.wire)
@@ -75,28 +76,58 @@
 ;;; ----------------------------------------------------------------------------
 
 (defstruct net
-  name magic port default-version genesis-hash)
+  name magic port default-version genesis-hash
+  genesis-hex            ; the 80-byte genesis header, hex
+  pow-limit-bits         ; compact nBits of the easiest allowed target
+  (no-retarget nil)      ; t = difficulty never changes (regtest)
+  heights)               ; plist of soft-fork activation heights
+
+;; mainnet genesis header (Jan 3 2009)
+(defparameter *mainnet-genesis-hex*
+  (concatenate 'string
+    "01000000"                                                          ; version
+    "0000000000000000000000000000000000000000000000000000000000000000"  ; prev
+    "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"  ; merkle
+    "29ab5f49" "ffff001d" "1dac2b7c"))                                  ; time bits nonce
+;; regtest genesis: same coinbase/merkle, nBits 0x207fffff (powLimit), nonce 2
+(defparameter *regtest-genesis-hex*
+  (concatenate 'string
+    "01000000" "0000000000000000000000000000000000000000000000000000000000000000"
+    "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
+    "dae5494d" "ffff7f20" "02000000"))                                  ; time bits nonce
+;; testnet3 genesis
+(defparameter *testnet-genesis-hex*
+  (concatenate 'string
+    "01000000" "0000000000000000000000000000000000000000000000000000000000000000"
+    "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
+    "dae5494d" "ffff001d" "1aa4ae18"))
+
+(defparameter *mainnet-heights*                ; real BIP activation heights
+  '(:p2sh 173805 :dersig 363725 :cltv 388381 :csv 419328
+    :bip34 227931 :segwit 481824 :taproot 709632))
+(defparameter *early-heights*                  ; regtest/testnet: everything from block 1
+  '(:p2sh 1 :dersig 1 :cltv 1 :csv 1 :bip34 1 :segwit 1 :taproot 1))
 
 (defparameter *networks*
   (list
    (make-net :name :mainnet
              :magic #xD9B4BEF9            ; wire order F9 BE B4 D9, stored as LE u32
-             :port 8333
-             :default-version 70016
-             :genesis-hash
-             "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+             :port 8333 :default-version 70016
+             :genesis-hash "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+             :genesis-hex *mainnet-genesis-hex* :pow-limit-bits #x1d00ffff
+             :no-retarget nil :heights *mainnet-heights*)
    (make-net :name :testnet
              :magic #x0709110B
-             :port 18333
-             :default-version 70016
-             :genesis-hash
-             "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943")
+             :port 18333 :default-version 70016
+             :genesis-hash "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
+             :genesis-hex *testnet-genesis-hex* :pow-limit-bits #x1d00ffff
+             :no-retarget nil :heights *mainnet-heights*)
    (make-net :name :regtest
              :magic #xDAB5BFFA
-             :port 18444
-             :default-version 70016
-             :genesis-hash
-             "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")))
+             :port 18444 :default-version 70016
+             :genesis-hash "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+             :genesis-hex *regtest-genesis-hex* :pow-limit-bits #x207fffff
+             :no-retarget t :heights *early-heights*)))
 
 (defparameter *network* (first *networks*) "The active network (default mainnet).")
 
