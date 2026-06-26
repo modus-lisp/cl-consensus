@@ -121,7 +121,8 @@
   (unless *utxo* (error "no UTXO set loaded (cannot validate)"))
   (let ((txn (parse-tx-hex hexstring)))
     (handler-case
-        (progn (mp:accept-tx txn *utxo* *mempool* :height (c:tip-height))
+        (progn (mp:accept-tx txn *utxo* *mempool*
+                             :height (1+ (c:tip-height)) :mtp (c:median-time-past (c:tip)))
                (tx:txid-hex txn))
       (mp:rejected (e) (error "~a" (mp:rejected-reason e))))))
 
@@ -133,7 +134,9 @@
        (lambda (hx)
          (let ((txn (parse-tx-hex hx)))
            (handler-case
-               (let ((e (mp:accept-tx txn *utxo* *mempool* :height (c:tip-height) :check-only t)))
+               (let ((e (mp:accept-tx txn *utxo* *mempool*
+                                      :height (1+ (c:tip-height)) :mtp (c:median-time-past (c:tip))
+                                      :check-only t)))
                  (obj "txid" (tx:txid-hex txn) "allowed" t
                       "vsize" (mp:entry-vsize e) "fees" (obj "base" (/ (mp:entry-fee e) 1d8))))
              (mp:rejected (er)
