@@ -29,12 +29,18 @@
   (:export #:run))
 (in-package :fuzz-test)
 
-(defparameter *iters* 3000 "fuzz iterations per parser per strategy")
+;; Iterations per parser default to 3000 (a fast, deterministic regression gate);
+;; override for a deeper soak via FUZZ_ITERS, and FUZZ_SEED for a fresh random run:
+;;   FUZZ_ITERS=200000 FUZZ_SEED=$RANDOM sbcl --load inspect/fuzz-test.lisp --eval '(fuzz-test:run)'
+(defparameter *iters*
+  (let ((e (sb-ext:posix-getenv "FUZZ_ITERS"))) (if e (parse-integer e) 3000)))
+(defparameter *seed*
+  (let ((e (sb-ext:posix-getenv "FUZZ_SEED"))) (if e (parse-integer e) 20260626)))
 (defparameter *ok* t)
 (defun fail (fmt &rest args) (setf *ok* nil) (format t "  *** FAIL: ~a~%" (apply #'format nil fmt args)))
 
 ;;; --- byte helpers (seeded PRNG so a failure is reproducible) -----------------
-(defvar *rng* (sb-ext:seed-random-state 20260626))
+(defvar *rng* (sb-ext:seed-random-state *seed*))
 (defun rnd (n) (random n *rng*))
 (defun rand-bytes (n)
   (let ((v (make-array n :element-type '(unsigned-byte 8))))
@@ -178,7 +184,7 @@
 
 (defun run ()
   (setf *ok* t)
-  (format t "~&== parser fuzzing (~d iters/target, seed 20260626) ==~%" *iters*)
+  (format t "~&== parser fuzzing (~d iters/target, seed ~d) ==~%" *iters* *seed*)
   (dolist (tg *targets*) (fuzz-target (first tg) (second tg) (third tg)))
   (roundtrips)
   (envelope-guard)
