@@ -1,0 +1,23 @@
+name: gates
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  offline-gate-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install SBCL
+        run: sudo apt-get update && sudo apt-get install -y sbcl curl
+      - name: Install Quicklisp + runtime deps
+        run: |
+          curl -sL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/ql.lisp
+          sbcl --non-interactive --load /tmp/ql.lisp \
+            --eval '(quicklisp-quickstart:install)' \
+            --eval '(ql-util:without-prompting (ql:add-to-init-file))' \
+            --eval '(ql:quickload (list :ironclad :usocket :bordeaux-threads :com.inuoe.jzon :hunchentoot))'
+      - name: Offline gate suite (13 gates)
+        run: inspect/run-all.sh
