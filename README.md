@@ -83,21 +83,23 @@ bin/cl-consensus.lisp   run the daemon
 ## Dependencies
 
 Pure SBCL + a few Quicklisp libs (`ironclad`, `usocket`, `bordeaux-threads`,
-`com.inuoe.jzon`, `hunchentoot`) — **plus two sibling repos** that are not yet on
-Quicklisp: [`secp256k1-fast`](../secp256k1-fast) (the crypto) and
-[`pagetree`](../pagetree) (the disk-backed UTXO store). Clone all three side by side
-so ASDF finds them:
-
-```
-parent/
-  cl-consensus/   secp256k1-fast/   pagetree/
-```
-
-Point ASDF at the parent (or symlink the three into `~/quicklisp/local-projects/`):
+`com.inuoe.jzon`, `hunchentoot`) — **plus two companion repos** that are not yet on
+Quicklisp: `secp256k1-fast` (the crypto) and `pagetree` (the disk-backed UTXO store).
+They're vendored as git submodules under `deps/`, so clone recursively:
 
 ```sh
-export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$PWD/..\") :inherit-configuration)"
+git clone --recursive https://github.com/modus-lisp/cl-consensus.git
+# (already cloned?  git submodule update --init)
 ```
+
+Point ASDF at the tree (or symlink the systems into `~/quicklisp/local-projects/`):
+
+```sh
+export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$PWD\") :inherit-configuration)"
+```
+
+`inspect/run-all.sh` sets this up automatically and also works with a side-by-side
+sibling checkout of the two repos.
 
 ## Quick start
 
