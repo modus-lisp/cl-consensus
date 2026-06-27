@@ -22,7 +22,7 @@
 
 (in-package #:btc-sweep)
 
-(defun run (&optional (height 900000) (host "epyc-docker.lan"))
+(defun run (&optional (height 900000) (host "127.0.0.1"))
   (unless (c:tip) (c:load-headers))
   (let ((peer (p:connect-peer host))
         (flags (v:consensus-flags height))

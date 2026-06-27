@@ -1,12 +1,12 @@
 ;;;; shared/bitcoind/inspect/oracle.lisp
 ;;;;
 ;;;; Persistent inspector: cross-check our node's state against the real mainnet
-;;;; bitcoind on epyc-docker.lan via its JSON-RPC (the ground-truth oracle).
+;;;; a local bitcoind via its JSON-RPC (the ground-truth oracle).
 ;;;;
 ;;;;   sbcl --load shared/bitcoind/inspect/oracle.lisp
 ;;;;   (in-package :btc-oracle) (check-headers) (check-tip)
 ;;;;
-;;;; Auth uses the node's cookie at /mnt/lisp/bitcoind/.cookie.
+;;;; Auth uses the node's cookie file (BITCOIN_COOKIE, default ~/.bitcoin/.cookie).
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :asdf)
@@ -23,8 +23,12 @@
 
 (in-package #:btc-oracle)
 
-(defparameter *rpc-url* "http://epyc-docker.lan:8332/")
-(defparameter *cookie-file* "/mnt/lisp/bitcoind/.cookie")
+;; Point these at your own Bitcoin Core node (env overrides for convenience).
+(defparameter *rpc-url*
+  (or (sb-ext:posix-getenv "BITCOIN_RPC_URL") "http://127.0.0.1:8332/"))
+(defparameter *cookie-file*
+  (or (sb-ext:posix-getenv "BITCOIN_COOKIE")
+      (namestring (merge-pathnames ".bitcoin/.cookie" (user-homedir-pathname)))))
 
 (defun cookie-auth ()
   (let ((s (with-open-file (f *cookie-file*)
