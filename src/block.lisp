@@ -69,11 +69,16 @@
   "Parse a full serialized block (header + tx_count + txs)."
   (let* ((r (w:make-reader bytes))
          (header (c:parse-header r))
-         (ntx (w:r-varint r))
-         (txs (make-array ntx)))
-    (dotimes (i ntx)
-      (setf (aref txs i) (tx:parse-tx r)))
-    (%make-block :header header :txs txs)))
+         (ntx (w:r-varint r)))
+    ;; Bound the count before allocating: each tx is >= 1 byte, so a tx-count larger
+    ;; than the bytes remaining is malformed — reject it rather than make-array a
+    ;; gigantic vector from an attacker-controlled varint (DoS).
+    (when (> ntx (w:reader-remaining r))
+      (error "block tx count ~d exceeds ~d remaining bytes" ntx (w:reader-remaining r)))
+    (let ((txs (make-array ntx)))
+      (dotimes (i ntx)
+        (setf (aref txs i) (tx:parse-tx r)))
+      (%make-block :header header :txs txs))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Witness commitment (coinbase) — merkle root over wtxids (coinbase wtxid=0)

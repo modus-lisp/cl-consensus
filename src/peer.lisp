@@ -24,6 +24,8 @@
 
 (defparameter *protocol-version* 70016)
 (defparameter *default-user-agent* "/cl-consensus:0.1/")
+(defparameter +max-message-length+ (* 32 1024 1024)
+  "Reject P2P messages larger than this before allocating the payload (DoS guard).")
 
 (defstruct peer
   host port socket stream
@@ -73,12 +75,17 @@
              (command (string-right-trim '(#\Nul)
                                          (map 'string #'code-char cmd-bytes)))
              (len (w:r-u32 r))
-             (checksum (w:r-bytes r 4))
-             (payload (if (plusp len) (read-fully stream len)
-                          (make-array 0 :element-type '(unsigned-byte 8)))))
-        (unless (equalp checksum (w:checksum payload))
-          (error "bad checksum on ~a message from ~a" command (peer-addr p)))
-        (values command payload)))))
+             (checksum (w:r-bytes r 4)))
+        ;; Cap the payload length before allocating: an attacker-controlled u32 (up to
+        ;; 4 GB) would otherwise make-array a giant buffer (DoS).  Largest legit message
+        ;; is a block (~4 MB); 32 MB leaves generous headroom.
+        (when (> len +max-message-length+)
+          (error "oversized ~a message: ~d bytes from ~a" command len (peer-addr p)))
+        (let ((payload (if (plusp len) (read-fully stream len)
+                           (make-array 0 :element-type '(unsigned-byte 8)))))
+          (unless (equalp checksum (w:checksum payload))
+            (error "bad checksum on ~a message from ~a" command (peer-addr p)))
+          (values command payload))))))
 
 (defun send (p command payload)
   "Frame and send a message.  PAYLOAD is a byte vector (often a writer's bytes)."

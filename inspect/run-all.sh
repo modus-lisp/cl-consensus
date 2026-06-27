@@ -30,6 +30,7 @@ GATES=(
   tx-relay-test         # tx relay (accept + inv + serve + orphans)
   reorg-equiv           # reorg == fresh winning branch
   regtest-test          # real-mined: genesis + mine->send->confirm + reorg
+  fuzz-test             # adversarial fuzzing of the untrusted-input parsers
 )
 
 pass=0; fail=0; failed=()
