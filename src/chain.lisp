@@ -413,16 +413,6 @@
 ;;; order (genesis is reseeded by INIT-CHAIN, so we store heights 1..tip).
 ;;; ----------------------------------------------------------------------------
 
-(defun writable-dir-p (dir)
-  (handler-case
-      (progn (ensure-directories-exist dir)
-             (let ((probe (merge-pathnames ".wtest" dir)))
-               (with-open-file (s probe :direction :output :if-exists :supersede
-                                        :if-does-not-exist :create)
-                 (write-char #\x s))
-               (delete-file probe) t))
-    (serious-condition () nil)))
-
 (defun data-dir ()
   "Data directory for headers.dat etc.: $BITCOIND_DATADIR if set, else
    ~/.cl-consensus/bitcoind/."

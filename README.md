@@ -125,11 +125,19 @@ Make a wallet and an address (REPL):
 Restore it later with
 `(cl-consensus.bip39:make-wallet-from-mnemonic "<phrase>" :type :p2wpkh)`.
 
-Run the daemon (JSON-RPC on :8432, control socket on :4008):
+Run the node — `serve-node`: validate each block to the tip while serving +
+relaying, with JSON-RPC on :8432 and a control socket on :4008. It syncs from a
+peer (a local `bitcoind` on 127.0.0.1 by default; set `CL_CONSENSUS_PEER`) and
+keeps its chainstate under `~/.cl-consensus/`. A mainnet UTXO is large, so give it
+a big heap:
 
 ```sh
-sbcl --load bin/cl-consensus.lisp
+CL_CONSENSUS_PEER=127.0.0.1 sbcl --dynamic-space-size 81920 --load bin/cl-consensus.lisp
 ```
+
+(Pure-Lisp validation makes a from-scratch IBD slow; point it at a peer you trust
+and let it follow the tip. For an RPC server over a static chainstate without full
+validation, call `cl-consensus.node:start` instead.)
 
 Differential regression against Bitcoin Core (after any change to the interpreter):
 

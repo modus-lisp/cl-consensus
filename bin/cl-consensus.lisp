@@ -1,31 +1,31 @@
-;;;; bin/cl-consensus.lisp — run the node daemon.
+;;;; bin/cl-consensus.lisp — run the node.
 ;;;;
-;;;;   sbcl --load bin/cl-consensus.lisp
+;;;; This is THE node: a single-writer daemon that validates each block to the tip
+;;;; (reorg-aware) while serving headers/blocks + relaying to inbound peers, with a
+;;;; bitcoind-compatible JSON-RPC API (:8432) + a control socket (:4008).
 ;;;;
-;;;; Loads the cl-consensus system, attaches a UTXO chainstate checkpoint if one
-;;;; exists, and starts the JSON-RPC server (:8432) + control socket (:4008).
+;;;;   sbcl --dynamic-space-size 81920 --load bin/cl-consensus.lisp
+;;;;
+;;;; It needs a peer to sync from (a local bitcoind on 127.0.0.1 by default — set
+;;;; CL_CONSENSUS_PEER to point elsewhere) and writes its chainstate under
+;;;; ~/.cl-consensus/ (set BITCOIND_DATADIR for headers; pass paths to serve-node for
+;;;; the rest).  A mainnet UTXO is large, so run with a big --dynamic-space-size.
+;;;;
+;;;; (For an RPC server over a static chainstate without full validation, call
+;;;;  cl-consensus.node:start instead — see src/node.lisp.)
 
 (require :asdf)
 (pushnew (uiop:pathname-parent-directory-pathname
           (uiop:pathname-directory-pathname (or *load-truename* *compile-file-truename*)))
          asdf:*central-registry* :test #'equal)
-(asdf:load-system "cl-consensus")
+(handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-consensus"))
 
 (in-package #:cl-consensus.node)
 
-;; attach a UTXO chainstate checkpoint if one was built
-(let ((cs (cl-consensus.validate:chainstate-path)))
-  (when (probe-file cs)
-    (multiple-value-bind (set height) (cl-consensus.utxo:load-utxo cs)
-      (when set
-        (setf *utxo* set)
-        (format t "~&[cl-consensus] attached UTXO chainstate at height ~d (~d coins)~%"
-                height (cl-consensus.utxo:utxo-count set))))))
-
-(start)
-
-(handler-case
-    (loop (sleep 3600))
-  (#+sbcl sb-sys:interactive-interrupt #-sbcl error ()
-    (stop)
-    (format t "~&[cl-consensus] stopped.~%")))
+(let ((peer (or (sb-ext:posix-getenv "CL_CONSENSUS_PEER") "127.0.0.1")))
+  (format t "~&[cl-consensus] full node starting — syncing from peer ~a~%~
+             [cl-consensus]   (set CL_CONSENSUS_PEER to change; chainstate under ~~/.cl-consensus/)~%"
+          peer)
+  ;; serve-node blocks forever (accept + read + follow loops); Ctrl-C unwinds it,
+  ;; saving the mempool and closing the undo store.
+  (serve-node :peer-host peer))
