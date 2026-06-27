@@ -16,10 +16,12 @@
 (require :sb-posix)
 (let* ((here (or *load-truename* *compile-file-truename*))
        (root (uiop:pathname-parent-directory-pathname (uiop:pathname-directory-pathname here))))
+  ;; Find the deps whether they're siblings (dev) or submodules under deps/ (clone);
+  ;; only push paths that EXIST (truename errors on a missing dir).
   (dolist (p (list root
-                   (merge-pathnames "../secp256k1-fast/" root)
-                   (merge-pathnames "../pagetree/" root)))
-    (pushnew (truename p) asdf:*central-registry* :test #'equal)))
+                   (merge-pathnames "../secp256k1-fast/" root) (merge-pathnames "../pagetree/" root)
+                   (merge-pathnames "deps/secp256k1-fast/" root) (merge-pathnames "deps/pagetree/" root)))
+    (when (probe-file p) (pushnew (truename p) asdf:*central-registry* :test #'equal))))
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-consensus"))
 
 (defpackage :fuzz-test
