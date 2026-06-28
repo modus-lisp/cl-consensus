@@ -22,8 +22,11 @@ cl-consensus is a **clean-room, from-scratch** implementation — differential-t
 to 100% agreement with Bitcoin Core's `script_tests` and exercised against mainnet —
 but it has **NOT been audited or hardened for production**. It is **research /
 educational software**. Do **not** rely on it as your only validator, and do **not**
-use the wallet to custody real funds. The crypto is optimized for speed, not
-constant-time side-channel resistance. No warranty of any kind (see [LICENSE](LICENSE)).
+use the wallet to custody real funds. The crypto's secret operations (key
+generation and ECDSA/Schnorr signing) are constant-time on the x86-64/arm64
+backend — but only at the algorithm + field-arithmetic level; a GC'd runtime
+gives no formal microarchitectural guarantee, and the portable fallback is
+variable-time. No warranty of any kind (see [LICENSE](LICENSE)).
 
 ## Status
 
