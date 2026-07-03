@@ -18,6 +18,7 @@
                     (#:v #:cl-consensus.validate) (#:mp #:cl-consensus.mempool)
                     (#:s #:cl-consensus.serve) (#:r #:cl-consensus.reorg)
                     (#:bs #:cl-consensus.blockstore)
+                    (#:d #:cl-consensus.discovery) (#:am #:cl-consensus.addrman)
                     (#:ht #:hunchentoot)
                     (#:jzon #:com.inuoe.jzon) (#:bt #:bordeaux-threads))
   (:export #:start #:stop #:reload! #:*rpc-port* #:*control-port* #:rpc-call
@@ -255,7 +256,7 @@
     (bt:with-lock-held (s:*relay-lock*)
       (mp:mempool-on-block s:*mempool* (coerce (blk:block-txs block) 'list)))))
 
-(defun %connect-new-blocks (peers utxo undo committed)
+(defun %connect-new-blocks (peer utxo undo committed)
   "Fetch + connect every block from COMMITTED+1 to the header tip into UTXO, recording
    undo, storing the raw bytes, dropping confirmed mempool txs, and announcing each to
    inbound peers.  Returns the new committed height.  Synchronous per block — ample at
@@ -263,7 +264,7 @@
   (let ((target (c:tip-height)))
     (loop for h from (1+ committed) to target do
       (let* ((hdr (c:header-at-height h))
-             (raw (blk:get-block-raw (first peers) (c:header-hash hdr)))
+             (raw (blk:get-block-raw peer (c:header-hash hdr)))
              (b (blk:parse-block raw)))
         (multiple-value-bind (fees undo-rec) (v:connect-block b h utxo)
           (declare (ignore fees))
@@ -275,28 +276,247 @@
         (format t "~&[node] connected + served block ~d~%" h) (force-output)))
     committed))
 
-(defun validating-follow-loop (peers utxo undo start-height &key (poll 30))
+;;; ----------------------------------------------------------------------------
+;;; Peer manager: keep a pool of diverse outbound peers alive alongside the
+;;; primary (local) follow peer — bootstrapped from the primary's getaddr + DNS
+;;; seeds, dialed in parallel (most gossiped addresses are dead).  Gives the node
+;;; peer diversity + a failover source if the primary dies.
+;;; ----------------------------------------------------------------------------
+
+(defvar *extra-peers* '()  "Discovered outbound peers (besides the primary follow peer).")
+(defvar *extra-peers-lock* (bt:make-lock "extra-peers"))
+(defvar *peer-manager-thread* nil)
+
+(defun extra-peers ()
+  "Snapshot of the currently-live discovered peers (prunes dead ones)."
+  (bt:with-lock-held (*extra-peers-lock*)
+    (setf *extra-peers* (remove-if-not #'p:peer-alive-p *extra-peers*))
+    (copy-list *extra-peers*)))
+
+(defun peer-manager-loop (bootstrap &key (target 8) (poll 60))
+  "Maintain TARGET live discovered peers in *EXTRA-PEERS*.  Bootstraps the address
+   pool from BOOTSTRAP's getaddr (once) + DNS seeds, then tops up in parallel each
+   POLL seconds, pruning dead connections.  Best-effort: never signals."
+  (handler-case
+      (progn
+        ;; one-time addrman seeding from the local peer's known addresses
+        (when (and bootstrap (p:peer-alive-p bootstrap))
+          (ignore-errors
+            (p:enable-discovery bootstrap
+              (lambda (hp) (am:addrman-add am:*addrman* (car hp) (cdr hp))))
+            (sleep 3)))
+        (ignore-errors (d:seed-from-dns am:*addrman*))
+        (loop
+          (handler-case
+              (let* ((have (length (extra-peers)))
+                     (need (- target have)))
+                (when (> need 0)
+                  (let ((got (d:connect-n-parallel need :start-height (c:tip-height)
+                                                   :min-height (max 0 (- (c:tip-height) 6)))))
+                    (when got
+                      (bt:with-lock-held (*extra-peers-lock*)
+                        (setf *extra-peers* (append *extra-peers* got)))
+                      (format t "~&[peers] +~d discovered (pool now ~d/~d): ~{~a ~}~%"
+                              (length got) (length (extra-peers)) target
+                              (mapcar #'p:peer-host got)) (force-output)))))
+            (serious-condition (e)
+              (format t "~&[peers] manager tick error: ~a~%" e) (force-output)))
+          (sleep poll)))
+    (serious-condition () nil)))
+
+;;; ----------------------------------------------------------------------------
+;;; Archival backfill: download every historical block into the block store so the
+;;; node can SERVE any block, not just the rolling recent window.  Idempotent and
+;;; resumable — STORE-BLOCK skips blocks already present and gaps are retried over
+;;; multiple passes, so a re-run (or a restart) only fetches what's missing.  Uses
+;;; its OWN dedicated peers: GET-BLOCK-RAW installs one "block" handler per peer, so
+;;; archive fetches must not share the follow loop's / manager's connections.
+;;; ----------------------------------------------------------------------------
+
+(defvar *archive-thread* nil)
+(defvar *archive-stop* nil)
+(defvar *archive-status* (list :running nil :stored 0 :bytes 0 :height 0 :missing 0))
+
+(defun archive-status () (copy-list *archive-status*))
+(defun stop-archive () (setf *archive-stop* t) :stopping)
+
+(defun %missing-heights (from to store)
+  "Ascending list of heights in [FROM,TO] whose block isn't in STORE yet."
+  (let ((out '()))
+    (loop for h from to downto from
+          for hdr = (c:header-at-height h)
+          when (and hdr (not (bs:block-store-has-p store (c:header-hash-hex hdr))))
+            do (push h out))
+    out))
+
+(defun %archive-fetch (peer h store verify)
+  "Fetch block at height H from PEER and store it; return bytes stored, or NIL if
+   already present.  GET-BLOCK-RAW verifies the header hash; VERIFY adds a merkle
+   check that the tx body actually matches that trusted header."
+  (let* ((hdr (c:header-at-height h))
+         (hash (and hdr (c:header-hash hdr))))
+    (when (and hash (not (bs:block-store-has-p store (c:header-hash-hex hdr))))
+      (let ((raw (blk:get-block-raw peer hash :timeout 40 :witness t)))
+        (when (and verify (not (blk:verify-merkle (blk:parse-block raw))))
+          (error "archive: merkle mismatch at height ~d" h))
+        (bs:store-block store raw)
+        (length raw)))))
+
+(defun archive-blocks (&key (from 1) (to (c:tip-height)) (verify t) (peers 16)
+                            (archive-host (or (sb-ext:posix-getenv "SERVE_PEER") "epyc-docker.lan"))
+                            (max-passes 100) (log-every 5000))
+  "Backfill raw blocks [FROM,TO] into the block store, fetching in parallel over PEERS
+   dedicated connections to ARCHIVE-HOST — an archival node that can serve any block.
+   Defaults to the local Core (SERVE_PEER), so history streams off our own full node
+   at LAN speed instead of hammering public volunteers.  Resumable/idempotent: only
+   missing blocks are fetched, gaps are retried across passes, and a height skipped on
+   a peer error is picked up next pass.  Honors (STOP-ARCHIVE)."
+  (let ((store s:*block-store*) (t0 (get-internal-real-time))
+        (stored 0) (bytes 0))
+    (unless store (error "archive: no block store open"))
+    (setf *archive-stop* nil
+          *archive-status* (list :running t :stored 0 :bytes 0 :height from :missing 0))
+    (flet ((dial () (ignore-errors
+                      (p:connect-peer archive-host :start-height (c:tip-height) :timeout 15))))
+      (unwind-protect
+          (loop for pass from 1 to max-passes
+                for missing = (%missing-heights from to store)
+                while (and missing (not *archive-stop*)) do
+            (setf (getf *archive-status* :missing) (length missing))
+            (format t "~&[archive] pass ~d: ~d blocks to fetch in ~d..~d (from ~a)~%"
+                    pass (length missing) from to archive-host) (force-output)
+            (let ((apeers (remove nil (loop repeat peers collect (dial)))))
+              (unless apeers
+                (format t "~&[archive] cannot reach ~a; stopping (resume when it's back)~%"
+                        archive-host) (force-output)
+                (return))
+              (unwind-protect
+                  (let* ((vec (coerce missing 'vector)) (n (length vec))
+                         (idx 0) (lock (bt:make-lock)))
+                    (labels ((next-i ()
+                               (bt:with-lock-held (lock)
+                                 (if (or *archive-stop* (>= idx n)) nil (prog1 idx (incf idx))))))
+                      (let ((threads
+                              (mapcar
+                               (lambda (peer0)
+                                 (bt:make-thread
+                                  (lambda ()
+                                    (let ((peer peer0))
+                                      (loop for i = (next-i) while i
+                                            for h = (aref vec i) do
+                                        (handler-case
+                                            (let ((b (%archive-fetch peer h store verify)))
+                                              (when b
+                                                (bt:with-lock-held (lock)
+                                                  (incf stored) (incf bytes b)
+                                                  (setf (getf *archive-status* :stored) stored
+                                                        (getf *archive-status* :bytes) bytes
+                                                        (getf *archive-status* :height) h)
+                                                  (when (zerop (mod stored log-every))
+                                                    (let ((s (max 1d0 (/ (- (get-internal-real-time) t0)
+                                                                         internal-time-units-per-second))))
+                                                      (format t "~&[archive] ~d blocks, ~,2f GB, ~,1f blk/s, last h~d~%"
+                                                              stored (/ bytes 1d9) (/ stored s) h)
+                                                      (force-output))))))
+                                          (serious-condition ()
+                                            ;; peer stalled/died: redial; skipped height
+                                            ;; is refetched next pass.
+                                            (unless (p:peer-alive-p peer)
+                                              (setf peer (or (dial) peer))))))))
+                                  :name "btc-archive"))
+                               apeers)))
+                        (dolist (th threads) (ignore-errors (bt:join-thread th))))))
+                (dolist (pr apeers) (ignore-errors (p:disconnect pr)))))))
+      (setf (getf *archive-status* :running) nil))
+    (format t "~&[archive] finished this run: ~d blocks (~,2f GB); ~d still missing~%"
+            stored (/ bytes 1d9) (length (%missing-heights from to store))) (force-output)
+    stored))
+
+(defun start-archive (&rest args)
+  "Start ARCHIVE-BLOCKS in a background thread (ARGS pass through).  Returns
+   :ALREADY-RUNNING if an archive is already in progress."
+  (when (and *archive-thread* (bt:thread-alive-p *archive-thread*))
+    (return-from start-archive :already-running))
+  (setf *archive-thread*
+        (bt:make-thread (lambda () (ignore-errors (apply #'archive-blocks args)))
+                        :name "btc-archive-driver"))
+  :started)
+
+(defun %reconnect-peer (old peer-host)
+  "Drop OLD (if any) and dial a fresh follow connection to PEER-HOST at the current
+   tip.  Returns the new peer, or NIL if the redial failed (the caller keeps the old
+   handle and retries next tick)."
+  (when old (ignore-errors (p:disconnect old)))
+  (handler-case
+      (let ((np (p:connect-peer peer-host :start-height (c:tip-height))))
+        (format t "~&[node] reconnected peer ~a (height ~a)~%"
+                (p:peer-addr np) (p:peer-height np)) (force-output)
+        np)
+    (serious-condition (e)
+      (format t "~&[node] peer redial to ~a failed: ~a~%" peer-host e) (force-output)
+      nil)))
+
+(defun %ensure-peers (peers peer-host)
+  "Replace any peer whose read loop has died with a fresh dial to PEER-HOST.  A failed
+   redial keeps the old (dead) entry so the next tick retries."
+  (if peer-host
+      (loop for p in peers
+            collect (if (p:peer-alive-p p) p (or (%reconnect-peer p peer-host) p)))
+      peers))
+
+(defun validating-follow-loop (peers utxo undo start-height &key (poll 30) peer-host
+                                                                 (stall-ticks 2))
   "Long-lived: keep the UTXO at the header tip (reorg-aware), serving + relaying as we
-   go.  This thread is the SINGLE writer of the UTXO store."
-  (let ((committed start-height))
+   go.  This thread is the SINGLE writer of the UTXO store.  Self-heals a wedged
+   upstream: header sync is time-bounded, dead connections are redialled, and a peer
+   that goes silent (TCP-alive but not advancing the tip) is dropped after STALL-TICKS
+   idle ticks.  If the primary follow peer(s) all die it FAILS OVER to a discovered
+   peer from the manager pool — so the node can't freeze behind one bad connection."
+  (let ((committed start-height)
+        (peers (copy-list peers))
+        (stalls 0))
     (loop
       (handler-case
           (progn
-            (handler-case (c:sync-headers (first peers) :max-batches 50) (serious-condition () nil))
-            (setf u:*utxo-flush-method* :incremental)
-            ;; reorg: roll the UTXO onto the heaviest branch before extending it
-            (multiple-value-bind (h2 reorged depth)
-                (r:activate-best-chain utxo committed undo
-                                       (lambda (hdr) (blk:get-block (first peers) (c:header-hash hdr))))
-              (when reorged
-                (format t "~&[node] *** REORG depth ~d: ~d -> ~d ***~%" depth committed h2) (force-output)
-                (u:flush-utxo utxo h2) (c:save-headers) (r:undo-commit undo)
-                (setf committed h2)))
-            ;; extend forward
-            (when (> (c:tip-height) committed)
-              (setf committed (%connect-new-blocks peers utxo undo committed))
-              (u:flush-utxo utxo committed) (c:save-headers) (r:undo-commit undo)
-              (when (> committed 288) (r:undo-prune undo (- committed 288)))))
+            ;; drop-and-redial any primary peer whose read loop has already died
+            (setf peers (%ensure-peers peers peer-host))
+            ;; pick the follow peer for this tick: a live primary if any, else a
+            ;; discovered pool peer (failover when the local upstream is down).
+            (let ((fp (or (find-if #'p:peer-alive-p peers) (first (extra-peers)))))
+              (unless fp                       ; nothing live anywhere — force a redial
+                (setf peers (%ensure-peers peers peer-host)
+                      fp (find-if #'p:peer-alive-p peers)))
+              (when fp
+                ;; headers-first, but time-bounded so a silent peer can't hang the loop
+                (multiple-value-bind (added timed-out)
+                    (handler-case (c:sync-headers fp :max-batches 50)
+                      (serious-condition (e)
+                        (format t "~&[node] header sync error: ~a~%" e) (force-output)
+                        (values 0 t)))
+                  (declare (ignore added))
+                  ;; a peer that keeps timing out is wedged (TCP-alive, not replying):
+                  ;; drop it after STALL-TICKS idle ticks so the next tick fails over.
+                  (if timed-out
+                      (when (>= (incf stalls) stall-ticks)
+                        (format t "~&[node] follow peer ~a stalled at tip ~d — dropping~%"
+                                (p:peer-addr fp) (c:tip-height)) (force-output)
+                        (ignore-errors (p:disconnect fp))
+                        (setf peers (%ensure-peers peers peer-host) stalls 0))
+                      (setf stalls 0)))
+                (setf u:*utxo-flush-method* :incremental)
+                ;; reorg: roll the UTXO onto the heaviest branch before extending it
+                (multiple-value-bind (h2 reorged depth)
+                    (r:activate-best-chain utxo committed undo
+                                           (lambda (hdr) (blk:get-block fp (c:header-hash hdr))))
+                  (when reorged
+                    (format t "~&[node] *** REORG depth ~d: ~d -> ~d ***~%" depth committed h2) (force-output)
+                    (u:flush-utxo utxo h2) (c:save-headers) (r:undo-commit undo)
+                    (setf committed h2)))
+                ;; extend forward
+                (when (> (c:tip-height) committed)
+                  (setf committed (%connect-new-blocks fp utxo undo committed))
+                  (u:flush-utxo utxo committed) (c:save-headers) (r:undo-commit undo)
+                  (when (> committed 288) (r:undo-prune undo (- committed 288)))))))
         (r:deep-reorg-halt (e)
           (format t "~&[node] HALT (deep reorg): ~a~%" e) (force-output) (return))
         (r:reorg-error (e)
@@ -314,7 +534,8 @@
                                                                   (user-homedir-pathname))))
                         (peer-host "127.0.0.1") (conns 2) (cache-gb 24)
                         (listen-port (w:net-port w:*network*)) (rpc-port *rpc-port*)
-                        (max-peers 64) (poll 30)
+                        (max-peers 64) (poll 30) (discover 8)
+                        (archive nil) (archive-peers 16)
                         (mempool-path (namestring (merge-pathnames ".cl-consensus/mempool.dat"
                                                                    (user-homedir-pathname)))))
   "THE consolidated node: own the pagetree UTXO (single writer), validate new blocks to
@@ -351,9 +572,20 @@
       (unless *control-thread*
         (setf *control-thread* (bt:make-thread #'control-loop :name "btc-node control")))
       (s:start-listener :port listen-port :max-peers max-peers)
-      (format t "~&[node] serve-node up: RPC :~d control :~d P2P :~d  follow ~a  tip ~d~%"
-              rpc-port *control-port* listen-port peer-host (c:tip-height)) (force-output)
-      (unwind-protect (validating-follow-loop peers utxo undo height :poll poll)
+      ;; keep a pool of diverse outbound peers alive alongside the primary follow
+      ;; peer (peer diversity + failover); bootstraps from the primary's getaddr.
+      (when (and (plusp discover) (first peers))
+        (setf *peer-manager-thread*
+              (bt:make-thread (lambda () (peer-manager-loop (first peers) :target discover))
+                              :name "btc-peer-manager")))
+      ;; archival backfill of all historical blocks (resumable — skips what's stored)
+      (when archive
+        (format t "~&[node] starting archival backfill (~d peers, verify)~%" archive-peers) (force-output)
+        (start-archive :from 1 :to (c:tip-height) :peers archive-peers :verify t))
+      (format t "~&[node] serve-node up: RPC :~d control :~d P2P :~d  follow ~a  discover ~d  archive ~a  tip ~d~%"
+              rpc-port *control-port* listen-port peer-host discover archive (c:tip-height)) (force-output)
+      (unwind-protect (validating-follow-loop peers utxo undo height :poll poll
+                                                                     :peer-host peer-host)
         (when *mempool-path* (ignore-errors (mp:save-mempool *mempool* *mempool-path*)))
         (r:close-pt-undo-store undo)))))
 
