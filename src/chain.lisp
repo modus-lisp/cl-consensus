@@ -366,13 +366,19 @@
 ;;; ----------------------------------------------------------------------------
 
 (defun sync-headers (peer &key (max-batches most-positive-fixnum)
-                               (progress-every 20000) (validate t))
+                               (progress-every 20000) (validate t)
+                               (stall-timeout 60))
   "Drive headers-first sync from PEER until caught up (a batch < 2000) or
-   MAX-BATCHES is hit.  Returns the number of headers added."
+   MAX-BATCHES is hit.  The wait is bounded per batch: if no headers message
+   arrives within STALL-TIMEOUT seconds the peer is treated as wedged instead of
+   hanging the caller forever (a silent peer whose TCP socket never closed used to
+   block here indefinitely).  Returns (VALUES headers-added timed-out); TIMED-OUT
+   is true when we gave up on a silent peer before reaching the tip."
   (unless *tip* (init-chain))
   (let ((added 0)
         (done (bt:make-semaphore))
         (batches 0)
+        (finished nil)
         (last-error nil))
     (p:on peer "headers"
           (lambda (pr payload)
@@ -386,7 +392,7 @@
                         ;; locator overlap) is fine to skip; a PoW/difficulty
                         ;; failure is a real problem.
                         (unless (search "unknown parent" (rejected-reason c))
-                          (setf last-error c)
+                          (setf last-error c finished t)
                           (bt:signal-semaphore done)
                           (return)))))
                   (when (and (> added 0) (zerop (mod added progress-every)))
@@ -396,17 +402,24 @@
                   (incf batches)
                   (cond
                     ((or (< (length headers) 2000) (>= batches max-batches))
-                     (bt:signal-semaphore done))
+                     (setf finished t))
                     (t (p:send pr "getheaders"
-                               (build-getheaders-payload (build-locator))))))
+                               (build-getheaders-payload (build-locator)))))
+                  ;; wake the waiter on every batch so it's a per-batch stall — not
+                  ;; just total elapsed time — that bounds the wait.
+                  (bt:signal-semaphore done))
               (serious-condition (c)
-                (setf last-error c)
+                (setf last-error c finished t)
                 (bt:signal-semaphore done)))))
     ;; kick it off
     (p:send peer "getheaders" (build-getheaders-payload (build-locator)))
-    (bt:wait-on-semaphore done)
-    (when last-error (error last-error))
-    added))
+    ;; wait one batch at a time; a missed batch within STALL-TIMEOUT means the peer
+    ;; went silent — give up (timed-out) rather than hang the follow loop forever.
+    (loop
+      (let ((woke (bt:wait-on-semaphore done :timeout stall-timeout)))
+        (when last-error (error last-error))
+        (when (or finished (not woke))
+          (return (values added (and (not woke) (not finished)))))))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Persistence — the active chain as a flat file of 80-byte headers in height
