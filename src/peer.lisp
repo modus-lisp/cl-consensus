@@ -16,7 +16,7 @@
   (:export
    #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
    #:peer-services #:peer-alive-p #:peer-connected-at #:peer-prefers-headers
-   #:connect-peer #:accept-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
+   #:connect-peer #:start-read-loop #:run-read-loop #:accept-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
    #:*default-user-agent* #:*protocol-version*))
 
@@ -193,11 +193,36 @@
 ;;; connect + handshake
 ;;; ----------------------------------------------------------------------------
 
+(defun start-read-loop (p)
+  "Clear the connect-time input timeout and spawn P's async read loop; return P.
+   Call this from a LONG-LIVED thread: in SBCL a read loop spawned inside an
+   ephemeral worker thread dies when that worker exits, so a parallel dialer must
+   dial with :DEFER-LOOP and hand the peers here from its (long-lived) collector."
+  ;; usocket set an INPUT timeout on the stream (from the connect :timeout); clear it
+  ;; so the steady-state read loop blocks indefinitely for the next message instead of
+  ;; dying on an idle gap (e.g. while IBD is backpressured).
+  #+sbcl (ignore-errors (setf (sb-impl::fd-stream-timeout (peer-stream p)) nil))
+  (setf (peer-thread p)
+        (bt:make-thread (lambda () (read-loop p))
+                        :name (format nil "btc-peer ~a" (peer-addr p))))
+  p)
+
+(defun run-read-loop (p)
+  "Clear the input timeout and run P's read loop IN THE CURRENT THREAD (blocks until
+   the peer closes).  Parallel dialers use this so the dialing thread BECOMES the
+   peer's long-lived owner: a socket opened in a thread that then exits is torn down
+   with it, so the connecting thread must live as long as the connection."
+  #+sbcl (ignore-errors (setf (sb-impl::fd-stream-timeout (peer-stream p)) nil))
+  (setf (peer-thread p) (bt:current-thread))
+  (read-loop p))
+
 (defun connect-peer (host &key (port (w:net-port w:*network*))
                                (start-height 0) (verbose nil)
-                               (timeout 15))
+                               (timeout 15) (defer-loop nil))
   "Open a TCP connection to HOST:PORT and complete the version/verack handshake.
-   Returns a live PEER with its read loop running, or signals on failure."
+   Returns a live PEER with its read loop running, or signals on failure.  With
+   :DEFER-LOOP the handshake completes but the async read loop is NOT started — the
+   caller must call START-READ-LOOP from a long-lived thread (see its docstring)."
   (let* ((sock (usocket:socket-connect host port
                                         :element-type '(unsigned-byte 8)
                                         :timeout timeout))
@@ -224,15 +249,8 @@
             ((string= command "wtxidrelay") nil)
             ((string= command "sendaddrv2") nil)
             (t nil)))))
-    ;; --- go async ---
-    ;; usocket set a 15s INPUT timeout on the stream (from the connect :timeout);
-    ;; clear it so the steady-state read loop blocks indefinitely for the next
-    ;; message instead of dying on an idle gap (e.g. while IBD is backpressured).
-    #+sbcl (ignore-errors (setf (sb-impl::fd-stream-timeout (peer-stream p)) nil))
-    (setf (peer-thread p)
-          (bt:make-thread (lambda () (read-loop p))
-                          :name (format nil "btc-peer ~a" (peer-addr p))))
-    p))
+    ;; --- go async (unless the caller defers the loop to its own thread) ---
+    (if defer-loop p (start-read-loop p))))
 
 (defun %inbound-addr (socket)
   "Best-effort dotted IP of an accepted SOCKET's remote end (for logging)."
