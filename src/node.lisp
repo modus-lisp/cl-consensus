@@ -889,12 +889,40 @@
 ;;; Control socket (hot reload), start/stop
 ;;; ----------------------------------------------------------------------------
 
+(defun %cl-consensus-source-files ()
+  "The cl-consensus system's OWN .lisp source components, in load order."
+  (labels ((walk (c)
+             (cond ((typep c 'asdf:cl-source-file) (list c))
+                   ((typep c 'asdf:module) (mapcan #'walk (asdf:component-children c)))
+                   (t nil))))
+    (walk (asdf:find-system "cl-consensus"))))
+
+(defun %fasl-for (src)
+  "Output-translated fasl path (in the ASDF cache) for source file SRC."
+  (asdf:apply-output-translations (compile-file-pathname src)))
+
 (defun reload! ()
-  "Hot-reload the system (ASDF recompiles only changed files) and re-register
-   RPC methods.  `echo '(reload!)' | nc 127.0.0.1 4008`."
-  (asdf:load-system "cl-consensus")
-  (register-methods)
-  :reloaded)
+  "Hot-reload ONLY cl-consensus's own changed source files (recompile source-newer-
+   than-fasl, then load) and re-register RPC methods.  Deliberately does NOT go through
+   ASDF:LOAD-SYSTEM: that reloads the whole dependency graph, and some deps (notably
+   secp256k1-fast) define SBCL VOPs that CANNOT be reloaded into a live image — doing
+   so aborts mid-load and corrupts the crypto.  Scoping to our own files makes this
+   safe for fast in-process iteration.  `echo '(reload!)' | nc 127.0.0.1 4008`."
+  ;; pick up .asd component changes (e.g. a new file) without touching loaded code
+  (ignore-errors
+    (asdf:load-asd (asdf:system-source-file (asdf:find-system "cl-consensus"))))
+  (let ((reloaded '()))
+    (dolist (c (%cl-consensus-source-files))
+      (let* ((src (asdf:component-pathname c)) (fasl (%fasl-for src)))
+        (when (or (not (probe-file fasl))
+                  (> (file-write-date src) (file-write-date fasl)))
+          (handler-bind ((warning #'muffle-warning))
+            (ensure-directories-exist fasl)
+            (compile-file src :output-file fasl)
+            (load fasl))
+          (push (pathname-name src) reloaded))))
+    (register-methods)
+    (list :reloaded (nreverse reloaded))))
 
 (defun control-loop ()
   "Bare-TCP control socket (repo convention): read forms, eval in this package,
