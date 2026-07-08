@@ -7,21 +7,31 @@
 ;;;;
 ;;;; Append-only means a reader (the serving daemon) can stream out a block while a
 ;;;; writer is appending the next one — the bytes a reader sees never move or change.
-;;;; The hash->(offset,len) index lives in RAM, rebuilt by scanning the file at open
-;;;; (cheap: read the 4-byte len + 80-byte header per record, hash the header, skip
-;;;; the body).  A torn tail record (partial append after a crash) is detected during
-;;;; the scan and the file is truncated back to the last whole record.
+;;;; The hash->(offset,len) index lives in RAM.
+;;;;
+;;;; INDEX PERSISTENCE.  Rebuilding the index by scanning the whole file at open is
+;;;; O(blocks) random reads — fine at a few GB, ~40 min once the archive is ~800 GB.
+;;;; So the index is mirrored to a sidecar `blocks.dat.idx` of fixed 44-byte records
+;;;;   [block hash: 32][body-offset: u64 LE][len: u32 LE]
+;;;; written as each block is stored.  At open we load the sidecar (a fast sequential
+;;;; read) and then scan blocks.dat only from where the sidecar leaves off.
+;;;;
+;;;; Crash-safety: the block is written to blocks.dat (and fsynced) BEFORE its sidecar
+;;;; entry, so the sidecar can only ever LAG blocks.dat — a crash in between leaves an
+;;;; un-indexed tail that open re-scans (and re-appends to the sidecar).  A torn tail
+;;;; in either file (partial trailing record) is detected and dropped.  If the sidecar
+;;;; is missing or inconsistent (covers more than blocks.dat holds), open falls back to
+;;;; a full scan and rewrites it.
 ;;;;
 ;;;; Pure ANSI-CL stream I/O — no FFI, no mmap.
 
 (defpackage #:cl-consensus.blockstore
   (:use #:cl)
-  (:nicknames #:btc-blockstore)
   (:local-nicknames (#:w #:cl-consensus.wire) (#:bt #:bordeaux-threads))
   (:export
    #:block-store #:open-block-store #:close-block-store
    #:store-block #:get-block-bytes #:block-store-has-p
-   #:block-store-count #:block-store-path))
+   #:block-store-count #:block-store-path #:rebuild-index))
 
 (in-package #:cl-consensus.blockstore)
 
@@ -30,19 +40,23 @@
   stream                                ; open :io binary stream
   (index (make-hash-table :test 'equal)) ; hash-hex -> (cons body-offset len)
   (end 0)                               ; file length in bytes (next append offset)
+  idx-path                              ; pathname of the sidecar index (blocks.dat.idx)
+  idx-stream                            ; open :io binary stream for the sidecar
   (lock (bt:make-lock "block-store")))
 
-;;; --- little-endian u32 helpers on a byte stream ----------------------------
+(defconstant +idx-record-len+ 44)       ; 32 (hash) + 8 (offset u64) + 4 (len u32)
+
+;;; --- little-endian integer helpers -----------------------------------------
 
 (defun %read-u32-le (stream)
-  "Read 4 bytes LE from STREAM, or NIL at clean EOF."
+  "Read 4 bytes LE from STREAM, or NIL at clean EOF, or :TORN on a partial field."
   (let ((b0 (read-byte stream nil :eof)))
     (when (eq b0 :eof) (return-from %read-u32-le nil))
     (let ((b1 (read-byte stream nil :eof))
           (b2 (read-byte stream nil :eof))
           (b3 (read-byte stream nil :eof)))
       (when (or (eq b1 :eof) (eq b2 :eof) (eq b3 :eof))
-        (return-from %read-u32-le :torn))   ; partial length field
+        (return-from %read-u32-le :torn))
       (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))))
 
 (defun %write-u32-le (stream n)
@@ -51,36 +65,84 @@
   (write-byte (logand (ash n -16) #xff) stream)
   (write-byte (logand (ash n -24) #xff) stream))
 
-;;; --- index scan -------------------------------------------------------------
+(defun %u32-le (buf off)
+  (logior (aref buf off) (ash (aref buf (+ off 1)) 8)
+          (ash (aref buf (+ off 2)) 16) (ash (aref buf (+ off 3)) 24)))
 
-(defun %scan-index (store)
-  "Rebuild the in-RAM index by walking the file from the start.  Each record is a
-   u32 LE length followed by that many raw block bytes; we read just the 80-byte
-   header to derive the block hash, then skip the body.  A torn tail (short read)
-   truncates the file back to the last whole record."
+(defun %u64-le (buf off)
+  (let ((n 0)) (dotimes (i 8 n) (setf n (logior n (ash (aref buf (+ off i)) (* 8 i)))))))
+
+;;; --- sidecar index ----------------------------------------------------------
+
+(defun %append-idx-entry (store hash-bytes body-offset len)
+  "Append one 44-byte sidecar record (at the idx stream's current — end — position)."
+  (let ((s (block-store-idx-stream store))
+        (rec (make-array +idx-record-len+ :element-type '(unsigned-byte 8))))
+    (replace rec hash-bytes :end1 32)
+    (dotimes (i 8) (setf (aref rec (+ 32 i)) (logand (ash body-offset (* -8 i)) #xff)))
+    (dotimes (i 4) (setf (aref rec (+ 40 i)) (logand (ash len (* -8 i)) #xff)))
+    (write-sequence rec s)
+    (finish-output s)))
+
+(defun %reset-sidecar (store)
+  "Empty the sidecar and seek to its start (for a full rebuild)."
+  (let ((s (block-store-idx-stream store)))
+    (finish-output s)
+    (ignore-errors (sb-posix:ftruncate (sb-sys:fd-stream-fd s) 0))
+    (file-position s 0)))
+
+(defun %load-sidecar (store)
+  "Populate the RAM index from whole sidecar records; return the covered-end offset
+   in blocks.dat (max body-offset+len), or NIL if the sidecar is empty/absent.  A
+   torn trailing record is dropped and the sidecar truncated to the last whole one."
+  (let ((s (block-store-idx-stream store))
+        (index (block-store-index store))
+        (covered 0) (n 0)
+        (rec (make-array +idx-record-len+ :element-type '(unsigned-byte 8))))
+    (file-position s 0)
+    (loop
+      (let ((got (read-sequence rec s)))
+        (when (< got +idx-record-len+) (return))    ; EOF or torn trailing record
+        (let ((off (%u64-le rec 32)) (len (%u32-le rec 40)))
+          (setf (gethash (w:hash->hex (subseq rec 0 32)) index) (cons off len))
+          (setf covered (max covered (+ off len)))
+          (incf n))))
+    ;; drop any torn trailing partial record and position for appends at the end
+    (let ((good (* n +idx-record-len+)))
+      (finish-output s)
+      (when (> (file-length s) good)
+        (ignore-errors (sb-posix:ftruncate (sb-sys:fd-stream-fd s) good)))
+      (file-position s good))
+    (when (plusp n) covered)))
+
+;;; --- block index scan -------------------------------------------------------
+
+(defun %scan-blocks (store start write-idx)
+  "Index blocks.dat records from byte offset START to EOF: fill the RAM index,
+   optionally append each new record to the sidecar (WRITE-IDX), truncate a torn
+   tail, and set the store's END (next append offset).  Returns STORE."
   (let ((s (block-store-stream store))
         (index (block-store-index store))
-        (good-end 0))
-    (clrhash index)
-    (file-position s 0)
+        (good-end start))
+    (file-position s start)
     (loop
       (let* ((rec-start (file-position s))
              (len (%read-u32-le s)))
         (cond
           ((null len) (return))                 ; clean EOF
-          ((eq len :torn) (return))             ; partial length -> stop
+          ((eq len :torn) (return))             ; partial length field
           ((< len 80) (return))                 ; impossible: header alone is 80
           (t
            (let ((hdr (make-array 80 :element-type '(unsigned-byte 8))))
              (let ((got (read-sequence hdr s)))
-               (when (< got 80) (return))       ; torn header -> stop
+               (when (< got 80) (return))       ; torn header
                (let ((body-offset (+ rec-start 4))
                      (next (+ rec-start 4 len)))
-                 ;; ensure the whole body is present before accepting the record
                  (file-position s next)
-                 (when (< (file-position s) next) (return)) ; couldn't seek past -> torn
-                 (let ((hx (w:hash->hex (w:hash256 hdr))))
-                   (setf (gethash hx index) (cons body-offset len)))
+                 (when (< (file-position s) next) (return)) ; body not fully present
+                 (let ((hash (w:hash256 hdr)))
+                   (setf (gethash (w:hash->hex hash) index) (cons body-offset len))
+                   (when write-idx (%append-idx-entry store hash body-offset len)))
                  (setf good-end next))))))))
     ;; truncate any torn tail so a future scan can't mis-parse leftover bytes
     (let ((real (file-length s)))
@@ -91,22 +153,53 @@
     (file-position s good-end)
     store))
 
+;;; --- open / close -----------------------------------------------------------
+
 (defun open-block-store (path)
-  "Open (creating if needed) the append-only block store at PATH and rebuild its
-   index.  Returns a BLOCK-STORE."
-  (let ((s (open path :direction :io
-                      :element-type '(unsigned-byte 8)
-                      :if-exists :overwrite
-                      :if-does-not-exist :create)))
-    (let ((store (%make-block-store :path (pathname path) :stream s)))
-      (%scan-index store)
-      store)))
+  "Open (creating if needed) the append-only block store at PATH and build its index,
+   loading the persisted sidecar when present and scanning only the un-indexed tail.
+   Returns a BLOCK-STORE."
+  (let* ((s (open path :direction :io
+                       :element-type '(unsigned-byte 8)
+                       :if-exists :overwrite
+                       :if-does-not-exist :create))
+         (ipath (concatenate 'string (namestring (truename path)) ".idx"))
+         (is (open ipath :direction :io
+                         :element-type '(unsigned-byte 8)
+                         :if-exists :overwrite
+                         :if-does-not-exist :create))
+         (store (%make-block-store :path (pathname path) :stream s
+                                   :idx-path (pathname ipath) :idx-stream is)))
+    (let ((covered (%load-sidecar store))
+          (blen (file-length s)))
+      (cond
+        ((and covered (<= covered blen))
+         ;; sidecar valid — index only the tail blocks.dat grew past it (usually none)
+         (%scan-blocks store covered t))
+        (t
+         ;; missing or inconsistent (covers more than blocks.dat holds) — full rebuild
+         (clrhash (block-store-index store))
+         (%reset-sidecar store)
+         (%scan-blocks store 0 t))))
+    store))
 
 (defun close-block-store (store)
   (bt:with-lock-held ((block-store-lock store))
     (ignore-errors (finish-output (block-store-stream store)))
+    (ignore-errors (finish-output (block-store-idx-stream store)))
     (ignore-errors (close (block-store-stream store)))
-    (setf (block-store-stream store) nil)))
+    (ignore-errors (close (block-store-idx-stream store)))
+    (setf (block-store-stream store) nil
+          (block-store-idx-stream store) nil)))
+
+(defun rebuild-index (store)
+  "Force a full rescan of blocks.dat and rewrite the sidecar from scratch.  For
+   recovering from a suspected-bad sidecar without deleting files by hand."
+  (bt:with-lock-held ((block-store-lock store))
+    (clrhash (block-store-index store))
+    (%reset-sidecar store)
+    (%scan-blocks store 0 t)
+    (block-store-count store)))
 
 ;;; --- write / read -----------------------------------------------------------
 
@@ -117,19 +210,22 @@
   (declare (type (simple-array (unsigned-byte 8) (*)) raw))
   (when (< (length raw) 80)
     (error "store-block: raw block too short (~d bytes)" (length raw)))
-  (let ((hx (w:hash->hex (w:hash256 (subseq raw 0 80)))))
+  (let* ((hash (w:hash256 (subseq raw 0 80)))
+         (hx (w:hash->hex hash)))
     (bt:with-lock-held ((block-store-lock store))
       (when (gethash hx (block-store-index store))
         (return-from store-block nil))
       (let* ((s (block-store-stream store))
              (rec-start (block-store-end store))
-             (len (length raw)))
+             (len (length raw))
+             (body-offset (+ rec-start 4)))
         (file-position s rec-start)
         (%write-u32-le s len)
         (write-sequence raw s)
-        (finish-output s)
-        (setf (gethash hx (block-store-index store)) (cons (+ rec-start 4) len))
+        (finish-output s)                       ; block durable BEFORE its index entry
+        (setf (gethash hx (block-store-index store)) (cons body-offset len))
         (setf (block-store-end store) (+ rec-start 4 len))
+        (%append-idx-entry store hash body-offset len)
         hx))))
 
 (defun get-block-bytes (store hash-hex)
