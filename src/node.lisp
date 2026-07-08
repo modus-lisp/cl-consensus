@@ -18,6 +18,7 @@
                     (#:v #:cl-consensus.validate) (#:mp #:cl-consensus.mempool)
                     (#:s #:cl-consensus.serve) (#:r #:cl-consensus.reorg)
                     (#:bs #:cl-consensus.blockstore)
+                    (#:enc #:cl-consensus.encoding) (#:fee #:cl-consensus.fees)
                     (#:d #:cl-consensus.discovery) (#:am #:cl-consensus.addrman)
                     (#:ht #:hunchentoot)
                     (#:jzon #:com.inuoe.jzon) (#:bt #:bordeaux-threads))
@@ -160,6 +161,290 @@
              "coinbase" (if (u:coin-coinbase-p coin) t nil)
              "height" (u:coin-height coin)))))
 
+;;; ----------------------------------------------------------------------------
+;;; Fee estimation (mempool-based) — see src/fees.lisp
+;;; ----------------------------------------------------------------------------
+
+(defun sat/vb->btc/kvb (sat/vb)
+  "Convert a feerate in sat/vB to Core's BTC per 1000 vBytes."
+  (/ (* sat/vb 1000) 1d8))
+
+(defun m-estimatesmartfee (conf-target &optional estimate-mode &rest _)
+  "Mempool-based smart fee estimate, Core-shaped: {feerate: BTC/kvB, blocks: N}.
+   Falls back to the relay floor (1 sat/vB) with an `errors` note when the current
+   mempool backlog is too thin to imply congestion (e.g. an empty mempool)."
+  (declare (ignore estimate-mode _))
+  (let* ((target (min fee:*max-conf-target* (max 1 (truncate conf-target))))
+         (sat/vb (fee:estimate-feerate *mempool* target)))
+    (if sat/vb
+        (obj "feerate" (sat/vb->btc/kvb sat/vb) "blocks" target)
+        (obj "feerate" (sat/vb->btc/kvb fee:*min-relay-feerate*) "blocks" target
+             "errors" (vector "Insufficient data or no feerate estimate available; using relay floor")))))
+
+(defun m-estimaterawfee (conf-target &optional threshold &rest _)
+  "Lightweight raw estimator: the mempool feerate for CONF-TARGET blocks, reported
+   both in BTC/kvB and sat/vB (NIL feerate when the backlog can't price it)."
+  (declare (ignore threshold _))
+  (let* ((target (min fee:*max-conf-target* (max 1 (truncate conf-target))))
+         (sat/vb (fee:estimate-feerate *mempool* target)))
+    (obj "blocks" target
+         "feerate" (if sat/vb (sat/vb->btc/kvb sat/vb) 'null)
+         "feerate_sat_vb" (if sat/vb sat/vb 'null))))
+
+;;; ----------------------------------------------------------------------------
+;;; Block / transaction decoding for verbose RPC
+;;; ----------------------------------------------------------------------------
+
+(defun varint-size (n)
+  "Wire byte-length of a CompactSize encoding of N."
+  (cond ((< n #xfd) 1) ((<= n #xffff) 3) ((<= n #xffffffff) 5) (t 9)))
+
+(defun vin->json (in witness coinbasep)
+  (let ((o (if coinbasep
+               (obj "coinbase" (w:bytes->hex (tx:txin-script in))
+                    "sequence" (tx:txin-sequence in))
+               (obj "txid" (w:hash->hex (tx:txin-prev-hash in))
+                    "vout" (tx:txin-prev-index in)
+                    "scriptSig" (obj "hex" (w:bytes->hex (tx:txin-script in)))
+                    "sequence" (tx:txin-sequence in)))))
+    (when witness
+      (setf (gethash "txinwitness" o)
+            (map 'vector #'w:bytes->hex witness)))
+    o))
+
+(defun vout->json (out n)
+  (obj "value" (/ (tx:txout-value out) 1d8)
+       "n" n
+       "scriptPubKey" (obj "hex" (w:bytes->hex (tx:txout-script out)))))
+
+(defun tx->json (txn &optional include-hex)
+  "Decode TXN into a Core-shaped object (decoderawtransaction style)."
+  (let* ((cb (tx:tx-coinbase-p txn))
+         (wits (tx:tx-witnesses txn))
+         (o (obj "txid" (tx:txid-hex txn)
+                 "hash" (tx:wtxid-hex txn)
+                 "version" (tx:tx-version txn)
+                 "size" (tx:tx-total-size txn)
+                 "vsize" (tx:tx-vsize txn)
+                 "weight" (tx:tx-weight txn)
+                 "locktime" (tx:tx-locktime txn)
+                 "vin" (coerce (loop for in in (tx:tx-inputs txn) for i from 0
+                                     collect (vin->json in (nth i wits) cb))
+                               'vector)
+                 "vout" (coerce (loop for out in (tx:tx-outputs txn) for n from 0
+                                      collect (vout->json out n))
+                                'vector))))
+    (when include-hex
+      (setf (gethash "hex" o) (w:bytes->hex (tx:serialize-tx txn :witness t))))
+    o))
+
+(defun load-block-from-store (blockhash)
+  "Parse the block for BLOCKHASH (display hex) out of the archived block store.
+   Returns (values block raw-bytes); errors if unavailable."
+  (unless s:*block-store* (error "no block store loaded"))
+  (let ((raw (bs:get-block-bytes s:*block-store* blockhash)))
+    (unless raw (error "Block not found"))
+    (values (blk:parse-block raw) raw)))
+
+(defun block->json (b raw verbosity)
+  ;; Prefer the canonical chain header (carries height/chainwork/nextblockhash);
+  ;; the header parsed off the wire has none of those.
+  (let* ((chain-h (or (c:get-header (blk:block-hash-hex b)) (blk:block-header b)))
+         (txs (blk:block-txs b))
+         (ntx (length txs))
+         (stripped (+ 80 (varint-size ntx)
+                      (reduce #'+ txs :key #'tx:tx-base-size :initial-value 0)))
+         (size (length raw))
+         (o (header->json chain-h)))
+    (setf (gethash "size" o) size
+          (gethash "strippedsize" o) stripped
+          (gethash "weight" o) (+ (* 3 stripped) size)
+          (gethash "nTx" o) ntx
+          (gethash "tx" o)
+          (if (>= verbosity 2)
+              (map 'vector (lambda (txn) (tx->json txn nil)) txs)
+              (map 'vector #'tx:txid-hex txs)))
+    o))
+
+(defun m-getblock (blockhash &optional (verbosity 1) &rest _)
+  "getblock: verbosity 0 = raw hex; 1 = header + tx hashes; 2 = header + decoded txs.
+   Served from the full archived block store."
+  (declare (ignore _))
+  (let ((v (cond ((numberp verbosity) (truncate verbosity))
+                 ((null verbosity) 0)
+                 (t 1))))
+    (multiple-value-bind (b raw) (load-block-from-store blockhash)
+      (if (<= v 0)
+          (w:bytes->hex raw)
+          (block->json b raw v)))))
+
+(defun m-getrawtransaction (txid &optional verbose blockhash &rest _)
+  "With BLOCKHASH, pull the tx out of that block in the store (no txindex needed).
+   Otherwise look in the mempool; error like Core if absent.  VERBOSE (bool or int)
+   selects the decoded-object form over the raw hex."
+  (declare (ignore _))
+  (let ((verb (if (integerp verbose) (plusp verbose) (and verbose t))))
+    (multiple-value-bind (txn where)
+        (if blockhash
+            (let ((b (load-block-from-store blockhash)))
+              (let ((found (find txid (blk:block-txs b)
+                                 :key #'tx:txid-hex :test #'string=)))
+                (unless found (error "No such transaction found in the provided block"))
+                (values found blockhash)))
+            (let ((e (mp:mempool-get *mempool* txid)))
+              (unless e
+                (error "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries."))
+              (values (mp:entry-tx e) nil)))
+      (if verb
+          (let ((o (tx->json txn t)))
+            (when where (setf (gethash "blockhash" o) where))
+            o)
+          (w:bytes->hex (tx:serialize-tx txn :witness t))))))
+
+;;; ----------------------------------------------------------------------------
+;;; Peers / network
+;;; ----------------------------------------------------------------------------
+
+(defun inbound-peers-snapshot ()
+  (bt:with-lock-held (s::*inbound-lock*)
+    (remove-if-not #'p:peer-alive-p (copy-list s:*inbound-peers*))))
+
+(defun peer->json (pr id inbound)
+  (obj "id" id
+       "addr" (p:peer-addr pr)
+       "services" (format nil "~16,'0x" (or (p:peer-services pr) 0))
+       "subver" (or (p:peer-subver pr) "")
+       "version" (or (p:peer-version pr) 0)
+       "startingheight" (or (p:peer-height pr) 0)
+       "synced_headers" (c:tip-height)
+       "inbound" (if inbound t nil)
+       "conntime" (or (p:peer-connected-at pr) 0)))
+
+(defun connected-peers ()
+  "All peers we can enumerate: the primary follow peer (start-follow path, if any),
+   the discovered outbound pool, and the inbound serve peers.  Each element is
+   (peer . inbound-p)."
+  (let ((out '()))
+    (when (and *peer* (p:peer-alive-p *peer*)) (push (cons *peer* nil) out))
+    (dolist (pr (extra-peers)) (push (cons pr nil) out))
+    (dolist (pr (inbound-peers-snapshot)) (push (cons pr t) out))
+    (nreverse out)))
+
+(defun m-getpeerinfo (&rest _)
+  (declare (ignore _))
+  (let ((id -1))
+    (coerce (mapcar (lambda (cell) (peer->json (car cell) (incf id) (cdr cell)))
+                    (connected-peers))
+            'vector)))
+
+(defun m-getconnectioncount (&rest _)
+  (declare (ignore _))
+  (length (connected-peers)))
+
+(defun m-getnetworkinfo (&rest _)
+  (declare (ignore _))
+  (obj "version" 10100
+       "subversion" p:*default-user-agent*
+       "protocolversion" p:*protocol-version*
+       "localservices" "0000000000000000"
+       "localservicesnames" #()
+       "localrelay" t
+       "timeoffset" 0
+       "networkactive" t
+       "connections" (length (connected-peers))
+       "networks" (vector (obj "name" "ipv4" "limited" nil "reachable" t
+                               "proxy" "" "proxy_randomize_credentials" nil)
+                          (obj "name" "ipv6" "limited" nil "reachable" t
+                               "proxy" "" "proxy_randomize_credentials" nil))
+       "relayfee" (sat/vb->btc/kvb fee:*min-relay-feerate*)
+       "incrementalfee" (sat/vb->btc/kvb 1)
+       "localaddresses" #()
+       "warnings" ""))
+
+(defun m-getchaintips (&rest _)
+  (declare (ignore _))
+  (let ((tip (c:tip)))
+    (vector (obj "height" (c:tip-height)
+                 "hash" (c:header-hash-hex tip)
+                 "branchlen" 0
+                 "status" "active"))))
+
+(defun m-getnodeaddresses (&optional (count 1) &rest _)
+  "Sample reachable node addresses from the discovered outbound pool.  COUNT <= 0
+   returns all known.  Empty array when no peers are reachable."
+  (declare (ignore _))
+  (let* ((peers (extra-peers))
+         (n (if (and (numberp count) (plusp count)) (truncate count) (length peers))))
+    (coerce (loop for pr in peers repeat n
+                  collect (obj "time" (or (p:peer-connected-at pr) (get-universal-time))
+                               "services" (or (p:peer-services pr) 0)
+                               "address" (p:peer-host pr)
+                               "port" (p:peer-port pr)))
+            'vector)))
+
+;;; ----------------------------------------------------------------------------
+;;; Mempool entry / address validation
+;;; ----------------------------------------------------------------------------
+
+(defun m-getmempoolentry (txid &rest _)
+  (declare (ignore _))
+  (let ((e (mp:mempool-get *mempool* txid)))
+    (unless e (error "Transaction not in mempool"))
+    (let ((fee-btc (/ (mp:entry-fee e) 1d8)))
+      (obj "vsize" (mp:entry-vsize e)
+           "weight" (tx:tx-weight (mp:entry-tx e))
+           "time" (mp:entry-time e)
+           "descendantcount" 1
+           "ancestorcount" 1
+           "fees" (obj "base" fee-btc "modified" fee-btc
+                       "ancestor" fee-btc "descendant" fee-btc)
+           "depends" (coerce (mp:entry-parents e) 'vector)
+           "spentby" (coerce (mp:entry-children e) 'vector)
+           "bip125-replaceable" (if (mp:entry-replaceable e) t nil)))))
+
+(defun address->script (address)
+  "Decode a mainnet ADDRESS to (values scriptPubKey-bytes kind-keyword).
+   Signals on any invalid address (bad checksum / hrp / version)."
+  (let ((lower (string-downcase address)))
+    (if (and (>= (length lower) 4) (string= (subseq lower 0 3) "bc1"))
+        (multiple-value-bind (witver program) (enc:segwit-decode address "bc")
+          (let ((op (if (zerop witver) 0 (+ #x50 witver))))
+            (values (concatenate '(vector (unsigned-byte 8))
+                                 (vector op (length program)) program)
+                    (cond ((and (zerop witver) (= (length program) 20)) :witness_v0_keyhash)
+                          ((and (zerop witver) (= (length program) 32)) :witness_v0_scripthash)
+                          ((= witver 1) :witness_v1_taproot)
+                          (t :witness_unknown)))))
+        (let* ((payload (enc:base58check-decode address))
+               (ver (aref payload 0))
+               (h (subseq payload 1)))
+          (cond
+            ((and (= ver #x00) (= (length h) 20))
+             (values (concatenate '(vector (unsigned-byte 8))
+                                  (vector #x76 #xa9 #x14) h (vector #x88 #xac))
+                     :pubkeyhash))
+            ((and (= ver #x05) (= (length h) 20))
+             (values (concatenate '(vector (unsigned-byte 8))
+                                  (vector #xa9 #x14) h (vector #x87))
+                     :scripthash))
+            (t (error "unknown base58 address version ~d" ver)))))))
+
+(defun m-validateaddress (address &rest _)
+  "Decode ADDRESS (mainnet bech32/bech32m or base58check) and report validity +
+   the derived scriptPubKey.  isvalid is nil for anything that fails to decode."
+  (declare (ignore _))
+  (handler-case
+      (multiple-value-bind (spk kind) (address->script address)
+        (obj "isvalid" t
+             "address" address
+             "scriptPubKey" (w:bytes->hex spk)
+             "type" (string-downcase (symbol-name kind))
+             "isscript" (if (member kind '(:scripthash :witness_v0_scripthash)) t nil)
+             "iswitness" (if (member kind '(:witness_v0_keyhash :witness_v0_scripthash
+                                            :witness_v1_taproot :witness_unknown))
+                             t nil)))
+    (error () (obj "isvalid" nil))))
+
 (defun m-help (&rest _)
   (declare (ignore _))
   (format nil "methods: ~{~a~^, ~}"
@@ -180,6 +465,17 @@
                ("sendrawtransaction" m-sendrawtransaction)
                ("testmempoolaccept" m-testmempoolaccept)
                ("gettxout" m-gettxout)
+               ("estimatesmartfee" m-estimatesmartfee)
+               ("estimaterawfee" m-estimaterawfee)
+               ("getblock" m-getblock)
+               ("getrawtransaction" m-getrawtransaction)
+               ("getpeerinfo" m-getpeerinfo)
+               ("getconnectioncount" m-getconnectioncount)
+               ("getnetworkinfo" m-getnetworkinfo)
+               ("getchaintips" m-getchaintips)
+               ("getmempoolentry" m-getmempoolentry)
+               ("getnodeaddresses" m-getnodeaddresses)
+               ("validateaddress" m-validateaddress)
                ("uptime" m-uptime)
                ("help" m-help)))
     (setf (gethash (first m) *methods*) (symbol-function (second m)))))
