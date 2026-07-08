@@ -16,12 +16,14 @@
 ;;;; written as each block is stored.  At open we load the sidecar (a fast sequential
 ;;;; read) and then scan blocks.dat only from where the sidecar leaves off.
 ;;;;
-;;;; Crash-safety: the block is written to blocks.dat (and fsynced) BEFORE its sidecar
+;;;; Crash-safety: the block is written + flushed to blocks.dat BEFORE its sidecar
 ;;;; entry, so the sidecar can only ever LAG blocks.dat — a crash in between leaves an
 ;;;; un-indexed tail that open re-scans (and re-appends to the sidecar).  A torn tail
-;;;; in either file (partial trailing record) is detected and dropped.  If the sidecar
-;;;; is missing or inconsistent (covers more than blocks.dat holds), open falls back to
-;;;; a full scan and rewrites it.
+;;;; in either file (partial trailing record, incl. a truncated block body) is detected
+;;;; and dropped.  If the sidecar is missing or inconsistent (covers more than
+;;;; blocks.dat holds), open falls back to a full scan and rewrites it.  (Writes use
+;;;; FINISH-OUTPUT — OS-buffer durable, so this survives a process crash; power-loss
+;;;; reordering is caught by the same open-time torn-tail / covered>len self-healing.)
 ;;;;
 ;;;; Pure ANSI-CL stream I/O — no FFI, no mmap.
 
@@ -123,7 +125,8 @@
    tail, and set the store's END (next append offset).  Returns STORE."
   (let ((s (block-store-stream store))
         (index (block-store-index store))
-        (good-end start))
+        (good-end start)
+        (blen (file-length (block-store-stream store))))
     (file-position s start)
     (loop
       (let* ((rec-start (file-position s))
@@ -138,8 +141,10 @@
                (when (< got 80) (return))       ; torn header
                (let ((body-offset (+ rec-start 4))
                      (next (+ rec-start 4 len)))
+                 ;; body not fully present (torn tail) — seeking past EOF SUCCEEDS on
+                 ;; an :io stream, so check the length explicitly, don't probe by seek.
+                 (when (> next blen) (return))
                  (file-position s next)
-                 (when (< (file-position s) next) (return)) ; body not fully present
                  (let ((hash (w:hash256 hdr)))
                    (setf (gethash (w:hash->hex hash) index) (cons body-offset len))
                    (when write-idx (%append-idx-entry store hash body-offset len)))
@@ -222,7 +227,7 @@
         (file-position s rec-start)
         (%write-u32-le s len)
         (write-sequence raw s)
-        (finish-output s)                       ; block durable BEFORE its index entry
+        (finish-output s)                       ; block flushed BEFORE its index entry
         (setf (gethash hx (block-store-index store)) (cons body-offset len))
         (setf (block-store-end store) (+ rec-start 4 len))
         (%append-idx-entry store hash body-offset len)
