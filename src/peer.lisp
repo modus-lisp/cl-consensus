@@ -227,12 +227,16 @@
   (and (stringp s) (>= (length s) (length prefix))
        (string= prefix s :end2 (length prefix))))
 
+(defun %suffix-p (suffix s)
+  (and (stringp s) (>= (length s) (length suffix))
+       (string= suffix s :start2 (- (length s) (length suffix)))))
+
 (defun %private-host-p (host)
   "True for loopback / RFC1918 / .lan / .local hosts — not reachable via a Tor exit,
    so they always dial :DIRECT even when *PEER-TRANSPORT* is :TOR/:SOCKS5."
   (and (stringp host)
        (or (string= host "localhost")
-           (search ".lan" host) (search ".local" host)
+           (%suffix-p ".lan" host) (%suffix-p ".local" host)
            (%prefix-p "10." host) (%prefix-p "127." host) (%prefix-p "192.168." host)
            (loop for b from 16 to 31 thereis (%prefix-p (format nil "172.~d." b) host)))))
 
@@ -251,28 +255,40 @@
       (tr:dial host port :transport transport :timeout timeout)
     (let ((p (make-peer :host host :port port :stream stream :closer closer
                         :verbose verbose
-                        :connected-at (get-universal-time))))
-    ;; --- handshake (synchronous) ---
-    (send p "version" (build-version-payload :start-height start-height))
-    (let ((got-version nil) (got-verack nil))
-      (loop until (and got-version got-verack) do
-        (multiple-value-bind (command payload) (read-message p)
-          (unless command (error "peer ~a closed during handshake" (peer-addr p)))
-          (peer-log p "<- ~a (~d bytes)" command (length payload))
-          (cond
-            ((string= command "version")
-             (multiple-value-bind (v s sv h) (parse-version-payload payload)
-               (setf (peer-version p) v (peer-services p) s
-                     (peer-subver p) sv (peer-height p) h)
-               (setf got-version t)
-               ;; modern protocol: ack, and accept wtxid relay / sendaddrv2 noise
-               (send p "verack" #())))
-            ((string= command "verack") (setf got-verack t))
-            ((string= command "wtxidrelay") nil)
-            ((string= command "sendaddrv2") nil)
-            (t nil)))))
-    ;; --- go async (unless the caller defers the loop to its own thread) ---
-    (if defer-loop p (start-read-loop p)))))
+                        :connected-at (get-universal-time)))
+          (ok nil))
+      (unwind-protect
+           (progn
+             ;; --- handshake (synchronous, TIME-BOUNDED) ---
+             ;; A :tor gray-stream read has no socket input-timeout (unlike a usocket
+             ;; stream), so bound the whole handshake here — otherwise a peer that
+             ;; opens the stream but never sends `version` parks this call forever,
+             ;; which on a :tor failover dial could wedge the UTXO-writer follow loop.
+             (sb-ext:with-timeout timeout
+               (send p "version" (build-version-payload :start-height start-height))
+               (let ((got-version nil) (got-verack nil))
+                 (loop until (and got-version got-verack) do
+                   (multiple-value-bind (command payload) (read-message p)
+                     (unless command (error "peer ~a closed during handshake" (peer-addr p)))
+                     (peer-log p "<- ~a (~d bytes)" command (length payload))
+                     (cond
+                       ((string= command "version")
+                        (multiple-value-bind (v s sv h) (parse-version-payload payload)
+                          (setf (peer-version p) v (peer-services p) s
+                                (peer-subver p) sv (peer-height p) h)
+                          (setf got-version t)
+                          ;; modern protocol: ack, and accept wtxid relay / sendaddrv2 noise
+                          (send p "verack" #())))
+                       ((string= command "verack") (setf got-verack t))
+                       ((string= command "wtxidrelay") nil)
+                       ((string= command "sendaddrv2") nil)
+                       (t nil))))))
+             (setf ok t))
+        ;; on handshake failure/timeout, tear the connection down (don't leak a Tor
+        ;; circuit or socket); the condition then propagates to the caller.
+        (unless ok (ignore-errors (funcall closer))))
+      ;; --- go async (unless the caller defers the loop to its own thread) ---
+      (if defer-loop p (start-read-loop p)))))
 
 (defun %inbound-addr (socket)
   "Best-effort dotted IP of an accepted SOCKET's remote end (for logging)."
