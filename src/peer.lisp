@@ -12,13 +12,13 @@
 (defpackage #:cl-consensus.peer
   (:use #:cl)
   (:nicknames #:btc-peer)
-  (:local-nicknames (#:w #:cl-consensus.wire) (#:bt #:bordeaux-threads))
+  (:local-nicknames (#:w #:cl-consensus.wire) (#:bt #:bordeaux-threads) (#:tr #:cl-transport))
   (:export
    #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
    #:peer-services #:peer-alive-p #:peer-connected-at #:peer-prefers-headers
    #:connect-peer #:start-read-loop #:run-read-loop #:accept-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
-   #:*default-user-agent* #:*protocol-version*))
+   #:*default-user-agent* #:*protocol-version* #:*peer-transport* #:peer-closer))
 
 (in-package #:cl-consensus.peer)
 
@@ -27,8 +27,15 @@
 (defparameter +max-message-length+ (* 32 1024 1024)
   "Reject P2P messages larger than this before allocating the payload (DoS guard).")
 
+(defparameter *peer-transport* :direct
+  "Transport for OUTBOUND peer connections (CONNECT-PEER): :direct | :socks5 | :tor.
+   :direct is plain TCP (unchanged behaviour); :tor routes through cl-transport's
+   native Tor circuits (hides our IP); :socks5 through an external proxy.  Inbound
+   (ACCEPT-PEER) is always direct.")
+
 (defstruct peer
   host port socket stream
+  closer                                 ; thunk that tears the connection down (transport-agnostic)
   (lock (bt:make-lock "peer-send"))
   thread
   (handlers (make-hash-table :test 'equal))   ; command string -> function (peer payload-bytes)
@@ -216,41 +223,72 @@
   (setf (peer-thread p) (bt:current-thread))
   (read-loop p))
 
+(defun %prefix-p (prefix s)
+  (and (stringp s) (>= (length s) (length prefix))
+       (string= prefix s :end2 (length prefix))))
+
+(defun %suffix-p (suffix s)
+  (and (stringp s) (>= (length s) (length suffix))
+       (string= suffix s :start2 (- (length s) (length suffix)))))
+
+(defun %private-host-p (host)
+  "True for loopback / RFC1918 / .lan / .local hosts — not reachable via a Tor exit,
+   so they always dial :DIRECT even when *PEER-TRANSPORT* is :TOR/:SOCKS5."
+  (and (stringp host)
+       (or (string= host "localhost")
+           (%suffix-p ".lan" host) (%suffix-p ".local" host)
+           (%prefix-p "10." host) (%prefix-p "127." host) (%prefix-p "192.168." host)
+           (loop for b from 16 to 31 thereis (%prefix-p (format nil "172.~d." b) host)))))
+
 (defun connect-peer (host &key (port (w:net-port w:*network*))
                                (start-height 0) (verbose nil)
-                               (timeout 15) (defer-loop nil))
-  "Open a TCP connection to HOST:PORT and complete the version/verack handshake.
-   Returns a live PEER with its read loop running, or signals on failure.  With
-   :DEFER-LOOP the handshake completes but the async read loop is NOT started — the
-   caller must call START-READ-LOOP from a long-lived thread (see its docstring)."
-  (let* ((sock (usocket:socket-connect host port
-                                        :element-type '(unsigned-byte 8)
-                                        :timeout timeout))
-         (p (make-peer :host host :port port :socket sock
-                       :stream (usocket:socket-stream sock)
-                       :verbose verbose
-                       :connected-at (get-universal-time))))
-    ;; --- handshake (synchronous) ---
-    (send p "version" (build-version-payload :start-height start-height))
-    (let ((got-version nil) (got-verack nil))
-      (loop until (and got-version got-verack) do
-        (multiple-value-bind (command payload) (read-message p)
-          (unless command (error "peer ~a closed during handshake" (peer-addr p)))
-          (peer-log p "<- ~a (~d bytes)" command (length payload))
-          (cond
-            ((string= command "version")
-             (multiple-value-bind (v s sv h) (parse-version-payload payload)
-               (setf (peer-version p) v (peer-services p) s
-                     (peer-subver p) sv (peer-height p) h)
-               (setf got-version t)
-               ;; modern protocol: ack, and accept wtxid relay / sendaddrv2 noise
-               (send p "verack" #())))
-            ((string= command "verack") (setf got-verack t))
-            ((string= command "wtxidrelay") nil)
-            ((string= command "sendaddrv2") nil)
-            (t nil)))))
-    ;; --- go async (unless the caller defers the loop to its own thread) ---
-    (if defer-loop p (start-read-loop p))))
+                               (timeout 15) (defer-loop nil)
+                               (transport *peer-transport*))
+  "Open a connection to HOST:PORT over TRANSPORT (default *PEER-TRANSPORT*) and
+   complete the version/verack handshake.  Returns a live PEER with its read loop
+   running, or signals on failure.  With :DEFER-LOOP the handshake completes but the
+   async read loop is NOT started — the caller must call START-READ-LOOP from a
+   long-lived thread (see its docstring)."
+  (when (and (not (eq transport :direct)) (%private-host-p host))
+    (setf transport :direct))            ; LAN/loopback peers can't route through Tor
+  (multiple-value-bind (stream closer)
+      (tr:dial host port :transport transport :timeout timeout)
+    (let ((p (make-peer :host host :port port :stream stream :closer closer
+                        :verbose verbose
+                        :connected-at (get-universal-time)))
+          (ok nil))
+      (unwind-protect
+           (progn
+             ;; --- handshake (synchronous, TIME-BOUNDED) ---
+             ;; A :tor gray-stream read has no socket input-timeout (unlike a usocket
+             ;; stream), so bound the whole handshake here — otherwise a peer that
+             ;; opens the stream but never sends `version` parks this call forever,
+             ;; which on a :tor failover dial could wedge the UTXO-writer follow loop.
+             (sb-ext:with-timeout timeout
+               (send p "version" (build-version-payload :start-height start-height))
+               (let ((got-version nil) (got-verack nil))
+                 (loop until (and got-version got-verack) do
+                   (multiple-value-bind (command payload) (read-message p)
+                     (unless command (error "peer ~a closed during handshake" (peer-addr p)))
+                     (peer-log p "<- ~a (~d bytes)" command (length payload))
+                     (cond
+                       ((string= command "version")
+                        (multiple-value-bind (v s sv h) (parse-version-payload payload)
+                          (setf (peer-version p) v (peer-services p) s
+                                (peer-subver p) sv (peer-height p) h)
+                          (setf got-version t)
+                          ;; modern protocol: ack, and accept wtxid relay / sendaddrv2 noise
+                          (send p "verack" #())))
+                       ((string= command "verack") (setf got-verack t))
+                       ((string= command "wtxidrelay") nil)
+                       ((string= command "sendaddrv2") nil)
+                       (t nil))))))
+             (setf ok t))
+        ;; on handshake failure/timeout, tear the connection down (don't leak a Tor
+        ;; circuit or socket); the condition then propagates to the caller.
+        (unless ok (ignore-errors (funcall closer))))
+      ;; --- go async (unless the caller defers the loop to its own thread) ---
+      (if defer-loop p (start-read-loop p)))))
 
 (defun %inbound-addr (socket)
   "Best-effort dotted IP of an accepted SOCKET's remote end (for logging)."
@@ -294,7 +332,11 @@
 
 (defun disconnect (p)
   (setf (peer-alive p) nil)
-  (ignore-errors (usocket:socket-close (peer-socket p)))
+  ;; tear down via the transport closer (outbound: direct/socks5/tor), else the raw
+  ;; socket (inbound peers from ACCEPT-PEER have no closer).
+  (if (peer-closer p)
+      (ignore-errors (funcall (peer-closer p)))
+      (ignore-errors (usocket:socket-close (peer-socket p))))
   ;; The read-loop may be parked in a blocking read with the idle timeout cleared
   ;; (see CONNECT-PEER); closing the socket from another thread does not reliably
   ;; unblock that read, so join with a bounded timeout and move on rather than
