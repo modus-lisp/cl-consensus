@@ -20,6 +20,7 @@
      (:file "encoding")    ; base58check + bech32/bech32m (addresses, xprv/xpub)
      (:file "bip32")       ; HD key derivation (master/CKD, xprv/xpub)
      (:file "tx")          ; transactions (legacy + segwit), txid/wtxid
+     (:file "onion")       ; Tor v3 onion addresses + persistent tor peer directory
      (:file "peer")        ; P2P: handshake, message loop
      (:file "addrman")     ; address pool (dedup) for peer discovery
      (:file "discovery")   ; DNS seeds + getaddr-driven peer pool
