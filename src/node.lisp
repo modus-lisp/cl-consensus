@@ -24,7 +24,7 @@
                     (#:ht #:hunchentoot)
                     (#:jzon #:com.inuoe.jzon) (#:bt #:bordeaux-threads))
   (:export #:start #:stop #:reload! #:*rpc-port* #:*control-port* #:rpc-call
-           #:serve-node #:*utxo* #:*mempool*))
+           #:serve-node #:*utxo* #:*mempool* #:*onion-service-hook* #:live-peers))
 
 (in-package #:cl-consensus.node)
 
@@ -590,6 +590,15 @@
     (setf *extra-peers* (remove-if-not #'p:peer-alive-p *extra-peers*))
     (copy-list *extra-peers*)))
 
+(defun live-peers ()
+  "All currently-live peers: the primary follow peer, discovered outbound peers, and
+   accepted inbound peers.  Used to gossip our own address (self-advertisement)."
+  (remove-duplicates
+   (remove-if-not #'p:peer-alive-p
+                  (append (when *peer* (list *peer*))
+                          (extra-peers)
+                          (copy-list s:*inbound-peers*)))))   ; snapshot; a transient race is harmless
+
 (defvar *tor-dir-path* nil
   "File to persist the Tor v3 .onion peer directory to (NIL = don't persist).")
 
@@ -597,6 +606,11 @@
   "How many live .onion peers to keep in the pool (0 disables onion dialing).  Only
    attempted when cl-tor-transport is loaded (P:TOR-AVAILABLE-P), so the core node
    runs unchanged without the (optional) onion-service client.")
+
+(defvar *onion-service-hook* nil
+  "When set (by loading cl-consensus/tor), a function called by SERVE-NODE to publish
+   our OWN v3 onion service and accept inbound Tor peers.  Called as
+   (funcall hook :key-path P :start-height H :max-peers N) -> .onion address.")
 
 (defun %onion-peer-p (pr) (onion:onion-valid-p (p:peer-host pr)))
 
@@ -887,6 +901,7 @@
                         (block-store (namestring (merge-pathnames ".cl-consensus/blocks.dat"
                                                                   (user-homedir-pathname))))
                         (peer-host "127.0.0.1") (conns 2) (cache-gb 24)
+                        (onion-service nil)
                         (listen-port (w:net-port w:*network*)) (rpc-port *rpc-port*)
                         (max-peers 64) (poll 30) (discover 8)
                         (archive nil) (archive-peers 16)
@@ -927,6 +942,16 @@
       (unless *control-thread*
         (setf *control-thread* (bt:make-thread #'control-loop :name "btc-node control")))
       (s:start-listener :port listen-port :max-peers max-peers)
+      ;; optionally run our OWN v3 onion service (inbound over Tor).  Needs the provider
+      ;; (cl-consensus/tor sets *onion-service-hook*; cl-tor-transport registers :tor).
+      (when (and onion-service *onion-service-hook* (p:tor-available-p))
+        (ignore-errors
+          (let ((addr (funcall *onion-service-hook*
+                               :key-path (namestring (merge-pathnames "onion-service-key.dat"
+                                                                      (pathname block-store)))
+                               :port listen-port
+                               :start-height (c:tip-height) :max-peers max-peers)))
+            (format t "~&[node] onion service enabled: ~a~%" addr) (force-output))))
       ;; keep a pool of diverse outbound peers alive alongside the primary follow
       ;; peer (peer diversity + failover); bootstraps from the primary's getaddr.
       (when (and (plusp discover) (first peers))

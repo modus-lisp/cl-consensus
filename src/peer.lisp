@@ -16,9 +16,10 @@
                     (#:onion #:cl-consensus.onion))
   (:export
    #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
-   #:peer-services #:peer-alive-p #:peer-connected-at #:peer-prefers-headers
-   #:connect-peer #:start-read-loop #:run-read-loop #:accept-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
+   #:peer-services #:peer-alive-p #:peer-connected-at #:peer-prefers-headers #:peer-wants-addrv2
+   #:connect-peer #:start-read-loop #:run-read-loop #:accept-peer #:accept-peer-stream #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
+   #:build-addrv2-message #:onion-addrv2-entry #:announce-address
    #:tor-available-p #:%onion-host-p
    #:*default-user-agent* #:*protocol-version* #:*peer-transport* #:peer-closer))
 
@@ -46,6 +47,7 @@
   version services subver height
   (connected-at 0)
   (prefers-headers nil)   ; peer sent BIP130 "sendheaders" -> announce blocks via headers
+  (wants-addrv2 nil)      ; peer sent BIP155 "sendaddrv2" -> ok to send it addrv2
   (verbose nil))
 
 (defun peer-addr (p) (format nil "~a:~d" (peer-host p) (peer-port p)))
@@ -167,6 +169,8 @@
      (send p "pong" payload) t)          ; echo the nonce
     ((string= command "sendheaders")
      (setf (peer-prefers-headers p) t) t) ; BIP130: announce new blocks via headers
+    ((string= command "sendaddrv2")
+     (setf (peer-wants-addrv2 p) t) t)    ; BIP155 (belt-and-suspenders if it arrives late)
     ((member command '("alert" "feefilter" "sendcmpct" "wtxidrelay")
              :test #'string=)
      t)                                   ; ignore for now
@@ -297,7 +301,7 @@
                           (send p "verack" #())))
                        ((string= command "verack") (setf got-verack t))
                        ((string= command "wtxidrelay") nil)
-                       ((string= command "sendaddrv2") nil)
+                       ((string= command "sendaddrv2") (setf (peer-wants-addrv2 p) t))
                        (t nil))))))
              (setf ok t))
         ;; on handshake failure/timeout, tear the connection down (don't leak a Tor
@@ -324,27 +328,49 @@
                        :port (handler-case (usocket:get-peer-port socket) (serious-condition () 0))
                        :socket socket :stream stream :verbose verbose
                        :connected-at (get-universal-time))))
-    (let ((got-version nil) (got-verack nil))
-      (loop until (and got-version got-verack) do
-        (multiple-value-bind (command payload) (read-message p)
-          (unless command (error "inbound peer ~a closed during handshake" (peer-addr p)))
-          (peer-log p "<- ~a (~d bytes)" command (length payload))
-          (cond
-            ((string= command "version")
-             (multiple-value-bind (v s sv h) (parse-version-payload payload)
-               (setf (peer-version p) v (peer-services p) s
-                     (peer-subver p) sv (peer-height p) h))
-             (setf got-version t)
-             ;; respond with OUR version (advertising SERVICES) then verack.
-             (send p "version" (build-version-payload :services services :start-height start-height))
-             (send p "verack" #()))
-            ((string= command "verack") (setf got-verack t))
-            (t nil)))))                  ; ignore wtxidrelay/sendaddrv2/etc. during handshake
+    (%inbound-handshake p services start-height)
     #+sbcl (ignore-errors (setf (sb-impl::fd-stream-timeout (peer-stream p)) nil))
-    (setf (peer-thread p)
-          (bt:make-thread (lambda () (read-loop p))
-                          :name (format nil "btc-inbound ~a" (peer-addr p))))
-    p))
+    (%start-inbound-loop p)))
+
+(defun %inbound-handshake (p services start-height)
+  "Complete the INBOUND version/verack handshake on peer P: read THEIRS first, then
+   send OURS advertising SERVICES + verack.  Shared by socket and stream inbound."
+  (let ((got-version nil) (got-verack nil))
+    (loop until (and got-version got-verack) do
+      (multiple-value-bind (command payload) (read-message p)
+        (unless command (error "inbound peer ~a closed during handshake" (peer-addr p)))
+        (peer-log p "<- ~a (~d bytes)" command (length payload))
+        (cond
+          ((string= command "version")
+           (multiple-value-bind (v s sv h) (parse-version-payload payload)
+             (setf (peer-version p) v (peer-services p) s
+                   (peer-subver p) sv (peer-height p) h))
+           (setf got-version t)
+           (send p "version" (build-version-payload :services services :start-height start-height))
+           (send p "sendaddrv2" #())     ; BIP155: we speak addrv2 (so inbound peers gossip Tor v3)
+           (send p "verack" #()))
+          ((string= command "verack") (setf got-verack t))
+          ((string= command "sendaddrv2") (setf (peer-wants-addrv2 p) t))
+          (t nil)))))                  ; ignore wtxidrelay/etc. during handshake
+  p)
+
+(defun %start-inbound-loop (p)
+  (setf (peer-thread p)
+        (bt:make-thread (lambda () (read-loop p))
+                        :name (format nil "btc-inbound ~a" (peer-addr p))))
+  p)
+
+(defun accept-peer-stream (stream &key (host "onion") (port 0) closer
+                                       (services (logior w:+services-network+ w:+services-witness+))
+                                       (start-height 0) (verbose nil))
+  "Like ACCEPT-PEER but over an already-open binary STREAM (an inbound Tor rendezvous
+   stream) rather than a TCP socket.  CLOSER tears the connection down on disconnect.
+   Call from a long-lived thread: the peer read-loop it spawns dies if its creating
+   thread exits (the onion bridge calls it from cl-tor's persistent intro thread)."
+  (let ((p (make-peer :host host :port port :stream stream :closer closer :verbose verbose
+                      :connected-at (get-universal-time))))
+    (%inbound-handshake p services start-height)
+    (%start-inbound-loop p)))
 
 (defun disconnect (p)
   (setf (peer-alive p) nil)
@@ -407,3 +433,28 @@
                      (dolist (op (onion:parse-addrv2-onions payload)) (funcall onion-sink op)))))
   (send-getaddr p)
   p)
+
+;;; ----------------------------------------------------------------------------
+;;; Self-advertisement: announce our OWN address (BIP155 addrv2) so peers relay it.
+;;; ----------------------------------------------------------------------------
+
+(defconstant +netid-tor-v3+ 4 "BIP155 network id for Tor v3 (.onion).")
+
+(defun build-addrv2-message (entries)
+  "Encode an addrv2 (BIP155) message from ENTRIES, each (services netid addr port):
+   varint(count) then per entry u32(time) varint(services) u8(netid) varint(len) addr u16BE(port)."
+  (let ((wr (w:make-writer)) (now (- (get-universal-time) 2208988800)))   ; CL epoch -> unix
+    (w:w-varint wr (length entries))
+    (dolist (e entries (w:writer-bytes wr))
+      (destructuring-bind (services netid addr port) e
+        (w:w-u32 wr now) (w:w-varint wr services) (w:w-u8 wr netid)
+        (w:w-varint wr (length addr)) (w:w-bytes wr addr) (w:w-port-be wr port)))))
+
+(defun onion-addrv2-entry (onion port &optional
+                                       (services (logior w:+services-network+ w:+services-witness+)))
+  "An addrv2 entry advertising ONION:PORT (Tor v3: netID 4, 32-byte Ed25519 pubkey)."
+  (list services +netid-tor-v3+ (onion:onion->pubkey onion) port))
+
+(defun announce-address (p entries)
+  "Send an addrv2 message advertising ENTRIES to peer P (best-effort)."
+  (ignore-errors (send p "addrv2" (build-addrv2-message entries))))

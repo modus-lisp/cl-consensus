@@ -50,5 +50,7 @@
 ;;; separate so the core node has no hard dependency on cl-tor / cl+ssl — load
 ;;; "cl-consensus/tor" instead of "cl-consensus" when you want onion peering.
 (defsystem "cl-consensus/tor"
-  :description "cl-consensus plus the cl-tor :tor backend, so .onion peers are dialable."
-  :depends-on ("cl-consensus" "cl-tor-transport"))
+  :description "cl-consensus plus the cl-tor :tor backend, so .onion peers are dialable
+                AND the node can run its own v3 onion service (inbound over Tor)."
+  :depends-on ("cl-consensus" "cl-tor-transport")
+  :components ((:module "src" :components ((:file "onion-service")))))
