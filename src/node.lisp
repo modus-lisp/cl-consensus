@@ -593,12 +593,38 @@
 (defvar *tor-dir-path* nil
   "File to persist the Tor v3 .onion peer directory to (NIL = don't persist).")
 
+(defvar *onion-target* 2
+  "How many live .onion peers to keep in the pool (0 disables onion dialing).  Only
+   attempted when cl-tor-transport is loaded (P:TOR-AVAILABLE-P), so the core node
+   runs unchanged without the (optional) onion-service client.")
+
+(defun %onion-peer-p (pr) (onion:onion-valid-p (p:peer-host pr)))
+
+(defun %dial-onion-peers (want)
+  "Best-effort: dial up to WANT .onion peers from the directory that aren't already
+   live in the pool.  Onion dials are slow (descriptor fetch + introduce + rendezvous)
+   and flaky, so this is sequential with a generous per-dial timeout, and never signals.
+   CONNECT-PEER routes .onion hosts through cl-transport's :tor backend automatically."
+  (let* ((live (mapcar #'p:peer-host (remove-if-not #'%onion-peer-p (extra-peers))))
+         (cands (remove-if (lambda (op) (member (car op) live :test #'string=))
+                           (onion:tordir-list)))
+         (got '()))
+    (dolist (op cands got)
+      (when (>= (length got) want) (return got))
+      (let ((pr (ignore-errors
+                  (p:connect-peer (car op) :port (cdr op)
+                                  :start-height (c:tip-height) :timeout 120))))
+        (when pr
+          (format t "~&[onion] connected ~a:~d~%" (car op) (cdr op)) (force-output)
+          (push pr got))))))
+
 (defun peer-manager-loop (bootstrap &key (target 8) (poll 60))
-  "Maintain TARGET live discovered peers in *EXTRA-PEERS*, and collect Tor v3 .onion
-   addresses gossiped by peers into the persistent tor directory.  (Those aren't
-   dialable yet — that needs an onion-service client — but the directory is stocked
-   for when it lands.)  Bootstraps from BOOTSTRAP's getaddr + DNS, tops up in parallel
-   each POLL seconds, and asks each new peer for addresses.  Best-effort: never signals."
+  "Maintain TARGET live discovered peers in *EXTRA-PEERS*, collect Tor v3 .onion
+   addresses gossiped by peers into the persistent tor directory, and — when the
+   onion-service client is loaded (cl-tor-transport) — keep *ONION-TARGET* live
+   .onion peers dialed from it through cl-transport's :tor backend.  Bootstraps from
+   BOOTSTRAP's getaddr + DNS, tops up in parallel each POLL seconds, and asks each
+   new peer for addresses.  Best-effort: never signals."
   (handler-case
       (let ((onion-sink (lambda (op) (onion:tordir-add (car op) (cdr op)))))
         ;; restore the onion directory from disk
@@ -633,7 +659,17 @@
                         (setf *extra-peers* (append *extra-peers* got)))
                       (format t "~&[peers] +~d discovered (pool now ~d/~d); onion dir ~d~%"
                               (length got) (length (extra-peers)) target (onion:tordir-count))
-                      (force-output)))))
+                      (force-output))))
+                ;; dial .onion peers from the directory (needs cl-tor-transport's :tor backend)
+                (when (and (plusp *onion-target*) (p:tor-available-p))
+                  (let ((oneed (- *onion-target* (count-if #'%onion-peer-p (extra-peers)))))
+                    (when (> oneed 0)
+                      (let ((og (%dial-onion-peers oneed)))
+                        (when og
+                          (bt:with-lock-held (*extra-peers-lock*)
+                            (setf *extra-peers* (append *extra-peers* og)))
+                          (format t "~&[onion] +~d .onion peer(s) in pool (dir ~d)~%"
+                                  (length og) (onion:tordir-count)) (force-output)))))))
             (serious-condition (e)
               (format t "~&[peers] manager tick error: ~a~%" e) (force-output)))
           ;; persist the onion directory each tick

@@ -7,3 +7,6 @@
 [submodule "deps/cl-transport"]
 	path = deps/cl-transport
 	url = https://github.com/modus-lisp/cl-transport.git
+[submodule "deps/cl-tor"]
+	path = deps/cl-tor
+	url = https://github.com/modus-lisp/cl-tor.git

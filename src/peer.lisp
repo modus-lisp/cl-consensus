@@ -19,6 +19,7 @@
    #:peer-services #:peer-alive-p #:peer-connected-at #:peer-prefers-headers
    #:connect-peer #:start-read-loop #:run-read-loop #:accept-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
+   #:tor-available-p #:%onion-host-p
    #:*default-user-agent* #:*protocol-version* #:*peer-transport* #:peer-closer))
 
 (in-package #:cl-consensus.peer)
@@ -241,6 +242,17 @@
            (%prefix-p "10." host) (%prefix-p "127." host) (%prefix-p "192.168." host)
            (loop for b from 16 to 31 thereis (%prefix-p (format nil "172.~d." b) host)))))
 
+(defun %onion-host-p (host)
+  "True for a v3 .onion address — only reachable end-to-end via the onion-service
+   client, so these ALWAYS dial :TOR regardless of *PEER-TRANSPORT*."
+  (onion:onion-valid-p host))
+
+(defun tor-available-p ()
+  "T if a :tor backend is registered with cl-transport — i.e. cl-tor-transport is
+   loaded.  Callers gate .onion dialing on this so the core node stays usable
+   without the (optional) onion-service client."
+  (tr:transport-available-p :tor))
+
 (defun connect-peer (host &key (port (w:net-port w:*network*))
                                (start-height 0) (verbose nil)
                                (timeout 15) (defer-loop nil)
@@ -250,8 +262,9 @@
    running, or signals on failure.  With :DEFER-LOOP the handshake completes but the
    async read loop is NOT started — the caller must call START-READ-LOOP from a
    long-lived thread (see its docstring)."
-  (when (and (not (eq transport :direct)) (%private-host-p host))
-    (setf transport :direct))            ; LAN/loopback peers can't route through Tor
+  (cond ((%onion-host-p host) (setf transport :tor))        ; .onion requires the onion client
+        ((and (not (eq transport :direct)) (%private-host-p host))
+         (setf transport :direct)))       ; LAN/loopback peers can't route through Tor
   (multiple-value-bind (stream closer)
       (tr:dial host port :transport transport :timeout timeout)
     (let ((p (make-peer :host host :port port :stream stream :closer closer
