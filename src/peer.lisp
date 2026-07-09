@@ -17,7 +17,7 @@
   (:export
    #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
    #:peer-services #:peer-alive-p #:peer-connected-at #:peer-prefers-headers
-   #:connect-peer #:start-read-loop #:run-read-loop #:accept-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
+   #:connect-peer #:start-read-loop #:run-read-loop #:accept-peer #:accept-peer-stream #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
    #:tor-available-p #:%onion-host-p
    #:*default-user-agent* #:*protocol-version* #:*peer-transport* #:peer-closer))
@@ -324,27 +324,45 @@
                        :port (handler-case (usocket:get-peer-port socket) (serious-condition () 0))
                        :socket socket :stream stream :verbose verbose
                        :connected-at (get-universal-time))))
-    (let ((got-version nil) (got-verack nil))
-      (loop until (and got-version got-verack) do
-        (multiple-value-bind (command payload) (read-message p)
-          (unless command (error "inbound peer ~a closed during handshake" (peer-addr p)))
-          (peer-log p "<- ~a (~d bytes)" command (length payload))
-          (cond
-            ((string= command "version")
-             (multiple-value-bind (v s sv h) (parse-version-payload payload)
-               (setf (peer-version p) v (peer-services p) s
-                     (peer-subver p) sv (peer-height p) h))
-             (setf got-version t)
-             ;; respond with OUR version (advertising SERVICES) then verack.
-             (send p "version" (build-version-payload :services services :start-height start-height))
-             (send p "verack" #()))
-            ((string= command "verack") (setf got-verack t))
-            (t nil)))))                  ; ignore wtxidrelay/sendaddrv2/etc. during handshake
+    (%inbound-handshake p services start-height)
     #+sbcl (ignore-errors (setf (sb-impl::fd-stream-timeout (peer-stream p)) nil))
-    (setf (peer-thread p)
-          (bt:make-thread (lambda () (read-loop p))
-                          :name (format nil "btc-inbound ~a" (peer-addr p))))
-    p))
+    (%start-inbound-loop p)))
+
+(defun %inbound-handshake (p services start-height)
+  "Complete the INBOUND version/verack handshake on peer P: read THEIRS first, then
+   send OURS advertising SERVICES + verack.  Shared by socket and stream inbound."
+  (let ((got-version nil) (got-verack nil))
+    (loop until (and got-version got-verack) do
+      (multiple-value-bind (command payload) (read-message p)
+        (unless command (error "inbound peer ~a closed during handshake" (peer-addr p)))
+        (peer-log p "<- ~a (~d bytes)" command (length payload))
+        (cond
+          ((string= command "version")
+           (multiple-value-bind (v s sv h) (parse-version-payload payload)
+             (setf (peer-version p) v (peer-services p) s
+                   (peer-subver p) sv (peer-height p) h))
+           (setf got-version t)
+           (send p "version" (build-version-payload :services services :start-height start-height))
+           (send p "verack" #()))
+          ((string= command "verack") (setf got-verack t))
+          (t nil)))))                  ; ignore wtxidrelay/sendaddrv2/etc. during handshake
+  p)
+
+(defun %start-inbound-loop (p)
+  (setf (peer-thread p)
+        (bt:make-thread (lambda () (read-loop p))
+                        :name (format nil "btc-inbound ~a" (peer-addr p))))
+  p)
+
+(defun accept-peer-stream (stream &key (host "onion") (port 0) closer
+                                       (services (logior w:+services-network+ w:+services-witness+))
+                                       (start-height 0) (verbose nil))
+  "Like ACCEPT-PEER but over an already-open binary STREAM (an inbound Tor rendezvous
+   stream) rather than a TCP socket.  CLOSER tears the connection down on disconnect."
+  (let ((p (make-peer :host host :port port :stream stream :closer closer :verbose verbose
+                      :connected-at (get-universal-time))))
+    (%inbound-handshake p services start-height)
+    (%start-inbound-loop p)))
 
 (defun disconnect (p)
   (setf (peer-alive p) nil)
