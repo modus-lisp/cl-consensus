@@ -10,3 +10,6 @@
 [submodule "deps/cl-tor"]
 	path = deps/cl-tor
 	url = https://github.com/modus-lisp/cl-tor.git
+[submodule "deps/seal"]
+	path = deps/seal
+	url = https://github.com/modus-lisp/seal.git
