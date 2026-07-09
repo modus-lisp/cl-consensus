@@ -20,6 +20,7 @@
                     (#:bs #:cl-consensus.blockstore)
                     (#:enc #:cl-consensus.encoding) (#:fee #:cl-consensus.fees)
                     (#:d #:cl-consensus.discovery) (#:am #:cl-consensus.addrman)
+                    (#:onion #:cl-consensus.onion)
                     (#:ht #:hunchentoot)
                     (#:jzon #:com.inuoe.jzon) (#:bt #:bordeaux-threads))
   (:export #:start #:stop #:reload! #:*rpc-port* #:*control-port* #:rpc-call
@@ -589,17 +590,54 @@
     (setf *extra-peers* (remove-if-not #'p:peer-alive-p *extra-peers*))
     (copy-list *extra-peers*)))
 
+(defvar *tor-dir-path* nil
+  "File to persist the Tor v3 .onion peer directory to (NIL = don't persist).")
+
+(defvar *onion-target* 2
+  "How many live .onion peers to keep in the pool (0 disables onion dialing).  Only
+   attempted when cl-tor-transport is loaded (P:TOR-AVAILABLE-P), so the core node
+   runs unchanged without the (optional) onion-service client.")
+
+(defun %onion-peer-p (pr) (onion:onion-valid-p (p:peer-host pr)))
+
+(defun %dial-onion-peers (want)
+  "Best-effort: dial up to WANT .onion peers from the directory that aren't already
+   live in the pool.  Onion dials are slow (descriptor fetch + introduce + rendezvous)
+   and flaky, so this is sequential with a generous per-dial timeout, and never signals.
+   CONNECT-PEER routes .onion hosts through cl-transport's :tor backend automatically."
+  (let* ((live (mapcar #'p:peer-host (remove-if-not #'%onion-peer-p (extra-peers))))
+         (cands (remove-if (lambda (op) (member (car op) live :test #'string=))
+                           (onion:tordir-list)))
+         (got '()))
+    (dolist (op cands got)
+      (when (>= (length got) want) (return got))
+      (let ((pr (ignore-errors
+                  (p:connect-peer (car op) :port (cdr op)
+                                  :start-height (c:tip-height) :timeout 120))))
+        (when pr
+          (format t "~&[onion] connected ~a:~d~%" (car op) (cdr op)) (force-output)
+          (push pr got))))))
+
 (defun peer-manager-loop (bootstrap &key (target 8) (poll 60))
-  "Maintain TARGET live discovered peers in *EXTRA-PEERS*.  Bootstraps the address
-   pool from BOOTSTRAP's getaddr (once) + DNS seeds, then tops up in parallel each
-   POLL seconds, pruning dead connections.  Best-effort: never signals."
+  "Maintain TARGET live discovered peers in *EXTRA-PEERS*, collect Tor v3 .onion
+   addresses gossiped by peers into the persistent tor directory, and — when the
+   onion-service client is loaded (cl-tor-transport) — keep *ONION-TARGET* live
+   .onion peers dialed from it through cl-transport's :tor backend.  Bootstraps from
+   BOOTSTRAP's getaddr + DNS, tops up in parallel each POLL seconds, and asks each
+   new peer for addresses.  Best-effort: never signals."
   (handler-case
-      (progn
-        ;; one-time addrman seeding from the local peer's known addresses
+      (let ((onion-sink (lambda (op) (onion:tordir-add (car op) (cdr op)))))
+        ;; restore the onion directory from disk
+        (when *tor-dir-path*
+          (ignore-errors
+            (let ((n (onion:load-tor-directory *tor-dir-path*)))
+              (when (plusp n) (format t "~&[onion] restored ~d .onion peers~%" n) (force-output)))))
+        ;; one-time addrman seeding + onion collection from the local peer
         (when (and bootstrap (p:peer-alive-p bootstrap))
           (ignore-errors
             (p:enable-discovery bootstrap
-              (lambda (hp) (am:addrman-add am:*addrman* (car hp) (cdr hp))))
+              (lambda (hp) (am:addrman-add am:*addrman* (car hp) (cdr hp)))
+              onion-sink)
             (sleep 3)))
         (ignore-errors (d:seed-from-dns am:*addrman*))
         (loop
@@ -610,13 +648,33 @@
                   (let ((got (d:connect-n-parallel need :start-height (c:tip-height)
                                                    :min-height (max 0 (- (c:tip-height) 6)))))
                     (when got
+                      ;; ask each new peer for addresses — public peers are where the
+                      ;; .onion gossip comes from (the local follow peer usually has none)
+                      (dolist (pr got)
+                        (ignore-errors
+                          (p:enable-discovery pr
+                            (lambda (hp) (am:addrman-add am:*addrman* (car hp) (cdr hp)))
+                            onion-sink)))
                       (bt:with-lock-held (*extra-peers-lock*)
                         (setf *extra-peers* (append *extra-peers* got)))
-                      (format t "~&[peers] +~d discovered (pool now ~d/~d): ~{~a ~}~%"
-                              (length got) (length (extra-peers)) target
-                              (mapcar #'p:peer-host got)) (force-output)))))
+                      (format t "~&[peers] +~d discovered (pool now ~d/~d); onion dir ~d~%"
+                              (length got) (length (extra-peers)) target (onion:tordir-count))
+                      (force-output))))
+                ;; dial .onion peers from the directory (needs cl-tor-transport's :tor backend)
+                (when (and (plusp *onion-target*) (p:tor-available-p))
+                  (let ((oneed (- *onion-target* (count-if #'%onion-peer-p (extra-peers)))))
+                    (when (> oneed 0)
+                      (let ((og (%dial-onion-peers oneed)))
+                        (when og
+                          (bt:with-lock-held (*extra-peers-lock*)
+                            (setf *extra-peers* (append *extra-peers* og)))
+                          (format t "~&[onion] +~d .onion peer(s) in pool (dir ~d)~%"
+                                  (length og) (onion:tordir-count)) (force-output)))))))
             (serious-condition (e)
               (format t "~&[peers] manager tick error: ~a~%" e) (force-output)))
+          ;; persist the onion directory each tick
+          (when *tor-dir-path*
+            (ignore-errors (onion:save-tor-directory *tor-dir-path*)))
           (sleep poll)))
     (serious-condition () nil)))
 
@@ -848,7 +906,8 @@
         (u:open-utxo-backend store :backend :pagetree :cache-bytes (* cache-gb 1024 1024 1024))
       (setf *utxo* utxo
             s:*block-store* (bs:open-block-store block-store)
-            s:*utxo* utxo s:*mempool* *mempool* s:*tx-relay-enabled* t)
+            s:*utxo* utxo s:*mempool* *mempool* s:*tx-relay-enabled* t
+            *tor-dir-path* (merge-pathnames "onion-peers.dat" (pathname block-store)))
       (format t "~&[node] UTXO resume height ~d (~d coins); block store ~d blocks~%"
               height (u:utxo-count utxo) (bs:block-store-count s:*block-store*)) (force-output)
       ;; restore the mempool (re-validated against the just-loaded UTXO)

@@ -12,12 +12,14 @@
 (defpackage #:cl-consensus.peer
   (:use #:cl)
   (:nicknames #:btc-peer)
-  (:local-nicknames (#:w #:cl-consensus.wire) (#:bt #:bordeaux-threads) (#:tr #:cl-transport))
+  (:local-nicknames (#:w #:cl-consensus.wire) (#:bt #:bordeaux-threads) (#:tr #:cl-transport)
+                    (#:onion #:cl-consensus.onion))
   (:export
    #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
    #:peer-services #:peer-alive-p #:peer-connected-at #:peer-prefers-headers
    #:connect-peer #:start-read-loop #:run-read-loop #:accept-peer #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
+   #:tor-available-p #:%onion-host-p
    #:*default-user-agent* #:*protocol-version* #:*peer-transport* #:peer-closer))
 
 (in-package #:cl-consensus.peer)
@@ -240,6 +242,17 @@
            (%prefix-p "10." host) (%prefix-p "127." host) (%prefix-p "192.168." host)
            (loop for b from 16 to 31 thereis (%prefix-p (format nil "172.~d." b) host)))))
 
+(defun %onion-host-p (host)
+  "True for a v3 .onion address — only reachable end-to-end via the onion-service
+   client, so these ALWAYS dial :TOR regardless of *PEER-TRANSPORT*."
+  (onion:onion-valid-p host))
+
+(defun tor-available-p ()
+  "T if a :tor backend is registered with cl-transport — i.e. cl-tor-transport is
+   loaded.  Callers gate .onion dialing on this so the core node stays usable
+   without the (optional) onion-service client."
+  (tr:transport-available-p :tor))
+
 (defun connect-peer (host &key (port (w:net-port w:*network*))
                                (start-height 0) (verbose nil)
                                (timeout 15) (defer-loop nil)
@@ -249,8 +262,9 @@
    running, or signals on failure.  With :DEFER-LOOP the handshake completes but the
    async read loop is NOT started — the caller must call START-READ-LOOP from a
    long-lived thread (see its docstring)."
-  (when (and (not (eq transport :direct)) (%private-host-p host))
-    (setf transport :direct))            ; LAN/loopback peers can't route through Tor
+  (cond ((%onion-host-p host) (setf transport :tor))        ; .onion requires the onion client
+        ((and (not (eq transport :direct)) (%private-host-p host))
+         (setf transport :direct)))       ; LAN/loopback peers can't route through Tor
   (multiple-value-bind (stream closer)
       (tr:dial host port :transport transport :timeout timeout)
     (let ((p (make-peer :host host :port port :stream stream :closer closer
@@ -277,7 +291,9 @@
                           (setf (peer-version p) v (peer-services p) s
                                 (peer-subver p) sv (peer-height p) h)
                           (setf got-version t)
-                          ;; modern protocol: ack, and accept wtxid relay / sendaddrv2 noise
+                          ;; BIP155: signal we understand addrv2 (must precede verack) so
+                          ;; the peer gossips Tor v3 / other addrs; then ack.
+                          (send p "sendaddrv2" #())
                           (send p "verack" #())))
                        ((string= command "verack") (setf got-verack t))
                        ((string= command "wtxidrelay") nil)
@@ -378,13 +394,16 @@
                   out)))))
     out))
 
-(defun enable-discovery (p sink)
+(defun enable-discovery (p sink &optional onion-sink)
   "Register addr/addrv2 handlers on P that feed parsed (host . port) pairs to
    SINK (a function of one (host . port)), and send getaddr.  SINK is typically
-   ADDRMAN-ADD bound to the process address pool."
+   ADDRMAN-ADD bound to the process address pool.  With ONION-SINK, Tor v3
+   (.onion-address . port) entries from addrv2 gossip are fed to it as well."
   (on p "addr"   (lambda (pr payload) (declare (ignore pr))
                    (dolist (hp (parse-addr-payload payload)) (funcall sink hp))))
   (on p "addrv2" (lambda (pr payload) (declare (ignore pr))
-                   (dolist (hp (parse-addrv2-payload payload)) (funcall sink hp))))
+                   (dolist (hp (parse-addrv2-payload payload)) (funcall sink hp))
+                   (when onion-sink
+                     (dolist (op (onion:parse-addrv2-onions payload)) (funcall onion-sink op)))))
   (send-getaddr p)
   p)

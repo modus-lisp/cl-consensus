@@ -20,6 +20,7 @@
      (:file "encoding")    ; base58check + bech32/bech32m (addresses, xprv/xpub)
      (:file "bip32")       ; HD key derivation (master/CKD, xprv/xpub)
      (:file "tx")          ; transactions (legacy + segwit), txid/wtxid
+     (:file "onion")       ; Tor v3 onion addresses + persistent tor peer directory
      (:file "peer")        ; P2P: handshake, message loop
      (:file "addrman")     ; address pool (dedup) for peer discovery
      (:file "discovery")   ; DNS seeds + getaddr-driven peer pool
@@ -42,3 +43,12 @@
      (:file "wallet-store")   ; persist/restore a wallet (seed + tracked coins)
      (:file "rpc-wallet")     ; wallet-backed JSON-RPC (getnewaddress/sendtoaddress/...)
      (:file "taproot-script")))))  ; BIP341 taproot script-path spend construction
+
+;;; Optional: enable dialing .onion peers.  Loading this pulls in cl-tor's :tor
+;;; backend (via cl-tor-transport) and registers it with cl-transport, so the
+;;; peer-manager starts connecting to the .onion peers in its directory.  Kept
+;;; separate so the core node has no hard dependency on cl-tor / cl+ssl — load
+;;; "cl-consensus/tor" instead of "cl-consensus" when you want onion peering.
+(defsystem "cl-consensus/tor"
+  :description "cl-consensus plus the cl-tor :tor backend, so .onion peers are dialable."
+  :depends-on ("cl-consensus" "cl-tor-transport"))
