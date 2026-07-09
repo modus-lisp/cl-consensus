@@ -33,7 +33,7 @@
   (:export
    #:block-store #:open-block-store #:close-block-store
    #:store-block #:get-block-bytes #:block-store-has-p
-   #:block-store-count #:block-store-path #:rebuild-index))
+   #:block-store-count #:block-store-path #:rebuild-index #:prune-to))
 
 (in-package #:cl-consensus.blockstore)
 
@@ -250,6 +250,55 @@
 (defun block-store-has-p (store hash-hex)
   (bt:with-lock-held ((block-store-lock store))
     (and (gethash hash-hex (block-store-index store)) t)))
+
+(defun prune-to (store keep-hashes)
+  "Compact STORE, keeping only blocks whose HASH-HEX is in KEEP-HASHES (a list or
+   hash-set) — a pruned node keeps just a recent window and discards the rest.  Copies
+   the kept blocks to a temp file, atomically renames it over blocks.dat, reopens, and
+   rebuilds the in-RAM index + sidecar.  Reclaims the disk of the pruned blocks.
+   Returns (values kept-count pruned-count)."
+  (bt:with-lock-held ((block-store-lock store))
+    (let* ((keep (if (hash-table-p keep-hashes) keep-hashes
+                     (let ((h (make-hash-table :test 'equal)))
+                       (dolist (k keep-hashes h) (setf (gethash k h) t)))))
+           (s (block-store-stream store))
+           (tmp (concatenate 'string (namestring (block-store-path store)) ".tmp"))
+           (new-index (make-hash-table :test 'equal))
+           (ordered '())                        ; (hash-bytes offset len) in FILE order
+           (pos 0) (kept 0) (pruned 0))
+      (with-open-file (out tmp :direction :output :element-type '(unsigned-byte 8)
+                               :if-exists :supersede :if-does-not-exist :create)
+        (maphash
+         (lambda (hx entry)
+           (cond ((gethash hx keep)
+                  (let* ((len (cdr entry))
+                         (buf (make-array len :element-type '(unsigned-byte 8))))
+                    (file-position s (car entry))
+                    (read-sequence buf s)
+                    (%write-u32-le out len)
+                    (write-sequence buf out)
+                    (setf (gethash hx new-index) (cons (+ pos 4) len))
+                    (push (list (w:hex->hash hx) (+ pos 4) len) ordered)  ; record in write order
+                    (incf pos (+ 4 len)) (incf kept)))
+                 (t (incf pruned))))
+         (block-store-index store))
+        (setf ordered (nreverse ordered)))       ; now ascending by file offset
+      ;; swap the compacted file in for blocks.dat, then reopen at its new end
+      (ignore-errors (finish-output s))
+      (close s)
+      (sb-posix:rename tmp (namestring (block-store-path store)))
+      (setf (block-store-stream store)
+            (open (block-store-path store) :direction :io :element-type '(unsigned-byte 8)
+                                           :if-exists :overwrite :if-does-not-exist :create)
+            (block-store-index store) new-index
+            (block-store-end store) pos)
+      (file-position (block-store-stream store) pos)
+      ;; Rebuild the sidecar IN FILE ORDER so it stays a contiguous prefix of blocks.dat:
+      ;; a crash mid-rebuild then leaves a valid prefix [0,covered) that open self-heals
+      ;; by re-scanning the tail (rebuilding in hash-table order would strand kept blocks).
+      (%reset-sidecar store)
+      (dolist (e ordered) (%append-idx-entry store (first e) (second e) (third e)))
+      (values kept pruned))))
 
 (defun block-store-count (store)
   (bt:with-lock-held ((block-store-lock store))

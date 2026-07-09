@@ -21,7 +21,7 @@
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
    #:build-addrv2-message #:onion-addrv2-entry #:announce-address
    #:tor-available-p #:%onion-host-p
-   #:*default-user-agent* #:*protocol-version* #:*peer-transport* #:peer-closer))
+   #:*default-user-agent* #:*protocol-version* #:*peer-transport* #:*advertised-services* #:peer-closer))
 
 (in-package #:cl-consensus.peer)
 
@@ -35,6 +35,10 @@
    :direct is plain TCP (unchanged behaviour); :tor routes through cl-transport's
    native Tor circuits (hides our IP); :socks5 through an external proxy.  Inbound
    (ACCEPT-PEER) is always direct.")
+
+(defparameter *advertised-services* (logior w:+services-network+ w:+services-witness+)
+  "The service bits we advertise to inbound peers.  A pruned node sets this to
+   NODE_NETWORK_LIMITED|NODE_WITNESS (it serves only the last ~288 blocks).")
 
 (defstruct peer
   host port socket stream
@@ -317,7 +321,7 @@
         (if (vectorp a) (format nil "~{~a~^.~}" (coerce a 'list)) (format nil "~a" a)))
     (serious-condition () "inbound")))
 
-(defun accept-peer (socket &key (services (logior w:+services-network+ w:+services-witness+))
+(defun accept-peer (socket &key (services *advertised-services*)
                                 (start-height 0) (verbose nil))
   "Wrap an ACCEPTED inbound TCP SOCKET as a live peer: complete the version/verack
    handshake in INBOUND order (read THEIR version first, then send ours advertising
@@ -361,7 +365,7 @@
   p)
 
 (defun accept-peer-stream (stream &key (host "onion") (port 0) closer
-                                       (services (logior w:+services-network+ w:+services-witness+))
+                                       (services *advertised-services*)
                                        (start-height 0) (verbose nil))
   "Like ACCEPT-PEER but over an already-open binary STREAM (an inbound Tor rendezvous
    stream) rather than a TCP socket.  CLOSER tears the connection down on disconnect.
@@ -451,7 +455,7 @@
         (w:w-varint wr (length addr)) (w:w-bytes wr addr) (w:w-port-be wr port)))))
 
 (defun onion-addrv2-entry (onion port &optional
-                                       (services (logior w:+services-network+ w:+services-witness+)))
+                                       (services *advertised-services*))
   "An addrv2 entry advertising ONION:PORT (Tor v3: netID 4, 32-byte Ed25519 pubkey)."
   (list services +netid-tor-v3+ (onion:onion->pubkey onion) port))
 
