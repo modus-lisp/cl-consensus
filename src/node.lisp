@@ -24,7 +24,7 @@
                     (#:ht #:hunchentoot)
                     (#:jzon #:com.inuoe.jzon) (#:bt #:bordeaux-threads))
   (:export #:start #:stop #:reload! #:*rpc-port* #:*control-port* #:rpc-call
-           #:serve-node #:*utxo* #:*mempool* #:*onion-service-hook*))
+           #:serve-node #:*utxo* #:*mempool* #:*onion-service-hook* #:live-peers))
 
 (in-package #:cl-consensus.node)
 
@@ -590,6 +590,15 @@
     (setf *extra-peers* (remove-if-not #'p:peer-alive-p *extra-peers*))
     (copy-list *extra-peers*)))
 
+(defun live-peers ()
+  "All currently-live peers: the primary follow peer, discovered outbound peers, and
+   accepted inbound peers.  Used to gossip our own address (self-advertisement)."
+  (remove-duplicates
+   (remove-if-not #'p:peer-alive-p
+                  (append (when *peer* (list *peer*))
+                          (extra-peers)
+                          (copy-list s:*inbound-peers*)))))   ; snapshot; a transient race is harmless
+
 (defvar *tor-dir-path* nil
   "File to persist the Tor v3 .onion peer directory to (NIL = don't persist).")
 
@@ -940,6 +949,7 @@
           (let ((addr (funcall *onion-service-hook*
                                :key-path (namestring (merge-pathnames "onion-service-key.dat"
                                                                       (pathname block-store)))
+                               :port listen-port
                                :start-height (c:tip-height) :max-peers max-peers)))
             (format t "~&[node] onion service enabled: ~a~%" addr) (force-output))))
       ;; keep a pool of diverse outbound peers alive alongside the primary follow

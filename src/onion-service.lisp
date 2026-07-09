@@ -50,16 +50,34 @@
       (serious-condition (e)
         (format t "~&[onion] inbound handshake failed: ~a~%" e) (force-output)))))
 
-(defun start-onion-service (&key key-path (start-height 0) (num-intros 3)
-                                 (max-peers 64) (republish 5400))
+(defun %announce-loop (onion port interval)
+  "Periodically gossip our own .onion as a BIP155 addrv2 to every live peer, so they
+   add it to their address db and RELAY it — this is how the network learns to reach us."
+  (loop
+    (sleep interval)
+    (handler-case
+        (let ((peers (remove-if-not #'p:peer-wants-addrv2 (cl-consensus.node:live-peers)))
+              (entries (list (p:onion-addrv2-entry onion port))))
+          (dolist (pr peers) (p:announce-address pr entries))
+          (when peers
+            (format t "~&[onion] advertised ~a:~d to ~d peers~%" onion port (length peers))
+            (force-output)))
+      (serious-condition () nil))))
+
+(defun start-onion-service (&key key-path (start-height 0) (num-intros 3) (port 8333)
+                                 (max-peers 64) (republish 5400) (announce-interval 900))
   "Publish an onion service for this node and serve inbound Tor peers into the node's
    inbound set.  KEY-PATH persists the identity (stable .onion across restarts).
-   Re-publishes every REPUBLISH seconds (descriptors expire).  Returns the .onion."
+   Re-publishes every REPUBLISH seconds, and self-advertises our .onion (addrv2) to
+   peers every ANNOUNCE-INTERVAL seconds so the network learns to dial us.  Returns
+   the .onion."
   (let* ((id (%load-or-create-identity key-path))
          (onion (hsdir:pubkey->onion (svc:hs-identity-pubkey id)))
          (handler (%inbound-handler start-height max-peers)))
     (setf *onion-address* onion)
     (format t "~&[onion] service address: ~a~%" onion) (force-output)
+    (bt:make-thread (lambda () (%announce-loop onion port announce-interval))
+                    :name "onion-advertise")
     (setf *onion-service-thread*
           (bt:make-thread
            (lambda ()
