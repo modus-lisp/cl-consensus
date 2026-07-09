@@ -553,6 +553,24 @@
     (bt:with-lock-held (s:*relay-lock*)
       (mp:mempool-on-block s:*mempool* (coerce (blk:block-txs block) 'list)))))
 
+(defvar *prune-window* nil
+  "Pruned mode: when set to N, keep only the last N blocks in the block store; older
+   blocks are compacted away (reclaiming disk).  NIL = archive everything.")
+
+(defun %prune-store-window ()
+  "In pruned mode, compact the block store down to the last *PRUNE-WINDOW* main-chain
+   blocks (with a small margin so it runs at most every ~64 blocks, not every batch)."
+  (when (and *prune-window* s:*block-store*
+             (> (bs:block-store-count s:*block-store*) (+ *prune-window* 64)))
+    (let ((keep (loop with tip = (c:tip-height)
+                      for h from (max 0 (- tip (1- *prune-window*))) to tip
+                      for hdr = (c:header-at-height h)
+                      when hdr collect (c:header-hash-hex hdr))))
+      (multiple-value-bind (kept pruned) (bs:prune-to s:*block-store* keep)
+        (when (plusp pruned)
+          (format t "~&[prune] block store compacted: kept ~d, pruned ~d~%" kept pruned)
+          (force-output))))))
+
 (defun %connect-new-blocks (peer utxo undo committed)
   "Fetch + connect every block from COMMITTED+1 to the header tip into UTXO, recording
    undo, storing the raw bytes, dropping confirmed mempool txs, and announcing each to
@@ -571,6 +589,7 @@
         (s:announce-block hdr)
         (setf committed h)
         (format t "~&[node] connected + served block ~d~%" h) (force-output)))
+    (%prune-store-window)                  ; pruned mode: keep the store to its window
     committed))
 
 ;;; ----------------------------------------------------------------------------
@@ -904,14 +923,21 @@
                         (onion-service nil)
                         (listen-port (w:net-port w:*network*)) (rpc-port *rpc-port*)
                         (max-peers 64) (poll 30) (discover 8)
-                        (archive nil) (archive-peers 16)
+                        (archive nil) (archive-peers 16) (prune nil)
                         (mempool-path (namestring (merge-pathnames ".cl-consensus/mempool.dat"
                                                                    (user-homedir-pathname)))))
   "THE consolidated node: own the pagetree UTXO (single writer), validate new blocks to
    the tip (reorg-aware), and SERVE headers/blocks + RELAY txs to inbound peers with a
    tip-current UTXO + mempool, plus JSON-RPC + the control socket.  Replaces the
-   keep-current poll AND the header-only serve-daemon.  Blocks forever."
+   keep-current poll AND the header-only serve-daemon.  Blocks forever.  PRUNE (an
+   integer, or T for the 288-block default) runs pruned: keep only the last N blocks in
+   the store, don't archive, and advertise NODE_NETWORK_LIMITED."
   (setf *rpc-port* rpc-port *start-time* (get-universal-time))
+  ;; pruned mode: bound the block store + advertise limited service (implies no archive)
+  (when prune
+    (setf *prune-window* (if (integerp prune) prune 288)
+          p:*advertised-services* (logior w:+services-network-limited+ w:+services-witness+)
+          archive nil))
   (ensure-directories-exist store)              ; create the data dir for a fresh node
   (c:init-chain) (c:load-headers)
   (let* ((peers (loop repeat conns collect (p:connect-peer peer-host :start-height (c:tip-height))))

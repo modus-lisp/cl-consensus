@@ -31,7 +31,7 @@
    #:*network* #:select-network #:net-name #:net-magic #:net-port
    #:net-default-version #:net-genesis-hash
    #:net-genesis-hex #:net-pow-limit-bits #:net-no-retarget #:net-heights
-   #:+services-none+ #:+services-network+ #:+services-witness+))
+   #:+services-none+ #:+services-network+ #:+services-witness+ #:+services-network-limited+))
 
 (in-package #:cl-consensus.wire)
 
@@ -140,8 +140,9 @@
 
 ;;; service bit flags (uint64)
 (defconstant +services-none+    0)
-(defconstant +services-network+ 1)       ; NODE_NETWORK
+(defconstant +services-network+ 1)       ; NODE_NETWORK (serves the whole chain)
 (defconstant +services-witness+ #x08)    ; NODE_WITNESS
+(defconstant +services-network-limited+ #x400)  ; NODE_NETWORK_LIMITED (BIP159): last ~288 blocks
 
 ;;; ----------------------------------------------------------------------------
 ;;; Writer — accumulates little-endian bytes into an adjustable vector
