@@ -51,10 +51,11 @@
         (format t "~&[onion] inbound handshake failed: ~a~%" e) (force-output)))))
 
 (defun %announce-loop (onion port interval)
-  "Periodically gossip our own .onion as a BIP155 addrv2 to every live peer, so they
-   add it to their address db and RELAY it — this is how the network learns to reach us."
+  "Gossip our own .onion as a BIP155 addrv2 to every live peer, so they add it to their
+   address db and RELAY it — this is how the network learns to reach us.  Announces
+   shortly after startup (once peers are up), then every INTERVAL seconds."
+  (sleep 60)                              ; let the initial peers connect first
   (loop
-    (sleep interval)
     (handler-case
         (let ((peers (remove-if-not #'p:peer-wants-addrv2 (cl-consensus.node:live-peers)))
               (entries (list (p:onion-addrv2-entry onion port))))
@@ -62,7 +63,8 @@
           (when peers
             (format t "~&[onion] advertised ~a:~d to ~d peers~%" onion port (length peers))
             (force-output)))
-      (serious-condition () nil))))
+      (serious-condition () nil))
+    (sleep interval)))
 
 (defun start-onion-service (&key key-path (start-height 0) (num-intros 3) (port 8333)
                                  (max-peers 64) (republish 5400) (announce-interval 900))
