@@ -244,11 +244,13 @@
 (defun register-inbound-peer (pr &key (max-peers 64))
   "Install serving handlers on an already-handshaked inbound peer PR and track it in
    *INBOUND-PEERS* (up to MAX-PEERS).  Returns T if accepted, NIL at the cap.  Used by
-   both the TCP listener and the onion-service inbound bridge."
-  (cond ((>= (%reap-inbound) max-peers) nil)
-        (t (install-serving-handlers pr)
-           (bt:with-lock-held (*inbound-lock*) (push pr *inbound-peers*))
-           t)))
+   both the TCP listener and the onion-service inbound bridge.  The cap check and the
+   push are done under one lock so concurrent registrations can't overshoot it."
+  (install-serving-handlers pr)
+  (bt:with-lock-held (*inbound-lock*)
+    (setf *inbound-peers* (remove-if-not #'p:peer-alive-p *inbound-peers*))
+    (cond ((>= (length *inbound-peers*) max-peers) nil)
+          (t (push pr *inbound-peers*) t))))
 
 (defun start-listener (&key (port (w:net-port w:*network*)) (host "0.0.0.0") (max-peers 64))
   "Accept inbound P2P connections in a background thread: handshake each (advertising

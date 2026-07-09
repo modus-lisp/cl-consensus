@@ -364,7 +364,9 @@
                                        (services (logior w:+services-network+ w:+services-witness+))
                                        (start-height 0) (verbose nil))
   "Like ACCEPT-PEER but over an already-open binary STREAM (an inbound Tor rendezvous
-   stream) rather than a TCP socket.  CLOSER tears the connection down on disconnect."
+   stream) rather than a TCP socket.  CLOSER tears the connection down on disconnect.
+   Call from a long-lived thread: the peer read-loop it spawns dies if its creating
+   thread exits (the onion bridge calls it from cl-tor's persistent intro thread)."
   (let ((p (make-peer :host host :port port :stream stream :closer closer :verbose verbose
                       :connected-at (get-universal-time))))
     (%inbound-handshake p services start-height)

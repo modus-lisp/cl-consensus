@@ -36,19 +36,31 @@
 
 (defun %inbound-handler (start-height max-peers)
   "A RUN-SERVICE handler: turn one connected rendezvous (circ . sid) into an inbound
-   peer — gray-stream wrap, INBOUND handshake, install serving handlers, track it."
+   peer — gray-stream wrap, INBOUND handshake, install serving handlers, track it.
+   The handshake runs in its OWN thread (a stalled/malformed peer must not wedge
+   cl-tor's intro serve-loop) with a deadline, and the stream (hence circuit) is
+   ALWAYS torn down on failure — otherwise a bad inbound handshake leaks a circuit+fd."
+  ;; Runs on cl-tor's per-intro serve thread, which lives for the whole service — so
+  ;; the gray-stream reader + peer read-loop it spawns keep a stable owner (the SBCL
+  ;; rule: a socket/reader created in a thread that then exits is torn down with it,
+  ;; which is why dispatching the handshake to an ephemeral thread breaks the
+  ;; connection).  We instead BOUND the handshake with a deadline so a stalled peer
+  ;; only briefly delays the next introduction rather than wedging it, and always tear
+  ;; the rendezvous circuit down when the handshake fails (else it leaks a circuit+fd).
   (lambda (circ sid)
-    (handler-case
-        (let* ((stream (gs:make-tor-stream circ sid))
-               (pr (p:accept-peer-stream stream :host "onion-inbound"
-                                         :closer (lambda () (ignore-errors (close stream)))
-                                         :start-height start-height)))
-          (if (s:register-inbound-peer pr :max-peers max-peers)
-              (progn (format t "~&[onion] inbound peer up: ~a (height ~a)~%"
-                             (p:peer-subver pr) (p:peer-height pr)) (force-output))
-              (ignore-errors (p:disconnect pr))))             ; at cap
-      (serious-condition (e)
-        (format t "~&[onion] inbound handshake failed: ~a~%" e) (force-output)))))
+    (let ((stream (gs:make-tor-stream circ sid)))
+      (handler-case
+          (let ((pr (sb-ext:with-timeout 30
+                      (p:accept-peer-stream stream :host "onion-inbound"
+                                            :closer (lambda () (ignore-errors (close stream)))
+                                            :start-height start-height))))
+            (if (s:register-inbound-peer pr :max-peers max-peers)
+                (progn (format t "~&[onion] inbound peer up: ~a (height ~a)~%"
+                               (p:peer-subver pr) (p:peer-height pr)) (force-output))
+                (ignore-errors (p:disconnect pr))))         ; at cap
+        (serious-condition (e)
+          (ignore-errors (close stream))    ; tear the rendezvous circuit + link down
+          (format t "~&[onion] inbound handshake failed: ~a~%" e) (force-output))))))
 
 (defun %announce-loop (onion port interval)
   "Gossip our own .onion as a BIP155 addrv2 to every live peer, so they add it to their
@@ -83,16 +95,23 @@
     (setf *onion-service-thread*
           (bt:make-thread
            (lambda ()
-             (loop
-               (handler-case
-                   (multiple-value-bind (service accepted)
-                       (host:run-service id handler :num-intros num-intros)
-                     (declare (ignore service))
-                     (format t "~&[onion] published descriptor to ~d HSDirs (~a)~%"
-                             accepted onion) (force-output))
-                 (serious-condition (e)
-                   (format t "~&[onion] publish failed: ~a~%" e) (force-output)))
-               (sleep republish)))
+             ;; Establish intro points ONCE, then just re-upload the descriptor each
+             ;; cycle (reusing those intros) — re-running the whole service would leak
+             ;; a fresh set of intro circuits + threads every REPUBLISH.
+             (let ((service nil))
+               (loop
+                 (handler-case
+                     (let ((accepted (if service
+                                         (host:republish-service service)
+                                         (multiple-value-bind (s a)
+                                             (host:run-service id handler :num-intros num-intros)
+                                           (setf service s) a))))
+                       (format t "~&[onion] published descriptor to ~d HSDirs (~a)~%"
+                               accepted onion) (force-output))
+                   (serious-condition (e)
+                     (format t "~&[onion] publish failed: ~a~%" e) (force-output)
+                     (setf service nil)))     ; force a fresh run-service next cycle on failure
+                 (sleep republish))))
            :name "onion-service"))
     onion))
 
