@@ -12,7 +12,7 @@
   (:local-nicknames (#:w #:cl-consensus.wire) (#:wal #:cl-consensus.wallet)
                     (#:ic #:ironclad))
   (:export
-   #:*wordlist* #:mnemonic-from-entropy #:mnemonic->seed
+   #:*wordlist* #:mnemonic-from-entropy #:mnemonic->entropy #:mnemonic->seed
    #:validate-mnemonic #:make-wallet-from-mnemonic
    #:generate-entropy #:generate-mnemonic #:generate-wallet))
 
@@ -103,6 +103,14 @@
                        (want (entropy->checksum-bits entropy))
                        (got (subseq bits ent-len)))
                   (equal want got)))))))
+
+(defun mnemonic->entropy (mnemonic)
+  "The raw BIP39 entropy bytes of MNEMONIC (checksum stripped).  Signals if MNEMONIC is
+   malformed or its checksum does not recompute — the inverse of MNEMONIC-FROM-ENTROPY."
+  (unless (validate-mnemonic mnemonic) (error "bip39: invalid mnemonic"))
+  (let* ((ent-bits (* (length (split-words mnemonic)) 11))
+         (ent-len (- ent-bits (/ ent-bits 33))))
+    (bits->bytes (subseq (mnemonic->bits mnemonic) 0 ent-len))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; mnemonic -> 512-bit seed (PBKDF2-HMAC-SHA512, 2048 iterations)

@@ -19,6 +19,7 @@ export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$ROOT\") (:tree \"$ROOT/..
 
 GATES=(
   bip39-test            # BIP39 mnemonics (vs Trezor vectors)
+  slip39-test           # Shamir + SLIP-0039 backup (vs 45 official vectors)
   wallet-test           # encodings + BIP32 + watch/balance + build/sign/verify
   wallet-store-test     # wallet persistence (incl. encrypted)
   rpc-wallet-test       # wallet-backed JSON-RPC
