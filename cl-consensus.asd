@@ -40,6 +40,9 @@
      (:file "wallet")      ; HD wallet: addresses, watch/balance, build+sign+broadcast
      (:file "bip39")       ; BIP39 mnemonic seed phrases (entropy<->words, seed)
      (:file "bip39-wordlist") ; canonical 2048-word English list (order matters)
+     (:file "shamir")      ; Shamir secret sharing over GF(2^8) (SLIP-0039 field)
+     (:file "slip39-wordlist") ; canonical 1024-word SLIP-0039 list (order matters)
+     (:file "slip39")      ; SLIP-0039 Shamir backup: split/recover a seed as word mnemonics
      (:file "wallet-store")   ; persist/restore a wallet (seed + tracked coins)
      (:file "rpc-wallet")     ; wallet-backed JSON-RPC (getnewaddress/sendtoaddress/...)
      (:file "taproot-script")))))  ; BIP341 taproot script-path spend construction

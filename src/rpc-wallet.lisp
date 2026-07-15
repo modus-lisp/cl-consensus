@@ -22,7 +22,8 @@
   (:use #:cl)
   (:local-nicknames (#:node #:cl-consensus.node) (#:w #:cl-consensus.wire)
                     (#:tx #:cl-consensus.tx) (#:c #:cl-consensus.chain)
-                    (#:mp #:cl-consensus.mempool) (#:wal #:cl-consensus.wallet))
+                    (#:mp #:cl-consensus.mempool) (#:wal #:cl-consensus.wallet)
+                    (#:b39 #:cl-consensus.bip39) (#:sl #:cl-consensus.slip39))
   (:export #:*wallet* #:register-wallet-methods))
 
 (in-package #:cl-consensus.rpc-wallet)
@@ -100,6 +101,39 @@
          "next_receive_index" *receive-index*)))
 
 ;;; ----------------------------------------------------------------------------
+;;; SLIP-0039 Shamir backup of the seed phrase (stateless — operates on the phrase
+;;; you pass, not the loaded wallet, so an air-gapped node can split/recover secrets).
+;;; ----------------------------------------------------------------------------
+
+(defun %parse-groups (spec)
+  "JSON [[mt,mc],...] -> a list of (member-threshold . member-count)."
+  (map 'list (lambda (p) (cons (elt p 0) (elt p 1))) spec))
+
+(defun m-slip39backup (mnemonic group-threshold groups &optional (passphrase "") (ext t) &rest _)
+  "Split a BIP39 seed phrase MNEMONIC into SLIP-0039 shares.  GROUPS is a JSON array of
+   [member_threshold, member_count] pairs; any GROUP-THRESHOLD groups (each satisfied by
+   its own member threshold) and the same PASSPHRASE recover the phrase.  Returns an array
+   of {group_index, member_threshold, mnemonics:[...]}."
+  (declare (ignore _))
+  (let* ((entropy (b39:mnemonic->entropy mnemonic))
+         (glist (%parse-groups groups))
+         (shares (sl:generate-mnemonics group-threshold glist entropy
+                                        :passphrase (or passphrase "")
+                                        :ext (if (or (null ext) (eql ext 0) (eq ext 'null)) 0 1))))
+    (coerce (loop for g in shares for gi from 0 for (mt . nil) in glist
+                  collect (obj "group_index" gi "member_threshold" mt
+                               "mnemonics" (coerce g 'vector)))
+            'vector)))
+
+(defun m-slip39restore (mnemonics &optional (passphrase "") &rest _)
+  "Recover a BIP39 seed phrase from SLIP-0039 share MNEMONICS (a JSON array of strings).
+   Returns {bip39_mnemonic, entropy}."
+  (declare (ignore _))
+  (let* ((entropy (sl:combine-mnemonics (coerce mnemonics 'list) :passphrase (or passphrase "")))
+         (mnemonic (b39:mnemonic-from-entropy entropy)))
+    (obj "bip39_mnemonic" mnemonic "entropy" (w:bytes->hex entropy))))
+
+;;; ----------------------------------------------------------------------------
 ;;; Registration — splice these into the node's dispatch table
 ;;; ----------------------------------------------------------------------------
 
@@ -109,7 +143,9 @@
                ("getbalance"    m-getbalance)
                ("listunspent"   m-listunspent)
                ("sendtoaddress" m-sendtoaddress)
-               ("getwalletinfo" m-getwalletinfo)))
+               ("getwalletinfo" m-getwalletinfo)
+               ("slip39backup"  m-slip39backup)
+               ("slip39restore" m-slip39restore)))
     (setf (gethash (first m) (symbol-value 'node::*methods*))
           (symbol-function (find-symbol (string (second m)) '#:cl-consensus.rpc-wallet)))))
 
