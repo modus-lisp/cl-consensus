@@ -28,7 +28,7 @@
 
 (require :asdf)
 ;; cl-consensus + its deps (pagetree, secp256k1-fast) are on the asdf
-;; source-registry tree under /home/claude/; just load the system.
+;; source-registry tree for this workspace; just load the system.
 (asdf:load-system "cl-consensus")
 
 (defpackage #:pt-ibd

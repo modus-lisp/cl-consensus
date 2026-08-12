@@ -11,11 +11,13 @@
 ;;;;   sbcl --non-interactive --load inspect/taproot-script-test.lisp \
 ;;;;        --eval '(taproot-script-test:run)'
 (require :asdf)
-;; NB: register THIS worktree's repo root (run pwd), not /home/claude/cl-consensus.
+;; NB: register THIS worktree's repo root (run pwd), not the canonical checkout.
 (pushnew (truename (merge-pathnames "../" (directory-namestring *load-pathname*)))
          asdf:*central-registry* :test #'equal)
-(pushnew #p"/home/claude/secp256k1-fast/" asdf:*central-registry* :test #'equal)
-(pushnew #p"/home/claude/pagetree/" asdf:*central-registry* :test #'equal)
+;; Sibling repos, found relative to this file so the workspace can live anywhere.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here)) :inherit-configuration)))
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-consensus"))
 
 (defpackage :taproot-script-test

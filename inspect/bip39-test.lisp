@@ -6,8 +6,10 @@
 ;;;;
 ;;;;   sbcl --non-interactive --load inspect/bip39-test.lisp --eval '(bip39-test:run)'
 (require :asdf)
-(pushnew #p"/home/claude/pagetree/" asdf:*central-registry* :test #'equal)
-(pushnew #p"/home/claude/secp256k1-fast/" asdf:*central-registry* :test #'equal)
+;; Sibling repos, found relative to this file so the workspace can live anywhere.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here)) :inherit-configuration)))
 ;; This worktree's repo root (the checkout these edits live in), discovered at load
 ;; time so the gate tests the code right here rather than another checkout.
 (let* ((here (or *load-truename* *default-pathname-defaults*))

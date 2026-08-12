@@ -9,11 +9,13 @@
 ;;;;
 ;;;;   sbcl --non-interactive --load inspect/rpc-wallet-test.lisp --eval '(rpc-wallet-test:run)'
 (require :asdf)
-;; THIS worktree's repo root (NOT the canonical /home/claude/cl-consensus), so we
+;; THIS worktree's repo root (NOT the canonical cl-consensus checkout), so we
 ;; load the code under test, plus the sibling deps.
 (pushnew (truename #p"./") asdf:*central-registry* :test #'equal)
-(pushnew #p"/home/claude/secp256k1-fast/" asdf:*central-registry* :test #'equal)
-(pushnew #p"/home/claude/pagetree/" asdf:*central-registry* :test #'equal)
+;; Sibling repos, found relative to this file so the workspace can live anywhere.
+(asdf:initialize-source-registry
+ (let ((here (make-pathname :name nil :type nil :defaults *load-truename*)))
+   `(:source-registry (:tree ,(merge-pathnames "../../" here)) :inherit-configuration)))
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-consensus"))
 
 (defpackage :rpc-wallet-test
