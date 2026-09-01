@@ -195,9 +195,27 @@ all and exits non-zero on any failure.
 | `rpc-wallet-test` | wallet JSON-RPC (getnewaddress/getbalance/listunspent/sendtoaddress/…) |
 | `mempool-test` | relay policy, BIP125 RBF, package links, eviction, expiry, on-block, persistence |
 | `blockstore-test` | append-only block store round-trip + torn-tail recovery |
+| `signet-test` | BIP325: the P2P magic derives to the public signet's published `0a03cf40`; 9 real blocks from the private devnet verify under their own challenge, verify under **no other** challenge, and are rejected once the signature is stripped |
 | `serve-test` / `relay-test` / `tx-relay-test` | inbound handshake; serve headers/blocks; relay blocks (BIP130/inv) + txs + orphans (loopback) |
 | `reorg-equiv` | a reorg's UTXO is digest-identical to a fresh build of the winning branch |
 | `regtest-test` | real-mined: regtest genesis + nonce-grinding, mine → fund → spend → mine → confirm, and a real-mined reorg |
+
+**Two consensus bugs this found.** Bringing up a real private signet — a chain that
+starts at height 1 with BIP34 already active — exposed that `bip34-height-ok` only
+accepted a *pushdata* encoding of the height. Core builds the expected prefix with
+`CScript() << nHeight`, which emits `OP_1`..`OP_16` for heights 1–16, so our block 1
+(`51 00`) was rejected. Mainnet activates BIP34 at height 227931, so no height small
+enough to be affected is ever reached under the rule and the reader looked correct
+forever. Fixing it then exposed the mirror-image bug in `inspect/regtest-test.lisp`'s
+miner, which hand-rolled `01 <height>` and so produced coinbases our own (lax)
+validator accepted and **Core would have rejected**. Both are fixed; the encoder is
+now shared between the two.
+
+The signet gate's negative cases carry the weight: signet's proof-of-work is
+trivial by design, so accepting a block under the wrong challenge — or one with no
+signature at all — would mean the chain is secured by nothing. BIP325 reduces to an
+ordinary script verification of a synthetic `to_sign`/`to_spend` pair, so it is
+checked by the same interpreter that is differential-tested to 0 divergence vs Core.
 
 A signed spend (wallet, taproot script-path) is "verified" by passing our own
 `verify-input` — which is itself differential-tested to 0 divergence vs Core — so a

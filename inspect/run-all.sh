@@ -26,6 +26,7 @@ GATES=(
   taproot-script-test   # BIP341 taproot script-path spends
   mempool-test          # policy + RBF + eviction + on-block + persistence
   blockstore-test       # append-only block store + torn-tail recovery
+  signet-test           # BIP325 signet block signatures (vs real devnet blocks)
   serve-test            # inbound handshake + serve headers/blocks
   relay-test            # block relay (inv + BIP130 headers announce)
   tx-relay-test         # tx relay (accept + inv + serve + orphans)

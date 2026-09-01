@@ -35,6 +35,24 @@
               ((and tp (string-equal tp "socks5")) :socks5)
               (t :direct))))
 
+;; NETWORK picks the chain: mainnet (default) | testnet | regtest | signet.
+;;
+;; SIGNET_CHALLENGE selects a PRIVATE signet — pass the `signetchallenge=` value
+;; from that chain's bitcoin.conf.  Everything else follows from it: the P2P magic
+;; is derived from the challenge, so this node can only handshake with peers on the
+;; same signet, and BIP325 validation checks every block's coinbase signature
+;; against it.  That check is not optional there — signet's proof-of-work is
+;; trivial by design, so the signature is what actually secures the chain.
+(let ((net (sb-ext:posix-getenv "NETWORK"))
+      (challenge (sb-ext:posix-getenv "SIGNET_CHALLENGE")))
+  (cond ((and challenge (string/= challenge ""))
+         (cl-consensus.wire:select-signet challenge))
+        ((and net (string/= net ""))
+         (cl-consensus.wire:select-network (intern (string-upcase net) :keyword)))))
+(format t "~&[cl-consensus] network ~(~a~), p2p port ~d~%"
+        (cl-consensus.wire:net-name cl-consensus.wire:*network*)
+        (cl-consensus.wire:net-port cl-consensus.wire:*network*))
+
 ;; GC more often (1 GB) so transient flush-churn doesn't spike to OOM before a collect.
 (setf (sb-ext:bytes-consed-between-gcs) (* 1 1024 1024 1024))
 
@@ -45,7 +63,7 @@
   :peer-host     (%env "SERVE_PEER" "127.0.0.1")
   :conns         (%env-int "CONNS" 2)
   :cache-gb      (%env-int "PT_CACHE_GB" 8)
-  :listen-port   (%env-int "SERVE_PORT" 8333)
+  :listen-port   (%env-int "SERVE_PORT" (cl-consensus.wire:net-port cl-consensus.wire:*network*))
   :rpc-port      (%env-int "RPC_PORT" 8432)
   :archive       (%env-flag "ARCHIVE")
   :archive-peers (%env-int "ARCHIVE_PEERS" 16)

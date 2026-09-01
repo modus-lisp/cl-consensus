@@ -18,14 +18,14 @@
   (:local-nicknames (#:w #:cl-consensus.wire) (#:p #:cl-consensus.peer)
                     (#:c #:cl-consensus.chain) (#:tx #:cl-consensus.tx)
                     (#:blk #:cl-consensus.block) (#:s #:cl-consensus.script)
-                    (#:u #:cl-consensus.utxo)
+                    (#:u #:cl-consensus.utxo) (#:sig #:cl-consensus.signet)
                     (#:bt #:bordeaux-threads) (#:secp #:secp256k1-fast))
   (:export
    #:block-subsidy #:connect-block #:disconnect-block #:consensus-error
    #:run-ibd #:resume-ibd #:run-ibd-async #:chainstate-path #:consensus-flags
    #:*verify-workers*
    #:block-undo #:make-block-undo #:block-undo-spent #:block-undo-created
-   #:block-weight #:count-sigops
+   #:block-weight #:count-sigops #:bip34-expected-prefix #:bip34-height-ok
    #:+bip16-height+ #:+segwit-height+ #:+taproot-height+ #:+bip34-height+
    #:*coinbase-maturity* #:*max-block-weight* #:*max-block-sigops*))
 
@@ -590,6 +590,12 @@
    it parallelizes across a download batch.  Signals CONSENSUS-ERROR on failure."
   (unless (blk:verify-merkle block) (cerr height "merkle root mismatch"))
   (check-witness-commitment block height)
+  ;; BIP325.  A no-op off signet.  On signet this is THE rule that secures the
+  ;; chain — its proof-of-work is trivial by design, so a validator that checks
+  ;; the work and skips the signature is validating nothing at all.
+  (when (w:signet-p)
+    (handler-case (sig:check-signet-block-solution block)
+      (error (e) (cerr height "~a" e))))
   (let ((wt (block-weight block)))
     (when (> wt *max-block-weight*) (cerr height "block weight ~d exceeds ~d" wt *max-block-weight*)))
   (let ((so (count-sigops block)))
@@ -733,13 +739,43 @@
 ;;; BIP34 — coinbase scriptSig begins with a push of the block height
 ;;; ----------------------------------------------------------------------------
 
+(defun script-num-bytes (n)
+  "CScriptNum::serialize — minimal little-endian, with a 0x00 appended when the
+   top byte would otherwise read as the sign bit.  N is a block height here, so
+   always positive."
+  (if (zerop n)
+      (coerce #() '(vector (unsigned-byte 8)))
+      (let ((out '()))
+        (loop for v = n then (ash v -8)
+              while (plusp v)
+              do (push (logand v #xff) out))
+        (setf out (nreverse out))
+        (when (logtest (car (last out)) #x80)
+          (setf out (append out (list 0))))
+        (coerce out '(vector (unsigned-byte 8))))))
+
+(defun bip34-expected-prefix (height)
+  "The bytes Core builds with `CScript() << nHeight` — what a BIP34 coinbase
+   scriptSig must begin with.
+
+   The small-integer case is the one that matters and the easiest to miss:
+   heights 1..16 serialize as the single opcodes OP_1..OP_16, NOT as a one-byte
+   push.  On mainnet BIP34 activates at height 227931, so a pushdata-only reader
+   never meets a height small enough to be affected and looks correct forever.
+   On regtest and signet the rule is active from height 1, where the coinbase
+   scriptSig begins with a bare OP_1."
+  (cond ((zerop height) (coerce #(0) '(vector (unsigned-byte 8))))      ; OP_0
+        ((<= 1 height 16)
+         (coerce (vector (+ #x50 height)) '(vector (unsigned-byte 8)))) ; OP_1..OP_16
+        (t (let ((b (script-num-bytes height)))
+             (concatenate '(vector (unsigned-byte 8)) (vector (length b)) b)))))
+
 (defun bip34-height-ok (scriptsig height)
-  (and (plusp (length scriptsig))
-       (let* ((n (aref scriptsig 0)))
-         (and (<= 1 n 8) (<= (1+ n) (length scriptsig))
-              (let ((v 0))
-                (dotimes (i n) (setf v (logior v (ash (aref scriptsig (1+ i)) (* 8 i)))))
-                (= v height))))))
+  "BIP34: the coinbase scriptSig must BEGIN WITH the serialized height.  Core
+   compares a prefix, so whatever extranonce the miner appends is fine."
+  (let ((expect (bip34-expected-prefix height)))
+    (and (>= (length scriptsig) (length expect))
+         (equalp (subseq scriptsig 0 (length expect)) expect))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; disconnect-block — reverse a block's effect on the UTXO set (reorg support)

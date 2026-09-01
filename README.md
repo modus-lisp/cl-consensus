@@ -54,6 +54,11 @@ variable-time. No warranty of any kind (see [LICENSE](LICENSE)).
 - **Node** — a consolidated **single-writer** daemon that validates each block to the
   tip (reorg-aware) while serving + relaying with a tip-current UTXO + mempool;
   bitcoind-compatible JSON-RPC (incl. wallet methods), control socket, live follow.
+- **Networks** — mainnet, testnet, regtest, and **signet incl. BIP325**: signet's
+  proof-of-work is trivial by design, so blocks are secured by a signature in the
+  coinbase that must satisfy the network's challenge script. `select-signet`
+  takes any challenge and derives the P2P magic from it, so a **private** signet —
+  your own chain, whose blocks only you can sign — is a one-line configuration.
 - **Regtest** — a real harness: select the regtest network, **mine** blocks (real
   nonce-grinding), and drive the full loop — mine → fund a wallet → build a spend →
   accept to the mempool → mine it into a block → confirm — plus real-mined reorgs.
@@ -70,6 +75,7 @@ src/
   wire tx peer chain     P2P, serialization, header chain
   utxo block script      UTXO set, block/merkle, the Script interpreter + sighash
   validate reorg         connect/disconnect-block, IBD, best-chain activation
+  signet                 BIP325 signet block signatures (the rule securing signet)
   mempool serve node     relay-policy mempool, serve/relay layer, the daemon
   encoding bip32 bip39    base58check/bech32(m), HD derivation, mnemonics
   wallet wallet-store     HD wallet (addresses/balance/spend) + (encrypted) persistence

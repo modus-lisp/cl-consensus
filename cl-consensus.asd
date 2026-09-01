@@ -31,6 +31,7 @@
      (:file "block")       ; block parse, merkle root, block download
      (:file "blockstore")  ; append-only raw-block store (serve blocks we've fetched)
      (:file "script")      ; the Script interpreter + sighash (the consensus core)
+     (:file "signet")      ; BIP325 signet block signatures (the rule that secures signet)
      (:file "validate")    ; connect/disconnect-block, consensus rules, IBD
      (:file "reorg")       ; tip reorg / best-chain activation
      (:file "mempool")     ; mempool acceptance + relay policy (fee/dust/RBF/eviction)

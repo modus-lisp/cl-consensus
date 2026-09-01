@@ -31,6 +31,9 @@
    #:*network* #:select-network #:net-name #:net-magic #:net-port
    #:net-default-version #:net-genesis-hash
    #:net-genesis-hex #:net-pow-limit-bits #:net-no-retarget #:net-heights
+   ;; signet (BIP325)
+   #:net-signet-challenge #:select-signet #:signet-p #:make-signet
+   #:derive-signet-magic #:*default-signet-challenge*
    #:+services-none+ #:+services-network+ #:+services-witness+ #:+services-network-limited+))
 
 (in-package #:cl-consensus.wire)
@@ -80,7 +83,12 @@
   genesis-hex            ; the 80-byte genesis header, hex
   pow-limit-bits         ; compact nBits of the easiest allowed target
   (no-retarget nil)      ; t = difficulty never changes (regtest)
-  heights)               ; plist of soft-fork activation heights
+  heights                ; plist of soft-fork activation heights
+  ;; BIP325: on signet, blocks carry a signature in the coinbase that must
+  ;; satisfy this challenge script.  NIL on every other network.  Signet's
+  ;; proof-of-work is deliberately trivial, so this signature — not the work —
+  ;; is what actually secures the chain; see src/signet.lisp.
+  (signet-challenge nil))
 
 ;; mainnet genesis header (Jan 3 2009)
 (defparameter *mainnet-genesis-hex*
@@ -108,6 +116,66 @@
 (defparameter *early-heights*                  ; regtest/testnet: everything from block 1
   '(:p2sh 1 :dersig 1 :cltv 1 :csv 1 :bip34 1 :segwit 1 :taproot 1))
 
+;;; --- signet ------------------------------------------------------------------
+;;;
+;;; Signet's genesis block is the SAME on every signet — what makes two signets
+;;; different chains is the block-signing challenge, and the fact that the P2P
+;;; magic is DERIVED from it.  Two signets with different challenges therefore
+;;; can't even complete a handshake, let alone exchange blocks, which is what
+;;; keeps a private signet isolated without any extra configuration.
+
+(defparameter *signet-genesis-hex*
+  (concatenate 'string
+    "01000000" "0000000000000000000000000000000000000000000000000000000000000000"
+    "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
+    "008f4d5f" "ae77031e" "8ad22203"))                                ; time bits nonce
+
+(defparameter *signet-genesis-hash*
+  "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6")
+
+(defparameter *default-signet-challenge*
+  ;; The public signet's 1-of-2 multisig, from Core's chainparams.
+  (hex->bytes
+   (concatenate 'string
+     "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430"
+     "210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae")))
+
+(defun %compact-size (n)
+  "CompactSize prefix, written by hand: the WRITER isn't defined yet at this
+   point in the file, and the network table needs this to derive signet magic."
+  (cond ((< n #xfd) (vector n))
+        ((<= n #xffff) (vector #xfd (ldb (byte 8 0) n) (ldb (byte 8 8) n)))
+        ((<= n #xffffffff)
+         (vector #xfe (ldb (byte 8 0) n) (ldb (byte 8 8) n)
+                 (ldb (byte 8 16) n) (ldb (byte 8 24) n)))
+        (t (error "challenge too large"))))
+
+(defun derive-signet-magic (challenge)
+  "The signet P2P magic is the first 4 bytes of HASH256 of the challenge script,
+   serialized WITH its CompactSize length prefix (Core hashes the vector, and
+   serializing a byte vector writes that prefix — dropping it yields a magic that
+   looks plausible and matches nothing).  Returned in the same form as the other
+   networks' magic: a u32 whose little-endian serialization is the wire order."
+  (let* ((c (coerce challenge '(vector (unsigned-byte 8))))
+         (h (hash256 (concatenate '(vector (unsigned-byte 8)) (%compact-size (length c)) c))))
+    (logior (aref h 0) (ash (aref h 1) 8) (ash (aref h 2) 16) (ash (aref h 3) 24))))
+
+(defun make-signet (&key (challenge *default-signet-challenge*) (port 38333)
+                         (name :signet))
+  "A signet NET for CHALLENGE.  Every signet shares the genesis block, the
+   minimum-difficulty pow limit and always-active soft forks; only the challenge
+   (and therefore the magic) differs."
+  (let ((c (coerce challenge '(vector (unsigned-byte 8)))))
+    (make-net :name name
+              :magic (derive-signet-magic c)
+              :port port :default-version 70016
+              :genesis-hash *signet-genesis-hash*
+              :genesis-hex *signet-genesis-hex*
+              :pow-limit-bits #x1e0377ae
+              :no-retarget nil
+              :heights *early-heights*
+              :signet-challenge c)))
+
 (defparameter *networks*
   (list
    (make-net :name :mainnet
@@ -127,7 +195,9 @@
              :port 18444 :default-version 70016
              :genesis-hash "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
              :genesis-hex *regtest-genesis-hex* :pow-limit-bits #x207fffff
-             :no-retarget t :heights *early-heights*)))
+             :no-retarget t :heights *early-heights*)
+   ;; The public signet.  A private one is installed with SELECT-SIGNET.
+   (make-signet)))
 
 (defparameter *network* (first *networks*) "The active network (default mainnet).")
 
@@ -135,6 +205,20 @@
   (let ((n (find name *networks* :key #'net-name)))
     (unless n (error "unknown network ~s" name))
     (setf *network* n)))
+
+(defun select-signet (challenge &key (port 38333))
+  "Select a CUSTOM signet — a chain whose blocks only the holder of CHALLENGE's
+   key can produce.  CHALLENGE is the challenge script, as bytes or a hex string
+   (exactly what goes in bitcoin.conf's `signetchallenge=`).
+
+   Everything downstream follows from it: the P2P magic is derived, so this node
+   can only talk to peers on the same signet, and SIGNET-CHALLENGE is what
+   BIP325 block validation checks each block's coinbase signature against."
+  (let ((c (if (stringp challenge) (hex->bytes challenge) challenge)))
+    (setf *network* (make-signet :challenge c :port port))))
+
+(defun signet-p (&optional (net *network*))
+  (and (net-signet-challenge net) t))
 
 ;; Callers read params straight off the struct: (net-magic *network*), etc.
 

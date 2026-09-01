@@ -41,9 +41,18 @@
 (defun le-int (bytes) (loop for i below 32 sum (ash (aref bytes i) (* 8 i))))
 
 (defun bip34-scriptsig (height tag)
-  "Coinbase scriptSig: push the block height (BIP34, heights < 128) then a branch TAG
-   byte so coinbases on competing branches differ (distinct txids -> distinct blocks)."
-  (concatenate '(vector (unsigned-byte 8)) (vector 1 height 1 tag)))
+  "Coinbase scriptSig: the BIP34 height serialization, then a branch TAG byte so
+   coinbases on competing branches differ (distinct txids -> distinct blocks).
+
+   The height encoding comes from V:BIP34-EXPECTED-PREFIX rather than being
+   open-coded, because it is NOT simply a one-byte push: Core builds the expected
+   prefix with `CScript() << nHeight`, which emits OP_1..OP_16 for heights 1..16.
+   Hand-rolling `01 <height>` here produced blocks that our own (previously lax)
+   validator accepted and Bitcoin Core would have rejected — for exactly the low
+   heights a regtest/signet chain starts at."
+  (concatenate '(vector (unsigned-byte 8))
+               (v:bip34-expected-prefix height)
+               (vector 1 tag)))
 
 (defun coinbase-tx (height value script &optional (tag 0) commitment)
   "Coinbase paying VALUE to SCRIPT.  With COMMITMENT (32 bytes) add the BIP141 witness-
