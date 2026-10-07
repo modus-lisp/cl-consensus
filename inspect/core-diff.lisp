@@ -19,14 +19,14 @@
   (pushnew (uiop:pathname-parent-directory-pathname
             (uiop:pathname-directory-pathname (or *load-truename* *compile-file-truename*)))
            asdf:*central-registry* :test #'equal)
-  (ql:quickload '(:cffi :com.inuoe.jzon) :silent t)
+  (ql:quickload '(:cffi :json-simple) :silent t)
   (asdf:load-system "cl-consensus")
   (load (merge-pathnames "vectors.lisp" (or *load-truename* *compile-file-truename*))))
 
 (defpackage #:core-diff
   (:use #:cl)
   (:local-nicknames (#:w #:cl-consensus.wire) (#:tx #:cl-consensus.tx)
-                    (#:s #:cl-consensus.script) (#:jzon #:com.inuoe.jzon)
+                    (#:s #:cl-consensus.script) (#:json #:json-simple)
                     (#:bv #:btc-vectors)
                     (#:ec #:cl-consensus.crypto.secp256k1) (#:sch #:cl-consensus.crypto.schnorr))
   (:export #:core-verify #:diff-one #:vectors #:fuzz #:fuzz-mutate #:load-corpus #:ci
@@ -454,7 +454,7 @@
       (values (if (eq core :err) :invalid core) ours))))
 
 (defun assets (&optional (path "/mnt/lisp/script_assets_test.json") (limit most-positive-fixnum))
-  (let ((cases (with-open-file (f path) (jzon:parse f)))
+  (let ((cases (with-open-file (f path) (json:parse f)))
         (n 0) (cvo 0) (cve 0) (ex '()))
     (loop for c across cases while (< n limit) do
       (when (and (hash-table-p c) (gethash "tx" c))

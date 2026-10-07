@@ -18,7 +18,7 @@
   (require :asdf)
   (let ((here (or *load-truename* *compile-file-truename*)))
     (pushnew (uiop:pathname-parent-directory-pathname (uiop:pathname-directory-pathname here)) asdf:*central-registry* :test #'equal)
-    (ql:quickload '(:dexador :com.inuoe.jzon) :silent t)
+    (ql:quickload '(:dexador :json-simple) :silent t)
     (asdf:load-system "cl-consensus")
     (load (merge-pathnames "oracle.lisp" here))))   ; brings rpc
 

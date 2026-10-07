@@ -21,7 +21,7 @@
   (require :asdf)
   (pushnew (uiop:pathname-parent-directory-pathname (uiop:pathname-directory-pathname (or *load-truename* *compile-file-truename*)))
            asdf:*central-registry* :test #'equal)
-  (ql:quickload '(:com.inuoe.jzon) :silent t)
+  (ql:quickload '(:json-simple) :silent t)
   (asdf:load-system "cl-consensus")
   (load (merge-pathnames "vectors.lisp" (or *load-truename* *compile-file-truename*))))
 

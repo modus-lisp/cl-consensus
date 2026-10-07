@@ -22,7 +22,7 @@ trust our own output where we can diff it against Bitcoin Core.
   `~/.cl-consensus/bitcoind/` until the volume is chown'd writable. Full blocks (~650 GB)
   and the UTXO set need `/mnt/lisp`.
 - SBCL 2.2.9. Libs: `usocket`, `bordeaux-threads`, `ironclad`, `sqlite`,
-  `com.inuoe.jzon`. Existing reusable crypto in `shared/crypto/`
+  `json-simple`. Existing reusable crypto in `shared/crypto/`
   (`secp256k1`, `schnorr` — for Phase 4 signature checks).
 - Entrypoint (eventual): `bin/bitcoind.lisp` → `shared/bitcoind/node.lisp`,
   control socket for hot-reload, REPL contract on 127.0.0.1.

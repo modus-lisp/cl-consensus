@@ -10,12 +10,12 @@
   (pushnew (uiop:pathname-parent-directory-pathname
             (uiop:pathname-directory-pathname (or *load-truename* *compile-file-truename*)))
            asdf:*central-registry* :test #'equal)
-  (ql:quickload '(:com.inuoe.jzon) :silent t)
+  (ql:quickload '(:json-simple) :silent t)
   (asdf:load-system "cl-consensus"))
 
 (defpackage #:btc-vectors
   (:use #:cl)
-  (:local-nicknames (#:w #:cl-consensus.wire) (#:jzon #:com.inuoe.jzon))
+  (:local-nicknames (#:w #:cl-consensus.wire) (#:json #:json-simple))
   (:export #:parse-core-script #:load-script-tests))
 
 (in-package #:btc-vectors)
@@ -103,7 +103,7 @@
   "Read Core's raw script_tests.json and compile each case.  Returns a vector of
    (sig-bytes pk-bytes flags expected witness-bytes-list amount); skips comment
    rows and any case with an untokenizable script."
-  (let ((rows (with-open-file (f path) (jzon:parse f))) (out '()))
+  (let ((rows (with-open-file (f path) (json:parse f))) (out '()))
     (loop for row across rows do
       (when (> (length row) 1)
         (handler-case

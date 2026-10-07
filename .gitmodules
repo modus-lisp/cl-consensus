@@ -13,3 +13,6 @@
 [submodule "deps/seal"]
 	path = deps/seal
 	url = https://github.com/modus-lisp/seal.git
+[submodule "deps/json-simple"]
+	path = deps/json-simple
+	url = https://github.com/modus-lisp/json-simple.git

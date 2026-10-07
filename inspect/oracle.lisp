@@ -12,13 +12,13 @@
   (require :asdf)
   (pushnew (uiop:pathname-parent-directory-pathname (uiop:pathname-directory-pathname (or *load-truename* *compile-file-truename*)))
            asdf:*central-registry* :test #'equal)
-  (ql:quickload '(:dexador :com.inuoe.jzon) :silent t)
+  (ql:quickload '(:dexador :json-simple) :silent t)
   (asdf:load-system "cl-consensus"))
 
 (defpackage #:btc-oracle
   (:use #:cl)
   (:local-nicknames (#:w #:cl-consensus.wire) (#:c #:cl-consensus.chain)
-                    (#:jzon #:com.inuoe.jzon))
+                    (#:json #:json-simple))
   (:export #:rpc #:check-headers #:check-tip #:*rpc-url* #:*cookie-file*))
 
 (in-package #:btc-oracle)
@@ -38,7 +38,7 @@
 
 (defun rpc (method &rest params)
   "Call a bitcoind JSON-RPC METHOD; return the parsed \"result\"."
-  (let* ((body (jzon:stringify
+  (let* ((body (json:stringify
                 (alexandria:plist-hash-table
                  (list "jsonrpc" "1.0" "id" "o" "method" method
                        "params" (coerce params 'vector))
@@ -46,7 +46,7 @@
          (resp (dex:post *rpc-url* :content body
                          :basic-auth (cookie-auth)
                          :headers '(("content-type" . "text/plain"))))
-         (parsed (jzon:parse resp)))
+         (parsed (json:parse resp)))
     (gethash "result" parsed)))
 
 (defun check-headers (&optional (heights '(0 1 100000 210000 420000 630000 840000 909000)))

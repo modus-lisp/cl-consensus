@@ -13,7 +13,7 @@ ROOT="$(pwd -P)"
 SBCL="${SBCL:-sbcl}"
 
 # Let ASDF find cl-consensus + its deps (secp256k1-fast, pagetree) in either layout:
-#   - submodules:  <repo>/deps/{secp256k1-fast,pagetree}   (git clone --recursive)
+#   - submodules:  <repo>/deps/{secp256k1-fast,pagetree,json-simple}   (git clone --recursive)
 #   - siblings:    <parent>/{cl-consensus,secp256k1-fast,pagetree}
 export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$ROOT\") (:tree \"$ROOT/..\") :inherit-configuration)"
 

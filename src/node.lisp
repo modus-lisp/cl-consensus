@@ -22,7 +22,7 @@
                     (#:d #:cl-consensus.discovery) (#:am #:cl-consensus.addrman)
                     (#:onion #:cl-consensus.onion)
                     (#:ht #:hunchentoot)
-                    (#:jzon #:com.inuoe.jzon) (#:bt #:bordeaux-threads))
+                    (#:json #:json-simple) (#:bt #:bordeaux-threads))
   (:export #:start #:stop #:reload! #:*rpc-port* #:*control-port* #:rpc-call
            #:serve-node #:*utxo* #:*mempool* #:*onion-service-hook* #:live-peers))
 
@@ -504,8 +504,8 @@
 (defun rpc-handler ()
   (setf (ht:content-type*) "application/json")
   (let* ((raw (ht:raw-post-data :force-text t))
-         (parsed (handler-case (jzon:parse raw) (error () nil))))
-    (jzon:stringify
+         (parsed (handler-case (json:parse raw) (error () nil))))
+    (json:stringify
      (cond
        ((null parsed) (obj "result" 'null
                            "error" (obj "code" -32700 "message" "Parse error") "id" 'null))

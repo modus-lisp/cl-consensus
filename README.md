@@ -92,8 +92,9 @@ bin/cl-consensus.lisp   run the daemon
 ## Dependencies
 
 Pure SBCL + a few Quicklisp libs (`ironclad`, `usocket`, `bordeaux-threads`,
-`com.inuoe.jzon`, `hunchentoot`) — **plus two companion repos** that are not yet on
-Quicklisp: `secp256k1-fast` (the crypto) and `pagetree` (the disk-backed UTXO store).
+`hunchentoot`) — **plus companion repos** that are not yet on Quicklisp:
+`secp256k1-fast` (the crypto), `pagetree` (the disk-backed UTXO store) and
+`json-simple` (JSON for RPC).
 They're vendored as git submodules under `deps/`, so clone recursively:
 
 ```sh
