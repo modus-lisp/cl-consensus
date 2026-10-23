@@ -16,3 +16,6 @@
 [submodule "deps/json-simple"]
 	path = deps/json-simple
 	url = https://github.com/modus-lisp/json-simple.git
+[submodule "deps/natrium"]
+	path = deps/natrium
+	url = https://github.com/modus-lisp/natrium.git
