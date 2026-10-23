@@ -58,7 +58,7 @@
       (checkt "P2TR decodes witver 1" (= witver 1))
       (checkt "P2TR program round-trips" (equalp prog xonly))))
   ;; ---- BIP32 Test Vector 1 (seed 000102...0f) ----
-  (let* ((seed (hx "000102030405060708090a0b0c0d0e0f"))
+  (let* ((seed (gossamer:pooled-copy (hx "000102030405060708090a0b0c0d0e0f")))
          (m (b32:master-from-seed seed)))
     (check "BIP32 vec1 master xprv" (b32:serialize-xkey m)
            "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi")
@@ -84,7 +84,7 @@
       (checkt "BIP84 receive addr is bech32 mainnet" (string= (subseq addr 0 3) "bc1"))
       (format t "[wallet-test] sample m/84'/0'/0'/0/0 -> ~a~%" addr)))
   ;; ---- Phase 2: watch / balance ----
-  (let* ((seed (hx "000102030405060708090a0b0c0d0e0f"))
+  (let* ((seed (gossamer:pooled-copy (hx "000102030405060708090a0b0c0d0e0f")))
          (wal (wal:make-wallet-from-seed seed :type :p2wpkh)))
     (checkt "receive[0] is bech32 mainnet" (string= (subseq (wal:wallet-receive-address wal 0) 0 3) "bc1"))
     (checkt "receive addrs are distinct"
@@ -111,11 +111,11 @@
       (check "rescan finds our 1 coin" (wal:wallet-rescan-utxo wal utxo) 1)
       (check "rescan balance" (wal:wallet-balance wal) 77000)))
   ;; ---- P2PKH wallet derives legacy addresses ----
-  (let ((wpk (wal:make-wallet-from-seed (hx "000102030405060708090a0b0c0d0e0f") :type :p2pkh)))
+  (let ((wpk (wal:make-wallet-from-seed (gossamer:pooled-copy (hx "000102030405060708090a0b0c0d0e0f")) :type :p2pkh)))
     (checkt "p2pkh address starts with 1" (char= (char (wal:wallet-receive-address wpk 0) 0) #\1)))
   ;; ---- Phase 3: build + sign a spend; our own interpreter must accept each input ----
   (flet ((spend-check (type &optional dest)
-           (let* ((wal (wal:make-wallet-from-seed (hx "000102030405060708090a0b0c0d0e0f") :type type))
+           (let* ((wal (wal:make-wallet-from-seed (gossamer:pooled-copy (hx "000102030405060708090a0b0c0d0e0f")) :type type))
                   (spk (wal::waddr-script (aref (wal:wallet-receive wal) 0)))
                   (dest (or dest (wal:wallet-receive-address wal 1)))   ; self-send fallback (P2TR)
                   (fund (mk-tx (list (cons (hx "ab") 0)) (list (cons 1000000 spk)))))

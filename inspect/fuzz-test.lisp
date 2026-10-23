@@ -20,7 +20,9 @@
   ;; only push paths that EXIST (truename errors on a missing dir).
   (dolist (p (list root
                    (merge-pathnames "../secp256k1-fast/" root) (merge-pathnames "../pagetree/" root)
-                   (merge-pathnames "deps/secp256k1-fast/" root) (merge-pathnames "deps/pagetree/" root)))
+                   (merge-pathnames "../natrium/" root)
+                   (merge-pathnames "deps/secp256k1-fast/" root) (merge-pathnames "deps/pagetree/" root)
+                   (merge-pathnames "deps/natrium/" root)))
     (when (probe-file p) (pushnew (truename p) asdf:*central-registry* :test #'equal))))
 (handler-bind ((warning #'muffle-warning)) (asdf:load-system "cl-consensus"))
 

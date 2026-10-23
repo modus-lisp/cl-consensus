@@ -20,6 +20,11 @@
 
 (in-package #:btc-bench)
 
+(defun fk (d)
+  "Throwaway test key D (an integer from CL:RANDOM) as the fixed 32-byte buffer the
+signers take.  Test harness only: these keys are public by construction."
+  (gossamer:pooled-copy (ec:int-to-bytes32 d)))
+
 (defun fmt-duration (secs)
   (cond ((< secs 90) (format nil "~,1f s" secs))
         ((< secs 5400) (format nil "~,1f min" (/ secs 60)))
@@ -84,9 +89,9 @@
   ;; ---- ECDSA -----------------------------------------------------------------
   (format t "~%ECDSA (secp256k1):~%")
   (let* ((priv (1+ (random (1- ec:*secp256k1-n*))))
-         (pub (ec:secp-pubkey priv))
+         (pub (ec:secp-mul-point priv (ec:secp-generator)))
          (hash (w:hash256 (ironclad:ascii-string-to-byte-array "benchmark message")))
-         (sig (multiple-value-list (ec:ecdsa-sign-raw priv hash)))
+         (sig (multiple-value-list (ec:ecdsa-sign-raw (fk priv) hash)))
          (r (first sig)) (s (second sig)))
     (bench "ecdsa-verify" ecdsa-reps (lambda () (ec:ecdsa-verify pub hash r s)))
     (values))
@@ -95,9 +100,9 @@
   (format t "~%Schnorr (BIP340):~%")
   (let* ((priv (sch:tagged-hash "x" (ironclad:ascii-string-to-byte-array "k")))
          (d (1+ (mod (ec:bytes-to-int priv) (1- ec:*secp256k1-n*))))
-         (px (ec:int-to-bytes32 (car (ec:secp-pubkey d))))
+         (px (ec:int-to-bytes32 (car (ec:secp-mul-point d (ec:secp-generator)))))
          (msg (w:sha256 (ironclad:ascii-string-to-byte-array "schnorr bench")))
-         (sig (sch:schnorr-sign d msg)))
+         (sig (sch:schnorr-sign (fk d) msg)))
     (bench "schnorr-verify" schnorr-reps (lambda () (sch:schnorr-verify px msg sig))))
 
   (format t "~%(see estimate-ibd for what this means for sync)~%"))

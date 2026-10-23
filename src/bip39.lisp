@@ -2,7 +2,7 @@
 ;;;;
 ;;;; BIP39 mnemonic seed phrases: entropy -> mnemonic (with SHA256 checksum) -> a
 ;;;; 512-bit seed via PBKDF2-HMAC-SHA512.  The seed feeds BIP32 master-from-seed.
-;;;; SHA256 from wire (ironclad), PBKDF2-HMAC-SHA512 from ironclad's KDF.  The
+;;;; SHA256 from wire; PBKDF2-HMAC-SHA512 on natrium into fixed memory.  The
 ;;;; canonical 2048-word English list lives in bip39-wordlist.lisp (same package);
 ;;;; its exact order is load-bearing for the checksum and the test vectors.
 
@@ -116,15 +116,29 @@
 ;;; mnemonic -> 512-bit seed (PBKDF2-HMAC-SHA512, 2048 iterations)
 ;;; ----------------------------------------------------------------------------
 
+(defun %pbkdf2-hmac-sha512-into (password salt iterations out)
+  "PBKDF2-HMAC-SHA512 into OUT (fixed): natrium's, with every intermediate in fixed memory."
+  (natrium:pbkdf2-into :sha512 password salt iterations out))
+
+(defun %ascii-octets (s)
+  (map '(simple-array (unsigned-byte 8) (*))
+       (lambda (c) (if (< (char-code c) 128) (char-code c) (error "bip39: non-ASCII text (apply NFKD/UTF-8 first)")))
+       s))
+
 (defun mnemonic->seed (mnemonic &optional (passphrase ""))
   "The 64-byte BIP39 seed: PBKDF2(HMAC-SHA512, password=MNEMONIC,
-   salt=\"mnemonic\"||PASSPHRASE, 2048 iterations, dkLen=64).  The mnemonic and
-   passphrase are taken as UTF-8 (NFKD assumed already applied; ASCII is exact)."
-  (let ((kdf (ic:make-kdf :pbkdf2 :digest :sha512))
-        (pw (ic:ascii-string-to-byte-array mnemonic))
-        (salt (ic:ascii-string-to-byte-array
-               (concatenate 'string "mnemonic" passphrase))))
-    (ic:derive-key kdf pw salt 2048 64)))
+   salt=\"mnemonic\"||PASSPHRASE, 2048 iterations, dkLen=64), as a POOLED FIXED
+   buffer the caller FIXED:FREEs.  The mnemonic and passphrase are taken as ASCII
+   (NFKD assumed already applied).  The password bytes go straight into fixed memory
+   and their heap copy is wiped."
+  (let* ((heap-pw (%ascii-octets mnemonic))
+         (pw (gossamer:pooled-copy heap-pw))
+         (seed (gossamer:acquire :octets 64)))
+    (fill heap-pw 0)
+    (unwind-protect
+         (%pbkdf2-hmac-sha512-into pw (%ascii-octets (concatenate 'string "mnemonic" passphrase)) 2048 seed)
+      (gossamer:free pw))
+    seed))
 
 ;;; ----------------------------------------------------------------------------
 ;;; secure generation (fresh entropy -> mnemonic -> wallet)
@@ -159,7 +173,8 @@
   "A brand-new random BIP39 mnemonic of strength BITS (default 128 -> 12 words;
    256 -> 24 words).  Draws fresh CSPRNG entropy and encodes it with the
    SHA256 checksum, so the result always passes VALIDATE-MNEMONIC."
-  (mnemonic-from-entropy (generate-entropy bits)))
+  (let ((e (generate-entropy bits)))
+    (unwind-protect (mnemonic-from-entropy e) (fill e 0))))
 
 (defun generate-wallet (&key (type :p2wpkh) (passphrase "") (bits 128))
   "Mint a brand-new HD wallet from fresh randomness, returning (VALUES WALLET
@@ -179,5 +194,6 @@
    seed with the optional PASSPHRASE and handing it to wallet:make-wallet-from-seed."
   (unless (validate-mnemonic mnemonic)
     (error "invalid BIP39 mnemonic (bad word or checksum)"))
-  (wal:make-wallet-from-seed (mnemonic->seed mnemonic passphrase)
-                             :type type :account account :gap-limit gap-limit))
+  (let ((seed (mnemonic->seed mnemonic passphrase)))
+    (unwind-protect (wal:make-wallet-from-seed seed :type type :account account :gap-limit gap-limit)
+      (gossamer:free seed))))

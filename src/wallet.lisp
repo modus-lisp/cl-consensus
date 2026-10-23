@@ -46,7 +46,8 @@
 (defun taproot-output-key (internal-xonly)
   "The 32-byte BIP341 output key Q = lift_x(P) + t*G (key-path only, empty merkle root)."
   (let* ((p-even (sch:lift-x (secp:bytes-to-int internal-xonly)))
-         (q (secp:secp-add-points p-even (secp:secp-pubkey (taproot-tweak internal-xonly)))))
+         (q (secp:secp-add-points p-even (secp:secp-mul-point (taproot-tweak internal-xonly)
+                                                              (secp:secp-generator)))))
     (secp:int-to-bytes32 (secp:secp-x q))))
 
 (defun script-for (type pubkey)
@@ -74,7 +75,8 @@
   txid vout value script waddr height)
 
 (defstruct (wallet (:constructor %make-wallet) (:predicate wallet-p))
-  master account-xkey
+  account-xkey            ; PRIVATE account key (fixed buffers); signing derives from it
+  account-xpub            ; its public form; addresses derive from this
   (type :p2wpkh) (gap-limit 20)
   (receive (make-array 0 :adjustable t :fill-pointer 0))   ; chain 0
   (change  (make-array 0 :adjustable t :fill-pointer 0))   ; chain 1
@@ -85,7 +87,7 @@
 
 (defun derive-waddr (wallet chain index)
   "Derive the WADDR at (CHAIN, INDEX) below the account key and register its script."
-  (let* ((child (b32:ckd-priv (b32:ckd-priv (wallet-account-xkey wallet) chain) index))
+  (let* ((child (b32:ckd-pub (b32:ckd-pub (wallet-account-xpub wallet) chain) index))
          (pubkey (b32:xkey-pubkey child))
          (script (script-for (wallet-type wallet) pubkey))
          (wa (%make-waddr :index index :chain chain :xkey child :pubkey pubkey
@@ -106,7 +108,8 @@
    addresses."
   (let* ((master (b32:master-from-seed seed))
          (path (format nil "m/~d'/0'/~d'" (purpose-for type) account))
-         (wallet (%make-wallet :master master :account-xkey (b32:derive-path master path)
+         (acct (unwind-protect (b32:derive-path master path) (b32:xkey-wipe master)))
+         (wallet (%make-wallet :account-xkey acct :account-xpub (b32:neuter acct)
                                :type type :gap-limit gap-limit)))
     (ensure-addresses wallet 0 (1- gap-limit))
     (ensure-addresses wallet 1 (1- gap-limit))
@@ -206,41 +209,57 @@
     (assert (< n 76))
     (concatenate '(vector (unsigned-byte 8)) (vector n) bytes)))
 
+(defun %with-child-key (wallet wa fn)
+  "Call FN with the private xkey of WA, derived now from WALLET's account key, and
+wipe it (and the intermediate chain key) afterwards.  Addresses carry only public
+keys; a private child key exists only for the duration of one signature."
+  (let* ((chain-xk (b32:ckd-priv (wallet-account-xkey wallet) (waddr-chain wa)))
+         (child nil))
+    (unwind-protect
+         (progn (setf child (b32:ckd-priv chain-xk (waddr-index wa)))
+                (funcall fn child))
+      (b32:xkey-wipe chain-xk)
+      (when child (b32:xkey-wipe child)))))
+
 (defun sign-input (wallet txn i coin prevouts)
   "Sign input I of TXN (which spends COIN, one of our wallet coins) — sets the witness
    (P2WPKH BIP143 / P2TR BIP341 key-path) or scriptSig (P2PKH).  PREVOUTS is the vector
    of (amount . scriptPubKey) for ALL inputs (needed by the taproot sighash)."
-  (declare (ignore wallet))
   (let* ((wa (wcoin-waddr coin))
-         (priv (b32:xkey-key (waddr-xkey wa)))
          (pubkey (waddr-pubkey wa))
          (type (wallet-type-of-script (wcoin-script coin))))
-    (ecase type
-      (:p2wpkh
-       (let* ((sc (p2pkh-script (w:hash160 pubkey)))
-              (sighash (s:bip143-sighash txn i sc (wcoin-value coin) s:+sighash-all+)))
-         (multiple-value-bind (r ss) (secp:ecdsa-sign-raw priv sighash)
-           (let ((sig (concatenate '(vector (unsigned-byte 8))
-                                   (der-encode-sig r ss) (vector s:+sighash-all+))))
-             (setf (nth i (tx:tx-witnesses txn)) (list sig pubkey))))))
-      (:p2pkh
-       (let* ((sc (p2pkh-script (w:hash160 pubkey)))
-              (sighash (s:legacy-sighash txn i sc s:+sighash-all+)))
-         (multiple-value-bind (r ss) (secp:ecdsa-sign-raw priv sighash)
-           (let ((sig (concatenate '(vector (unsigned-byte 8))
-                                   (der-encode-sig r ss) (vector s:+sighash-all+))))
-             (setf (tx:txin-script (nth i (tx:tx-inputs txn)))
-                   (concatenate '(vector (unsigned-byte 8))
-                                (%push-data sig) (%push-data pubkey)))))))
-      (:p2tr
-       ;; BIP341 key-path: sign the taproot sighash with the tweaked private key.
-       (let* ((pt (secp:secp-pubkey priv))
-              (d-even (if (evenp (secp:secp-y pt)) priv (- secp:*secp256k1-n* priv)))
-              (internal-xonly (secp:int-to-bytes32 (secp:secp-x pt)))
-              (d-tweaked (mod (+ d-even (taproot-tweak internal-xonly)) secp:*secp256k1-n*))
-              (sighash (s:taproot-sighash txn i prevouts 0 :ext-flag 0))   ; SIGHASH_DEFAULT
-              (sig (sch:schnorr-sign d-tweaked sighash)))
-         (setf (nth i (tx:tx-witnesses txn)) (list sig)))))))
+    (%with-child-key wallet wa
+      (lambda (child)
+        (let ((priv (b32:xkey-key child)))
+          (ecase type
+            (:p2wpkh
+             (let* ((sc (p2pkh-script (w:hash160 pubkey)))
+                    (sighash (s:bip143-sighash txn i sc (wcoin-value coin) s:+sighash-all+)))
+               (multiple-value-bind (r ss) (secp:ecdsa-sign-raw priv sighash)
+                 (let ((sig (concatenate '(vector (unsigned-byte 8))
+                                         (der-encode-sig r ss) (vector s:+sighash-all+))))
+                   (setf (nth i (tx:tx-witnesses txn)) (list sig pubkey))))))
+            (:p2pkh
+             (let* ((sc (p2pkh-script (w:hash160 pubkey)))
+                    (sighash (s:legacy-sighash txn i sc s:+sighash-all+)))
+               (multiple-value-bind (r ss) (secp:ecdsa-sign-raw priv sighash)
+                 (let ((sig (concatenate '(vector (unsigned-byte 8))
+                                         (der-encode-sig r ss) (vector s:+sighash-all+))))
+                   (setf (tx:txin-script (nth i (tx:tx-inputs txn)))
+                         (concatenate '(vector (unsigned-byte 8))
+                                      (%push-data sig) (%push-data pubkey)))))))
+            (:p2tr
+             ;; BIP341 key-path: sign the taproot sighash with the tweaked private key,
+             ;; d' = (d or n-d, whichever has the even-Y point) + t, all in fixed memory.
+             (let* ((pt (b32:xkey-pubpoint child))
+                    (internal-xonly (secp:int-to-bytes32 (secp:secp-x pt)))
+                    (sighash (s:taproot-sighash txn i prevouts 0 :ext-flag 0)))   ; SIGHASH_DEFAULT
+               (gossamer:with-fixed-scratch ((d :octets 32) (tw :octets 32))
+                 (secp:seckey-negate-into priv d :negate (oddp (secp:secp-y pt)))
+                 (replace tw (secp:int-to-bytes32 (taproot-tweak internal-xonly)))
+                 (secp:seckey-tweak-add-into d tw d)
+                 (setf (nth i (tx:tx-witnesses txn))
+                       (list (sch:schnorr-sign d sighash (natrium:random-bytes 32)))))))))))))
 
 (defun wallet-type-of-script (script)
   "Classify a scriptPubKey we own as :p2wpkh / :p2pkh / :p2tr."

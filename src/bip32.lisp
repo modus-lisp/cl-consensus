@@ -1,20 +1,24 @@
-;;;; src/bip32.lisp
+;;;;; src/bip32.lisp
 ;;;;
 ;;;; BIP32 hierarchical-deterministic key derivation: a master key from a seed, then
 ;;;; child keys down a path (m/84'/0'/0'/0/0).  Private (CKD-priv, hardened or normal)
-;;;; and public (CKD-pub, normal only) derivation, xprv/xpub serialization.  Curve ops
-;;;; from secp256k1-fast; HMAC-SHA512 / SHA512 from ironclad (as wire already uses
-;;;; ironclad for ripemd160).
+;;;; and public (CKD-pub, normal only) derivation, xprv/xpub serialization.
+;;;;
+;;;; A PRIVATE xkey holds its key and chain code in pooled FIXED buffers (never
+;;;; integers, never heap vectors), owned by the xkey -- XKEY-WIPE returns them, and a
+;;;; dropped xkey returns them through FIXED:OWN.  HMAC-SHA512 runs in natrium over
+;;;; parts into fixed scratch; the child key is SECKEY-TWEAK-ADD-INTO.  A PUBLIC xkey's
+;;;; arithmetic is public and uses ordinary integers and points.
 
 (defpackage #:cl-consensus.bip32
   (:use #:cl)
   (:nicknames #:btc-bip32)
   (:local-nicknames (#:secp #:secp256k1-fast) (#:w #:cl-consensus.wire)
-                    (#:enc #:cl-consensus.encoding) (#:ic #:ironclad))
+                    (#:enc #:cl-consensus.encoding))
   (:export
    #:xkey #:xkey-p #:xkey-depth #:xkey-chain-code #:xkey-key #:xkey-private-p
-   #:master-from-seed #:ckd-priv #:ckd-pub #:derive-path #:neuter
-   #:xkey-pubpoint #:xkey-pubkey #:xkey-privkey #:fingerprint
+   #:master-from-seed #:ckd-priv #:ckd-pub #:derive-path #:neuter #:xkey-wipe
+   #:xkey-pubpoint #:xkey-pubkey #:fingerprint
    #:serialize-xkey #:compressed-pubkey #:+hardened+))
 
 (in-package #:cl-consensus.bip32)
@@ -24,25 +28,43 @@
 (defparameter *xpub-version* #x0488b21e)
 
 (defun bytes (&rest seqs)
-  (apply #'concatenate '(vector (unsigned-byte 8)) seqs))
+  (apply #'concatenate '(simple-array (unsigned-byte 8) (*)) seqs))
 
 (defun ascii->bytes (s)
-  (map '(vector (unsigned-byte 8)) #'char-code s))
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code s))
 
-(defun hmac-sha512 (key data)
-  (let ((h (ic:make-hmac (coerce key '(vector (unsigned-byte 8))) :sha512)))
-    (ic:update-hmac h (coerce data '(vector (unsigned-byte 8))))
-    (ic:hmac-digest h)))
+(defvar +bitcoin-seed+ (ascii->bytes "Bitcoin seed"))
+(defvar +zero1+ (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0))
 
 (defun ser32 (i)
-  (vector (logand (ash i -24) #xff) (logand (ash i -16) #xff)
-          (logand (ash i -8) #xff) (logand i #xff)))
+  (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+    (setf (aref v 0) (ldb (byte 8 24) i) (aref v 1) (ldb (byte 8 16) i)
+          (aref v 2) (ldb (byte 8 8) i) (aref v 3) (ldb (byte 8 0) i))
+    v))
 
 (defstruct (xkey (:predicate xkey-p))
   (version 0) (depth 0) (parent-fp #(0 0 0 0)) (child-number 0)
-  chain-code              ; 32 bytes
-  key                     ; private: integer k; public: point (cons x . y)
-  (private-p t))
+  chain-code              ; 32 bytes (private: a pooled fixed buffer)
+  key                     ; private: pooled fixed 32-byte key; public: point (x . y)
+  (private-p t)
+  (pub-cache nil))        ; cached public point
+
+(defun %make-private-xkey (key chain &rest initargs)
+  "A private xkey owning the pooled buffers KEY and CHAIN."
+  (let ((xk (apply #'make-xkey :key key :chain-code chain :private-p t initargs)))
+    (gossamer:own xk key chain)))
+
+(defun xkey-wipe (xk)
+  "Wipe a private XK's key and chain code and return them to the pool.  XK is
+unusable afterwards.  A no-op on a public xkey."
+  (when (and (xkey-private-p xk) (xkey-key xk))
+    (gossamer:disown xk)
+    (gossamer:free (xkey-key xk)) (gossamer:free (xkey-chain-code xk))
+    (setf (xkey-key xk) nil (xkey-chain-code xk) nil))
+  xk)
+
+(defun %live-key (xk)
+  (or (xkey-key xk) (error "use of a wiped xkey")))
 
 (defun compressed-pubkey (point)
   "33-byte compressed SEC public key for POINT (02/03 by y-parity || x)."
@@ -50,57 +72,68 @@
          (secp:int-to-bytes32 (secp:secp-x point))))
 
 (defun xkey-pubpoint (xk)
-  (if (xkey-private-p xk) (secp:secp-pubkey (xkey-key xk)) (xkey-key xk)))
+  (if (xkey-private-p xk)
+      (or (xkey-pub-cache xk)
+          (setf (xkey-pub-cache xk) (secp:secp-pubkey (%live-key xk))))
+      (xkey-key xk)))
+
 
 (defun xkey-pubkey (xk) (compressed-pubkey (xkey-pubpoint xk)))
-(defun xkey-privkey (xk)
-  (unless (xkey-private-p xk) (error "no private key (this is an xpub)"))
-  (secp:int-to-bytes32 (xkey-key xk)))
 
 (defun fingerprint (xk)
   (subseq (w:hash160 (xkey-pubkey xk)) 0 4))
 
 (defun master-from-seed (seed)
-  "BIP32 master key from a SEED (typically a BIP39 512-bit seed)."
-  (let* ((i (hmac-sha512 (ascii->bytes "Bitcoin seed") seed))
-         (il (subseq i 0 32)) (ir (subseq i 32 64))
-         (k (secp:bytes-to-int il)))
-    (when (or (zerop k) (>= k secp:*secp256k1-n*)) (error "invalid master key"))
-    (make-xkey :version *xprv-version* :depth 0 :chain-code ir :key k :private-p t)))
+  "BIP32 master key from a SEED (typically a BIP39 512-bit seed, a fixed buffer)."
+  (gossamer:check-fixed seed "BIP-32 seed")
+  (let ((key (gossamer:acquire :octets 32)) (chain (gossamer:acquire :octets 32)))
+    (gossamer:with-fixed-scratch ((i :octets 64))
+      (natrium:hmac-sha512-into +bitcoin-seed+ seed i)
+      (replace key i :end2 32) (replace chain i :start2 32))
+    (unless (secp:seckey-valid-p key)
+      (gossamer:free key) (gossamer:free chain) (error "invalid master key"))
+    (%make-private-xkey key chain :version *xprv-version* :depth 0)))
 
 (defun ckd-priv (xk i)
   "Derive child private key at index I (>= +hardened+ for a hardened child)."
   (unless (xkey-private-p xk) (error "ckd-priv needs a private key"))
-  (let* ((data (if (>= i +hardened+)
-                   (bytes (vector 0) (secp:int-to-bytes32 (xkey-key xk)) (ser32 i))
-                   (bytes (xkey-pubkey xk) (ser32 i))))
-         (big (hmac-sha512 (xkey-chain-code xk) data))
-         (il (secp:bytes-to-int (subseq big 0 32))) (ir (subseq big 32 64))
-         (ki (mod (+ il (xkey-key xk)) secp:*secp256k1-n*)))
-    (when (or (>= il secp:*secp256k1-n*) (zerop ki))
-      (error "invalid derived key at index ~d (use next index)" i))
-    (make-xkey :version (xkey-version xk) :depth (1+ (xkey-depth xk))
-               :parent-fp (fingerprint xk) :child-number i
-               :chain-code ir :key ki :private-p t)))
+  (let ((parent (%live-key xk))
+        (key (gossamer:acquire :octets 32)) (chain (gossamer:acquire :octets 32)))
+    (handler-case
+        (gossamer:with-fixed-scratch ((big :octets 64))
+          (natrium:hmac-sha512-into (xkey-chain-code xk)
+                                    (if (>= i +hardened+)
+                                        (list +zero1+ parent (ser32 i))
+                                        (list (xkey-pubkey xk) (ser32 i)))
+                                    big)
+          (secp:seckey-tweak-add-into parent big key)
+          (replace chain big :start2 32))
+      (error ()
+        (gossamer:free key) (gossamer:free chain)
+        (error "invalid derived key at index ~d (use next index)" i)))
+    (%make-private-xkey key chain :version (xkey-version xk) :depth (1+ (xkey-depth xk))
+                        :parent-fp (fingerprint xk) :child-number i)))
 
 (defun ckd-pub (xk i)
-  "Derive child PUBLIC key at index I (normal children only)."
+  "Derive child PUBLIC key at index I (normal children only).  Everything here is
+public: IL is derivable from the xpub."
   (when (>= i +hardened+) (error "cannot derive a hardened child of an xpub"))
   (let* ((data (bytes (xkey-pubkey xk) (ser32 i)))
-         (big (hmac-sha512 (xkey-chain-code xk) data))
-         (il (secp:bytes-to-int (subseq big 0 32))) (ir (subseq big 32 64))
-         (point (secp:secp-add-points (secp:secp-pubkey il) (xkey-pubpoint xk))))
-    (when (>= il secp:*secp256k1-n*) (error "invalid derived key at index ~d" i))
-    (make-xkey :version *xpub-version* :depth (1+ (xkey-depth xk))
-               :parent-fp (fingerprint xk) :child-number i
-               :chain-code ir :key point :private-p nil)))
+         (big (natrium:hmac-sha512 (bytes (xkey-chain-code xk)) data))
+         (il (secp:bytes-to-int (subseq big 0 32))) (ir (subseq big 32 64)))
+    (when (or (zerop il) (>= il secp:*secp256k1-n*)) (error "invalid derived key at index ~d" i))
+    (let ((point (secp:secp-add-points (secp:secp-mul-point il (secp:secp-generator))
+                                       (xkey-pubpoint xk))))
+      (make-xkey :version *xpub-version* :depth (1+ (xkey-depth xk))
+                 :parent-fp (fingerprint xk) :child-number i
+                 :chain-code ir :key point :private-p nil))))
 
 (defun neuter (xk)
   "The public (xpub) form of a private xkey."
   (if (xkey-private-p xk)
       (make-xkey :version *xpub-version* :depth (xkey-depth xk)
                  :parent-fp (xkey-parent-fp xk) :child-number (xkey-child-number xk)
-                 :chain-code (xkey-chain-code xk) :key (xkey-pubpoint xk) :private-p nil)
+                 :chain-code (bytes (xkey-chain-code xk)) :key (xkey-pubpoint xk) :private-p nil)
       xk))
 
 (defun parse-path (path)
@@ -121,16 +154,20 @@
 
 (defun derive-path (xk path)
   "Derive XK down PATH (a string like \"m/84'/0'/0'/0/0\").  Uses CKD-priv on a private
-   key (so hardened steps work), CKD-pub on a public key."
+   key (so hardened steps work), CKD-pub on a public key.  Intermediate private keys
+   are wiped as soon as their child exists; XK itself is the caller's."
   (let ((k xk))
     (dolist (i (parse-path path) k)
-      (setf k (if (xkey-private-p k) (ckd-priv k i) (ckd-pub k i))))))
+      (let ((next (if (xkey-private-p k) (ckd-priv k i) (ckd-pub k i))))
+        (unless (eq k xk) (xkey-wipe k))
+        (setf k next)))))
 
 (defun serialize-xkey (xk)
-  "BIP32 Base58Check serialization (xprv if private, xpub if public)."
+  "BIP32 Base58Check serialization (xprv if private, xpub if public).  An xprv is an
+EXPORT of the private key: the result is an ordinary heap string."
   (let* ((version (if (xkey-private-p xk) *xprv-version* *xpub-version*))
          (keybytes (if (xkey-private-p xk)
-                       (bytes (vector 0) (secp:int-to-bytes32 (xkey-key xk)))
+                       (bytes (vector 0) (%live-key xk))
                        (xkey-pubkey xk)))
          (payload (bytes (ser32 version) (vector (xkey-depth xk))
                          (xkey-parent-fp xk) (ser32 (xkey-child-number xk))

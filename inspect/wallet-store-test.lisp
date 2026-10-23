@@ -44,7 +44,7 @@
 
 (defun run ()
   (setf *ok* t)
-  (let* ((seed (hx "000102030405060708090a0b0c0d0e0f"))
+  (let* ((seed (gossamer:pooled-copy (hx "000102030405060708090a0b0c0d0e0f")))
          (wal (wal:make-wallet-from-seed seed :type :p2wpkh))
          (path "/tmp/wallet-store-test.wallet"))
     ;; fund receive[0] (mirror inspect/wallet-test.lisp)

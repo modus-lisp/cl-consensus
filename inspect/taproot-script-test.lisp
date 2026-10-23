@@ -37,7 +37,7 @@
 (defun run ()
   (setf *ok* t)
   (let* (;; leaf private key (the script's x-only pubkey must correspond to it)
-         (leaf-priv (secp:bytes-to-int
+         (leaf-priv (gossamer:pooled-copy
                      (hx "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef")))
          (internal-xonly (sch:pubkey-xonly leaf-priv))
          (leaf-script (tps:checksig-leaf-script internal-xonly)))
@@ -79,12 +79,12 @@
   ;; Multi-leaf taptrees: 2 leaves and 3 leaves, DISTINCT key per leaf, spend
   ;; EACH leaf in turn and assert every script-path spend verifies.
   ;; ==========================================================================
-  (let* ((leaf-privs (mapcar (lambda (h) (secp:bytes-to-int (hx h)))
+  (let* ((leaf-privs (mapcar (lambda (h) (gossamer:pooled-copy (hx h)))
                              '("0000000000000000000000000000000000000000000000000000000000000003"
                                "0000000000000000000000000000000000000000000000000000000000000005"
                                "0000000000000000000000000000000000000000000000000000000000000007")))
          ;; internal key distinct from every leaf key
-         (internal-priv (secp:bytes-to-int
+         (internal-priv (gossamer:pooled-copy
                          (hx "00000000000000000000000000000000000000000000000000000000000000aa")))
          (internal-xonly (sch:pubkey-xonly internal-priv))
          (leaf-scripts (mapcar (lambda (lp) (tps:checksig-leaf-script (sch:pubkey-xonly lp)))

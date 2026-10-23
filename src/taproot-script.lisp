@@ -155,7 +155,7 @@
                       (sch:tagged-hash "TapTweak" (cat internal-xonly merkle-root)))
                      secp:*secp256k1-n*))
          (p-even (sch:lift-x (secp:bytes-to-int internal-xonly)))
-         (q (secp:secp-add-points p-even (secp:secp-pubkey tweak)))
+         (q (secp:secp-add-points p-even (secp:secp-mul-point tweak (secp:secp-generator))))
          (qx (secp:int-to-bytes32 (secp:secp-x q)))
          (q-parity (logand (secp:secp-y q) 1)))
     (values (cat (vector #x51 #x20) qx) q-parity)))
@@ -200,13 +200,13 @@
   "Build + sign a v2 segwit tx spending the taproot output {AMOUNT, SPK} at
    PREV-TXID:PREV-VOUT via the SCRIPT path of one leaf of a taptree.
 
-   LEAF-PRIV   : integer private key whose x-only pubkey is the one embedded in
+   LEAF-PRIV   : private key (a FIXED 32-byte buffer) whose x-only pubkey is the one embedded in
                  the CHOSEN leaf script (signs that leaf's CHECKSIG).
    LEAF-SCRIPTS: the full list of leaf scripts in the taptree (defines the merkle
                  root + each leaf's path).  When NIL, the tree is the lone leaf
                  <pubkey(LEAF-PRIV)> OP_CHECKSIG (single-leaf back-compat).
    LEAF-INDEX  : which leaf of LEAF-SCRIPTS to spend (default 0).
-   INTERNAL-PRIV: integer private key of the taproot INTERNAL key (the key the
+   INTERNAL-PRIV: private key (fixed 32 bytes) of the taproot INTERNAL key (the key the
                  output was tweaked from).  When NIL, defaults to LEAF-PRIV (the
                  single-leaf convention: same key as internal + in the leaf).
 
@@ -245,7 +245,7 @@
                                            :codesep-pos #xffffffff))
                ;; BIP341 tapscript sigs are BIP340 over the x-only LEAF key.
                ;; SIGHASH_DEFAULT ⇒ 64-byte signature (no trailing hashtype byte).
-               (sig (sch:schnorr-sign leaf-priv sighash)))
+               (sig (sch:schnorr-sign leaf-priv sighash (natrium:random-bytes 32))))
           (setf (first (tx:tx-witnesses txn)) (list sig leaf-script ctrl))
           (tx:finalize-tx txn)
           txn)))))

@@ -36,39 +36,25 @@
 
 (defun %b (n) (make-array n :element-type '(unsigned-byte 8)))
 
-(defun %derive-key (passphrase salt iterations)
-  "Derive a 32-byte key from PASSPHRASE (string) and SALT via PBKDF2-HMAC-SHA256."
-  (let ((kdf (ironclad:make-kdf :pbkdf2 :digest :sha256)))
-    (ironclad:derive-key kdf (sb-ext:string-to-octets passphrase :external-format :utf-8)
-                         salt iterations 32)))
+;;; All of it is natrium, and every secret -- the passphrase bytes, the derived key, the
+;;; padded seed, the decrypted plaintext -- is in fixed memory.  AES is natrium's
+;;; constant-time (bit-sliced, table-free) implementation.  The file format is unchanged.
 
-(defun %pkcs7-pad (bytes)
-  "PKCS#7-pad BYTES to a multiple of the 16-byte AES block size."
-  (let* ((blk 16)
-         (pad (- blk (mod (length bytes) blk)))   ; 1..16 (full block when already aligned)
-         (out (%b (+ (length bytes) pad))))
-    (replace out bytes)
-    (fill out pad :start (length bytes))
+(defmacro %with-derived-key ((key passphrase salt iterations) &body body)
+  "Bind KEY to the 32-byte PBKDF2-HMAC-SHA256 key (fixed scratch) for PASSPHRASE and SALT."
+  (let ((pw (gensym "PW")) (heap (gensym "HEAP")))
+    `(gossamer:with-fixed-scratch ((,key :octets 32))
+       (let* ((,heap (sb-ext:string-to-octets ,passphrase :external-format :utf-8))
+              (,pw (prog1 (gossamer:pooled-copy ,heap) (fill ,heap 0))))
+         (unwind-protect (natrium:pbkdf2-into :sha256 ,pw ,salt ,iterations ,key)
+           (gossamer:free ,pw)))
+       ,@body)))
+
+(defun %mac (key salt iv ct)
+  "HMAC-SHA256(KEY) over salt|iv|ciphertext (as parts: nothing is concatenated)."
+  (let ((out (%b 32)))
+    (natrium:hmac-sha256-into key (list salt iv ct) out)
     out))
-
-(defun %pkcs7-unpad (bytes)
-  "Strip and validate PKCS#7 padding; signal on a malformed pad (a decryption-failure signal)."
-  (let ((n (length bytes)))
-    (when (or (zerop n) (plusp (mod n 16)))
-      (error "wrong passphrase or corrupt wallet (bad block length)"))
-    (let ((pad (aref bytes (1- n))))
-      (when (or (zerop pad) (> pad 16) (> pad n))
-        (error "wrong passphrase or corrupt wallet (bad padding)"))
-      (loop for i from (- n pad) below n
-            unless (= (aref bytes i) pad)
-              do (error "wrong passphrase or corrupt wallet (bad padding)"))
-      (subseq bytes 0 (- n pad)))))
-
-(defun %hmac (key &rest byte-vectors)
-  "HMAC-SHA256(KEY) over the concatenation of BYTE-VECTORS."
-  (let ((mac (ironclad:make-mac :hmac key :sha256)))
-    (dolist (v byte-vectors) (ironclad:update-mac mac v))
-    (ironclad:produce-mac mac)))
 
 (defun %constant-time-equal (a b)
   "Constant-time byte-vector compare (avoids leaking the MAC mismatch position via timing)."
@@ -80,34 +66,49 @@
 (defun %encrypt-seed (seed passphrase iterations)
   "Encrypt SEED under PASSPHRASE.  Returns a plist :salt/:iv/:ciphertext (hex) + :mac (hex)
    and the effective :iterations.  Encrypt-then-MAC over salt|iv|ciphertext."
-  (let* ((salt   (ironclad:make-random-salt 16))
-         (iv     (ironclad:make-random-salt 16))
-         (key    (%derive-key passphrase salt iterations))
-         (padded (%pkcs7-pad (coerce seed '(vector (unsigned-byte 8)))))
-         (ct     (%b (length padded)))
-         (cipher (ironclad:make-cipher :aes :key key :mode :cbc :initialization-vector iv)))
-    (ironclad:encrypt cipher padded ct)
-    (list :iterations iterations
-          :salt       (w:bytes->hex salt)
-          :iv         (w:bytes->hex iv)
-          :ciphertext (w:bytes->hex ct)
-          :mac        (w:bytes->hex (%hmac key salt iv ct)))))
+  (let* ((salt (natrium:random-bytes 16))
+         (iv   (natrium:random-bytes 16))
+         (n    (length seed))
+         (plen (* 16 (1+ (floor n 16)))))              ; PKCS#7: 1..16 bytes of padding
+    (%with-derived-key (key passphrase salt iterations)
+      (let ((padded (gossamer:acquire :octets plen)))
+        (unwind-protect
+             (progn
+               (replace padded seed)
+               (fill padded (- plen n) :start n)
+               (let ((ct (natrium:with-aes-key (k key) (natrium:aes-cbc-encrypt k iv padded))))
+                 (list :iterations iterations
+                       :salt       (w:bytes->hex salt)
+                       :iv         (w:bytes->hex iv)
+                       :ciphertext (w:bytes->hex ct)
+                       :mac        (w:bytes->hex (%mac key salt iv ct)))))
+          (gossamer:free padded))))))
 
 (defun %decrypt-seed (data passphrase)
-  "Re-derive the key from PASSPHRASE, verify the MAC, then AES-CBC-decrypt back to the raw seed.
-   Signals a clear error on a wrong passphrase or any tampering."
+  "Re-derive the key from PASSPHRASE, verify the MAC, then AES-CBC-decrypt back to the raw
+   seed, returned as a POOLED FIXED buffer the caller FIXED:FREEs.  Signals a clear error on a
+   wrong passphrase or any tampering (the MAC is checked before anything is decrypted)."
   (let* ((iterations (getf data :kdf-iterations))
          (salt       (w:hex->bytes (getf data :salt)))
          (iv         (w:hex->bytes (getf data :iv)))
          (ct         (w:hex->bytes (getf data :ciphertext)))
          (stored-mac (w:hex->bytes (getf data :mac)))
-         (key        (%derive-key passphrase salt iterations)))
-    (unless (%constant-time-equal stored-mac (%hmac key salt iv ct))
-      (error "wrong passphrase or corrupt wallet"))
-    (let ((pt (%b (length ct)))
-          (cipher (ironclad:make-cipher :aes :key key :mode :cbc :initialization-vector iv)))
-      (ironclad:decrypt cipher ct pt)
-      (%pkcs7-unpad pt))))
+         (n          (length ct)))
+    (%with-derived-key (key passphrase salt iterations)
+      (unless (%constant-time-equal stored-mac (%mac key salt iv ct))
+        (error "wrong passphrase or corrupt wallet"))
+      (when (or (zerop n) (plusp (mod n 16)))
+        (error "wrong passphrase or corrupt wallet (bad block length)"))
+      (let ((pt (gossamer:acquire :octets n)))
+        (unwind-protect
+             (progn
+               (natrium:with-aes-key (k key) (natrium:aes-cbc-decrypt-into k iv ct pt))
+               (let ((pad (aref pt (1- n))))
+                 (when (or (zerop pad) (> pad 16) (> pad n)
+                           (loop for i from (- n pad) below n thereis (/= (aref pt i) pad)))
+                   (error "wrong passphrase or corrupt wallet (bad padding)"))
+                 (gossamer:pooled-copy pt :end (- n pad))))
+          (gossamer:free pt))))))
 
 (defun %coin->plist (coin)
   "Serialize one wcoin to a property list with hex-encoded byte fields and the (chain,index)
@@ -183,14 +184,19 @@
     (let* ((type      (getf data :type))
            (gap-limit (getf data :gap-limit))
            (account   (getf data :account))
+           ;; the seed reaches fixed memory either way: decrypted straight into it, or
+           ;; decoded from plaintext hex with the heap copy wiped at once
            (seed      (if (getf data :encrypted-p)
                           (progn
                             (unless (and passphrase (plusp (length passphrase)))
                               (error "wallet is encrypted: a passphrase is required to load it"))
                             (%decrypt-seed data passphrase))
-                          (w:hex->bytes (getf data :seed))))
-           (wallet    (wal:make-wallet-from-seed seed :type type :account account
-                                                       :gap-limit gap-limit)))
+                          (let ((heap-seed (w:hex->bytes (getf data :seed))))
+                            (prog1 (gossamer:pooled-copy heap-seed) (fill heap-seed 0)))))
+           (wallet    (unwind-protect
+                           (wal:make-wallet-from-seed seed :type type :account account
+                                                           :gap-limit gap-limit)
+                        (gossamer:free seed))))
       (dolist (cp (getf data :coins))
         (let* ((chain (getf cp :chain))
                (index (getf cp :index))

@@ -34,7 +34,8 @@
 (defun seed (n)
   "A deterministic 64-byte (512-bit) seed."
   (let ((s (make-array 64 :element-type '(unsigned-byte 8))))
-    (dotimes (i 64 s) (setf (aref s i) (logand (+ n (* 7 i)) 255)))))
+    (dotimes (i 64) (setf (aref s i) (logand (+ n (* 7 i)) 255)))
+    (gossamer:pooled-copy s)))
 
 (defun fake-hash (n)
   (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))

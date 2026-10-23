@@ -292,8 +292,13 @@
     (w:w-i64 wr amount) (w:w-varint wr (length script)) (w:w-bytes wr script)
     (w:writer-bytes wr)))
 
+(defun fk (d)
+  "Throwaway test key D (an integer from CL:RANDOM) as the fixed 32-byte buffer the
+signers take.  Test harness only: these keys are public by construction."
+  (gossamer:pooled-copy (ec:int-to-bytes32 d)))
+
 (defun random-priv () (1+ (random (1- ec:*secp256k1-n*))))
-(defun even-y-priv (d) (if (evenp (cdr (ec:secp-pubkey d))) d (- ec:*secp256k1-n* d)))
+(defun even-y-priv (d) (if (evenp (cdr (ec:secp-mul-point d (ec:secp-generator)))) d (- ec:*secp256k1-n* d)))
 (defun bvec (&rest xs) (coerce xs '(simple-array (unsigned-byte 8) (*))))
 
 (defun spend-tx-for (spk amount)
@@ -305,15 +310,15 @@
 (defun build-keypath ()
   "Build a valid taproot key-path spend.  Returns (values spend spk amount)."
   (let* ((d (even-y-priv (random-priv)))
-         (px (ec:int-to-bytes32 (car (ec:secp-pubkey d))))
+         (px (ec:int-to-bytes32 (car (ec:secp-mul-point d (ec:secp-generator)))))
          (tweak (ec:bytes-to-int (sch:tagged-hash "TapTweak" px)))   ; key-path: no script tree
          (out-priv (mod (+ d tweak) ec:*secp256k1-n*))
-         (qx (ec:int-to-bytes32 (car (ec:secp-pubkey out-priv))))
+         (qx (ec:int-to-bytes32 (car (ec:secp-mul-point out-priv (ec:secp-generator)))))
          (spk (concatenate '(simple-array (unsigned-byte 8) (*)) (bvec #x51 #x20) qx))
          (amount (1+ (random 1000000000)))
          (spend (spend-tx-for spk amount))
          (digest (s:taproot-sighash spend 0 (vector (cons amount spk)) 0 :ext-flag 0))
-         (sig (sch:schnorr-sign out-priv digest)))
+         (sig (sch:schnorr-sign (fk out-priv) digest)))
     (setf (tx:tx-witnesses spend) (list (list sig)))
     (tx:finalize-tx spend)
     (values spend spk amount)))
@@ -321,21 +326,21 @@
 (defun build-tapscript ()
   "Build a valid taproot script-path spend: a single <pk> CHECKSIG tapleaf."
   (let* ((leaf-priv (even-y-priv (random-priv)))
-         (leaf-px (ec:int-to-bytes32 (car (ec:secp-pubkey leaf-priv))))
+         (leaf-px (ec:int-to-bytes32 (car (ec:secp-mul-point leaf-priv (ec:secp-generator)))))
          (leaf-script (concatenate '(simple-array (unsigned-byte 8) (*)) (bvec #x20) leaf-px (bvec #xac)))
          (leaf (s:tapleaf-hash #xc0 leaf-script))
          (d (even-y-priv (random-priv)))
-         (px (ec:int-to-bytes32 (car (ec:secp-pubkey d))))
+         (px (ec:int-to-bytes32 (car (ec:secp-mul-point d (ec:secp-generator)))))
          (tweak (ec:bytes-to-int (sch:tagged-hash "TapTweak"
                   (concatenate '(simple-array (unsigned-byte 8) (*)) px leaf))))
-         (qpt (ec:secp-add-points (ec:secp-pubkey d) (ec:secp-mul-point tweak (ec:secp-generator))))
+         (qpt (ec:secp-add-points (ec:secp-mul-point d (ec:secp-generator)) (ec:secp-mul-point tweak (ec:secp-generator))))
          (qx (ec:int-to-bytes32 (car qpt)))
          (parity (logand (cdr qpt) 1))
          (spk (concatenate '(simple-array (unsigned-byte 8) (*)) (bvec #x51 #x20) qx))
          (amount (1+ (random 1000000000)))
          (spend (spend-tx-for spk amount))
          (digest (s:taproot-sighash spend 0 (vector (cons amount spk)) 0 :ext-flag 1 :tapleaf-hash leaf))
-         (sig (sch:schnorr-sign leaf-priv digest))
+         (sig (sch:schnorr-sign (fk leaf-priv) digest))
          (control (concatenate '(simple-array (unsigned-byte 8) (*)) (bvec (logior #xc0 parity)) px)))
     (setf (tx:tx-witnesses spend) (list (list sig leaf-script control)))
     (tx:finalize-tx spend)

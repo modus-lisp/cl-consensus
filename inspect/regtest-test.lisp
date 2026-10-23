@@ -150,7 +150,7 @@
     (check "utxo has 101 coinbase coins" (u:utxo-count utxo) 101)
     ;; fund a P2PKH wallet by spending block 1's coinbase (OP_TRUE) to the wallet.
     ;; The coinbase is deterministic, so re-deriving coinbase-tx(1) reproduces its txid.
-    (let* ((wallet (wal:make-wallet-from-seed (w:hex->bytes "000102030405060708090a0b0c0d0e0f")
+    (let* ((wallet (wal:make-wallet-from-seed (gossamer:pooled-copy (w:hex->bytes "000102030405060708090a0b0c0d0e0f"))
                                               :type :p2pkh))
            (wspk (wal::waddr-script (aref (wal:wallet-receive wallet) 0)))
            (cb1-txid (tx:tx-txid (coinbase-tx 1 (v:block-subsidy 1) *op-true*))))
@@ -195,7 +195,7 @@
   (setf *blocks* (make-hash-table :test 'equal))
   (let ((utxo (setup-regtest)))
     (dotimes (i 101) (mine utxo))                      ; OP_TRUE coinbases (block 1 matures)
-    (let* ((wallet (wal:make-wallet-from-seed (w:hex->bytes "000102030405060708090a0b0c0d0e0f")
+    (let* ((wallet (wal:make-wallet-from-seed (gossamer:pooled-copy (w:hex->bytes "000102030405060708090a0b0c0d0e0f"))
                                               :type :p2tr))
            (wspk (wal::waddr-script (aref (wal:wallet-receive wallet) 0)))
            (cb1 (tx:tx-txid (coinbase-tx 1 (v:block-subsidy 1) *op-true* 0)))
