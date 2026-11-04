@@ -501,16 +501,33 @@
     (multiple-value-bind (result err) (rpc-call method params)
       (obj "result" (if err 'null result) "error" (or err 'null) "id" (or id 'null)))))
 
-(defun rpc-handler ()
-  (setf (ht:content-type*) "application/json")
-  (let* ((raw (ht:raw-post-data :force-text t))
-         (parsed (handler-case (json:parse raw) (error () nil))))
+(defun rpc-respond (raw)
+  "The JSON-RPC reply (a string) to request body RAW.  Shared by Hunchentoot's
+   handler and, on modus, the net layer's (see START-RPC-SERVER)."
+  (let ((parsed (handler-case (json:parse raw) (error () nil))))
     (json:stringify
      (cond
        ((null parsed) (obj "result" 'null
                            "error" (obj "code" -32700 "message" "Parse error") "id" 'null))
        ((vectorp parsed) (map 'vector #'handle-one parsed))   ; batch
        (t (handle-one parsed))))))
+
+(defun rpc-handler ()
+  (setf (ht:content-type*) "application/json")
+  (rpc-respond (ht:raw-post-data :force-text t)))
+
+(defun start-rpc-server (port)
+  "Serve JSON-RPC on PORT.  Hunchentoot on SBCL; on modus the net layer, whose
+   handler runs on this thread as the follow loop pumps (Hunchentoot's acceptor
+   and worker threads share its state, which modus refuses)."
+  #+modus (cl-consensus.netloop:serve-http "0.0.0.0" port #'rpc-respond)
+  #-modus
+  (progn
+    (setf *acceptor* (make-instance 'ht:easy-acceptor :port port :address "0.0.0.0"))
+    (setf (ht:acceptor-message-log-destination *acceptor*) nil
+          (ht:acceptor-access-log-destination *acceptor*) nil)
+    (ht:define-easy-handler (rpc :uri "/") () (rpc-handler))
+    (ht:start *acceptor*)))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Live chain-follow — keep a peer, extend the header chain as blocks arrive
@@ -922,7 +939,7 @@
                         (peer-host "127.0.0.1") (conns 2) (cache-gb 24)
                         (onion-service nil)
                         (listen-port (w:net-port w:*network*)) (rpc-port *rpc-port*)
-                        (max-peers 64) (poll 30) (discover 8)
+                        (max-peers 64) (poll 30) (discover 8) (control t)
                         (archive nil) (archive-peers 16) (prune nil)
                         (mempool-path (namestring (merge-pathnames ".cl-consensus/mempool.dat"
                                                                    (user-homedir-pathname)))))
@@ -960,12 +977,8 @@
               (format t "~&[node] mempool restored: ~d tx~%" n) (force-output))
           (serious-condition (e) (format t "~&[node] mempool restore skipped: ~a~%" e) (force-output))))
       (register-methods)
-      (setf *acceptor* (make-instance 'ht:easy-acceptor :port rpc-port :address "0.0.0.0"))
-      (setf (ht:acceptor-message-log-destination *acceptor*) nil
-            (ht:acceptor-access-log-destination *acceptor*) nil)
-      (ht:define-easy-handler (rpc :uri "/") () (rpc-handler))
-      (ht:start *acceptor*)
-      (unless *control-thread*
+      (start-rpc-server rpc-port)
+      (when (and control (not *control-thread*))
         (setf *control-thread* (bt:make-thread #'control-loop :name "btc-node control")))
       (s:start-listener :port listen-port :max-peers max-peers)
       ;; optionally run our OWN v3 onion service (inbound over Tor).  Needs the provider

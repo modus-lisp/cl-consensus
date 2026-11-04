@@ -252,6 +252,28 @@
     (cond ((>= (length *inbound-peers*) max-peers) nil)
           (t (push pr *inbound-peers*) t))))
 
+#+modus
+(defun start-listener (&key (port (w:net-port w:*network*)) (host "0.0.0.0") (max-peers 64))
+  "START-LISTENER on modus: the net thread accepts (see netloop.lisp), and each
+   inbound peer handshakes and is served on THIS thread as its messages arrive.
+   Returns the port bound."
+  (let ((bound (cl-consensus.netloop:net-listen
+                host port
+                (lambda (conn)
+                  (if (>= (%reap-inbound) max-peers)
+                      (cl-consensus.netloop:net-close conn)               ; at cap: drop
+                      (p:accept-netconn
+                       conn
+                       (lambda (pr)
+                         (install-serving-handlers pr)
+                         (bt:with-lock-held (*inbound-lock*) (push pr *inbound-peers*))
+                         (format t "~&[serve] inbound peer up: ~a ~a (height ~a)~%"
+                                 (p:peer-addr pr) (p:peer-subver pr) (p:peer-height pr))
+                         (force-output))))))))
+    (format t "~&[serve] listening for inbound peers on ~a:~d~%" host bound) (force-output)
+    (setf *listener-thread* bound)))
+
+#-modus
 (defun start-listener (&key (port (w:net-port w:*network*)) (host "0.0.0.0") (max-peers 64))
   "Accept inbound P2P connections in a background thread: handshake each (advertising
    NODE_NETWORK|WITNESS), install serving handlers, track it (up to MAX-PEERS).  Each
@@ -432,4 +454,4 @@
                   (c:tip-height) (%reap-inbound)
                   (if *block-store* (bs:block-store-count *block-store*) 0))
           (force-output))
-        (sleep 5)))))
+        (p:pause-for 5)))))

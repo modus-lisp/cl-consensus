@@ -72,5 +72,10 @@
                    (cond ((or (null e) (string= e "") (string= e "0")) nil)
                          (t (or (ignore-errors (parse-integer e)) t))))
   :onion-service *onion-service-p*
-  :poll          (%env-int "POLL" 30))
+  :poll          (%env-int "POLL" 30)
+  ;; DISCOVER=0: follow SERVE_PEER only, no peer manager (a private devnet has no
+  ;; other peers).  CONTROL=0: no control socket (it is a fixed port, so two nodes
+  ;; on one host collide; and on modus it is a thread sharing the node's state).
+  :discover      (%env-int "DISCOVER" 8)
+  :control       (not (equal (%env "CONTROL" "1") "0")))
 (sb-ext:exit :code 0)

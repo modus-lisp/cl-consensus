@@ -64,10 +64,10 @@
     (setf s:*utxo* utxo s:*mempool* (mp:make-mempool) s:*orphans* (s::make-orphan-pool)
           s:*tx-relay-enabled* t)
     (s:start-listener :port port :host "127.0.0.1" :max-peers 8)
-    (sleep 1)
+    (p:pause-for 1)
     (let ((a (p:connect-peer "127.0.0.1" :port port :start-height 0 :timeout 5))
           (b (p:connect-peer "127.0.0.1" :port port :start-height 0 :timeout 5)))
-      (loop repeat 50 until (>= (length s:*inbound-peers*) 2) do (sleep 0.1))
+      (loop repeat 50 until (>= (length s:*inbound-peers*) 2) do (p:pause-for 0.1))
       (check "two inbound peers registered" (>= (length s:*inbound-peers*) 2))
       ;; B watches for inv + tx
       (let ((b-inv nil) (b-tx nil))
@@ -77,15 +77,15 @@
         (let* ((t1 (build-tx (list (cons (aref hashes 0) 0)) (list (- +coin+ 5000))))
                (t1id (tx:txid-hex t1)))
           (send-tx a t1)
-          (loop repeat 50 until (mp:mempool-get s:*mempool* t1id) do (sleep 0.1))
+          (loop repeat 50 until (mp:mempool-get s:*mempool* t1id) do (p:pause-for 0.1))
           (check "tx accepted into mempool" (mp:mempool-get s:*mempool* t1id))
-          (loop repeat 50 until b-inv do (sleep 0.1))
+          (loop repeat 50 until b-inv do (p:pause-for 0.1))
           (check "tx inv-announced to the other peer"
                  (and b-inv (= (length b-inv) 1) (= (car (first b-inv)) s::+msg-tx+)
                       (string= (w:hash->hex (cdr (first b-inv))) t1id)))
           ;; ---- B getdata's the tx ----
           (p:send b "getdata" (s:build-inv-message (list (cons s::+msg-witness-tx+ (w:hex->hash t1id)))))
-          (loop repeat 50 until b-tx do (sleep 0.1))
+          (loop repeat 50 until b-tx do (p:pause-for 0.1))
           (check "tx served on getdata, exact bytes"
                  (and b-tx (equalp b-tx (tx:serialize-tx t1 :witness t)))))
         ;; ---- orphan: child before parent ----
@@ -94,12 +94,12 @@
                (child (build-tx (list (cons (tx:tx-txid parent) 0)) (list (- +coin+ 10000))))
                (cid (tx:txid-hex child)))
           (send-tx a child)                          ; parent unknown -> orphan
-          (loop repeat 30 until (gethash cid (s::orphan-pool-txs s:*orphans*)) do (sleep 0.1))
+          (loop repeat 30 until (gethash cid (s::orphan-pool-txs s:*orphans*)) do (p:pause-for 0.1))
           (check "child parked as orphan" (gethash cid (s::orphan-pool-txs s:*orphans*)))
           (check "child NOT yet in mempool" (null (mp:mempool-get s:*mempool* cid)))
           (send-tx a parent)                         ; now parent arrives
           (loop repeat 50 until (and (mp:mempool-get s:*mempool* pid)
-                                     (mp:mempool-get s:*mempool* cid)) do (sleep 0.1))
+                                     (mp:mempool-get s:*mempool* cid)) do (p:pause-for 0.1))
           (check "parent accepted" (mp:mempool-get s:*mempool* pid))
           (check "orphan child resolved into mempool" (mp:mempool-get s:*mempool* cid))
           (check "orphan pool drained" (null (gethash cid (s::orphan-pool-txs s:*orphans*))))))

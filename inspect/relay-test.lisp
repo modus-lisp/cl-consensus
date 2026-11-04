@@ -45,10 +45,10 @@
     (setf s:*block-store* (bs:open-block-store path))
     (loop for ht from 1 to n do (bs:store-block s:*block-store* (fake-raw-block (c:header-at-height ht))))
     (s:start-listener :port port :host "127.0.0.1" :max-peers 8)
-    (sleep 1)
+    (p:pause-for 1)
     (let ((out (p:connect-peer "127.0.0.1" :port port :start-height 0 :timeout 5)))
       ;; wait for the daemon-side inbound peer to register
-      (loop repeat 50 until s:*inbound-peers* do (sleep 0.1))
+      (loop repeat 50 until s:*inbound-peers* do (p:pause-for 0.1))
       (unless s:*inbound-peers* (setf ok nil) (format t "  *** no inbound peer registered~%"))
       (let* ((target (c:header-at-height n)) (hash (c:header-hash target)) (raw (fake-raw-block target)))
         ;; ---- INV PATH ----
@@ -58,7 +58,7 @@
                               (when (and (>= (length payload) 80) (equalp (w:hash256 (subseq payload 0 80)) hash))
                                 (setf got-blk payload bdone t))))
           (s:announce-block target)
-          (loop repeat 50 until idone do (sleep 0.1))
+          (loop repeat 50 until idone do (p:pause-for 0.1))
           (cond
             ((not idone) (setf ok nil) (format t "  *** no inv received~%"))
             ((not (and (= (length got-inv) 1) (equalp (cdr (first got-inv)) hash)
@@ -67,7 +67,7 @@
             (t (format t "[relay-test] inv announce: OK~%")))
           ;; client follows up with getdata; serve-getdata must return exact bytes
           (p:send out "getdata" (cl-consensus.block::build-getdata-payload blk:+msg-witness-block+ hash))
-          (loop repeat 50 until bdone do (sleep 0.1))
+          (loop repeat 50 until bdone do (p:pause-for 0.1))
           (cond
             ((not bdone) (setf ok nil) (format t "  *** no block after getdata~%"))
             ((not (equalp got-blk raw)) (setf ok nil) (format t "  *** relayed block bytes mismatch~%"))
@@ -77,13 +77,13 @@
           (p:send out "sendheaders" #())
           ;; wait until the daemon-side inbound peer records the preference
           (loop repeat 50 until (and s:*inbound-peers* (p:peer-prefers-headers (first s:*inbound-peers*)))
-                do (sleep 0.1))
+                do (p:pause-for 0.1))
           (unless (and s:*inbound-peers* (p:peer-prefers-headers (first s:*inbound-peers*)))
             (setf ok nil) (format t "  *** inbound peer did not record sendheaders~%"))
           (p:on out "headers" (lambda (pr payload) (declare (ignore pr))
                                 (setf got-hdrs (cl-consensus.chain::parse-headers-message payload) hdone t)))
           (s:announce-block target)
-          (loop repeat 50 until hdone do (sleep 0.1))
+          (loop repeat 50 until hdone do (p:pause-for 0.1))
           (cond
             ((not hdone) (setf ok nil) (format t "  *** no headers announcement received~%"))
             ((not (and (= (length got-hdrs) 1) (equalp (c:header-hash (first got-hdrs)) hash)))

@@ -416,7 +416,7 @@
     ;; wait one batch at a time; a missed batch within STALL-TIMEOUT means the peer
     ;; went silent — give up (timed-out) rather than hang the follow loop forever.
     (loop
-      (let ((woke (bt:wait-on-semaphore done :timeout stall-timeout)))
+      (let ((woke (p:await-semaphore done :timeout stall-timeout)))
         (when last-error (error last-error))
         (when (or finished (not woke))
           (return (values added (and (not woke) (not finished)))))))))

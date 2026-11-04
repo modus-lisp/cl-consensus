@@ -124,7 +124,7 @@
               (serious-condition (c) (setf err c) (bt:signal-semaphore done)))))
     (p:send peer "getdata"
             (build-getdata-payload (if witness +msg-witness-block+ +msg-block+) hash))
-    (unless (bt:wait-on-semaphore done :timeout timeout)
+    (unless (p:await-semaphore done :timeout timeout)
       (error "timed out waiting for block ~a" (w:hash->hex hash)))
     (when err (error err))
     result))
@@ -143,7 +143,7 @@
               (bt:signal-semaphore done))))
     (p:send peer "getdata"
             (build-getdata-payload (if witness +msg-witness-block+ +msg-block+) hash))
-    (unless (bt:wait-on-semaphore done :timeout timeout)
+    (unless (p:await-semaphore done :timeout timeout)
       (error "timed out waiting for raw block ~a" (w:hash->hex hash)))
     result))
 
@@ -191,7 +191,7 @@
         (p:send peer "getdata" (build-getdata-batch missing typ))
         ;; poll until this window's deadline or batch complete
         (let ((deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
-          (loop until (or (zerop remaining) (> (get-internal-real-time) deadline)) do (sleep 0.05)))))
+          (loop until (or (zerop remaining) (> (get-internal-real-time) deadline)) do (p:pause-for 0.05)))))
     (when (plusp remaining)
       (error "block batch: ~d of ~d still missing after retries" remaining (length hashes)))
     (map 'vector (lambda (h) (gethash (w:hash->hex h) results)) hashes)))

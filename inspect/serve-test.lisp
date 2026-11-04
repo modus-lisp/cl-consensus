@@ -53,7 +53,7 @@
     (format t "~&[serve-test] built chain to height ~d~%" (c:tip-height))
     ;; stand up the listener, give it a moment to bind
     (s:start-listener :port port :host "127.0.0.1" :max-peers 8)
-    (sleep 1)
+    (p:pause-for 1)
     ;; loopback-connect (our connect-peer drives the inbound accept-peer handshake)
     (let ((out (p:connect-peer "127.0.0.1" :port port :start-height 0 :timeout 5)))
       (format t "[serve-test] loopback handshake OK; peer ~a services ~a~%"
@@ -64,7 +64,7 @@
       (p:send out "getheaders"
               (cl-consensus.chain::build-getheaders-payload (list (c:header-hash c:*genesis*))))
       ;; wait for the response
-      (loop repeat 50 until done do (sleep 0.1))
+      (loop repeat 50 until done do (p:pause-for 0.1))
       (cond
         ((not done) (setf ok nil) (format t "  *** no headers response~%"))
         (t (let ((hs (cl-consensus.chain::parse-headers-message got)))
@@ -87,7 +87,7 @@
         (p:on out "block" (lambda (pr payload) (declare (ignore pr)) (setf gotblk payload bdone t)))
         (p:send out "getdata"
                 (cl-consensus.block::build-getdata-payload blk:+msg-witness-block+ (c:header-hash target)))
-        (loop repeat 50 until bdone do (sleep 0.1))
+        (loop repeat 50 until bdone do (p:pause-for 0.1))
         (cond
           ((not bdone) (setf ok nil) (format t "  *** no block response to getdata~%"))
           ((not (equalp gotblk raw)) (setf ok nil) (format t "  *** served block bytes mismatch~%"))
@@ -98,7 +98,7 @@
           (p:on out "notfound" (lambda (pr payload) (declare (ignore pr)) (setf nf payload nfdone t)))
           (p:send out "getdata"
                   (cl-consensus.block::build-getdata-payload blk:+msg-witness-block+ unknown))
-          (loop repeat 50 until nfdone do (sleep 0.1))
+          (loop repeat 50 until nfdone do (p:pause-for 0.1))
           (if (and nfdone nf) (format t "[serve-test] unknown getdata -> notfound: OK~%")
               (progn (setf ok nil) (format t "  *** expected notfound for unknown block~%"))))
         (ignore-errors (bs:close-block-store s:*block-store*))

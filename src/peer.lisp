@@ -13,10 +13,12 @@
   (:use #:cl)
   (:nicknames #:btc-peer)
   (:local-nicknames (#:w #:cl-consensus.wire) (#:bt #:bordeaux-threads) (#:tr #:cl-transport)
-                    (#:onion #:cl-consensus.onion))
+                    (#:onion #:cl-consensus.onion) (#:nl #:cl-consensus.netloop))
   (:export
    #:peer #:peer-addr #:peer-version #:peer-subver #:peer-height
    #:peer-services #:peer-alive-p #:peer-connected-at #:peer-prefers-headers #:peer-wants-addrv2
+   #:pause-for #:wait-until #:await-semaphore
+   #+modus #:accept-netconn
    #:connect-peer #:start-read-loop #:run-read-loop #:accept-peer #:accept-peer-stream #:disconnect #:send #:on #:peer-log #:peer-host #:peer-port
    #:send-getaddr #:parse-addr-payload #:parse-addrv2-payload #:enable-discovery
    #:build-addrv2-message #:onion-addrv2-entry #:announce-address
@@ -68,6 +70,7 @@
 
 (defun read-fully (stream n)
   "Read exactly N bytes or signal end-of-file."
+  #+modus (when (nl:netconn-p stream) (return-from read-fully (nl:conn-read stream n)))
   (let ((buf (make-array n :element-type '(unsigned-byte 8)))
         (got 0))
     (loop while (< got n) do
@@ -106,8 +109,9 @@
   "Frame and send a message.  PAYLOAD is a byte vector (often a writer's bytes)."
   (let ((bytes (w:encode-message command payload)))
     (bt:with-lock-held ((peer-lock p))
-      (write-sequence bytes (peer-stream p))
-      (force-output (peer-stream p)))
+      (cond #+modus ((nl:netconn-p (peer-stream p)) (nl:conn-write (peer-stream p) bytes))
+            (t (write-sequence bytes (peer-stream p))
+               (force-output (peer-stream p)))))
     (peer-log p "-> ~a (~d bytes)" command (length payload))
     p))
 
@@ -184,6 +188,53 @@
     ;; by default (a pure leech ignores them; the serving daemon installs handlers).
     (t nil)))
 
+(defun pause-for (seconds)
+  "Wait SECONDS.  Use this, not SLEEP, while waiting for a peer: on modus it is
+   what delivers the peer's messages (and runs their handlers) meanwhile."
+  (nl:pause-for seconds))
+
+(defun await-semaphore (semaphore &key timeout)
+  "BT:WAIT-ON-SEMAPHORE for a semaphore a PEER HANDLER signals.  On modus the
+   handler runs on this thread, and only while it pumps the net layer (see
+   PAUSE-FOR), so a plain wait would block the very reply it is waiting for: there
+   it polls the semaphore and pumps in between.  T if it was signalled."
+  #-modus (bt:wait-on-semaphore semaphore :timeout timeout)
+  #+modus (and (nl:wait-until (lambda () (bt:wait-on-semaphore semaphore :timeout 0))
+                              :timeout (or timeout most-positive-fixnum) :step 0.01)
+               t))
+
+(defun wait-until (predicate &key (timeout 5) (step 0.05))
+  "Call PREDICATE until it is true or TIMEOUT seconds pass (pausing STEP between
+   tries, see PAUSE-FOR); its last value."
+  (nl:wait-until predicate :timeout timeout :step step))
+
+;;; On modus a peer has no read thread: its connection's ON-DATA runs on the owner
+;;; thread whenever input arrives (see netloop.lisp), and dispatches every complete
+;;; message buffered by then.
+#+modus
+(defun %frame-ready-p (c)
+  (and (>= (nl:conn-available c) 24)
+       (>= (nl:conn-available c) (+ 24 (nl:conn-peek-u32 c 16)))))
+
+#+modus
+(defun %drain (p)
+  "Dispatch every complete message buffered on P's connection, as READ-LOOP would."
+  (let ((c (peer-stream p)))
+    (handler-case
+        (loop while (and (peer-alive p) (%frame-ready-p c)) do
+          (multiple-value-bind (command payload) (read-message p)
+            (peer-log p "<- ~a (~d bytes)" command (length payload))
+            (unless (handle-builtin p command payload)
+              (dispatch p command payload))))
+      (serious-condition (e)
+        (when (peer-alive p)
+          (format t "~&[peer ~a] read loop ended: ~a~%" (peer-addr p) e) (force-output))
+        (setf (peer-alive p) nil)
+        (nl:net-close c)))
+    (when (and (nl:netconn-eof c) (not (%frame-ready-p c)))
+      (setf (peer-alive p) nil)
+      (nl:net-close c))))
+
 (defun read-loop (p)
   (handler-case
       (loop while (peer-alive p) do
@@ -211,6 +262,11 @@
 ;;; ----------------------------------------------------------------------------
 
 (defun start-read-loop (p)
+  #+modus
+  (when (nl:netconn-p (peer-stream p))
+    (setf (nl:netconn-on-data (peer-stream p)) (lambda (c) (declare (ignore c)) (%drain p)))
+    (%drain p)                            ; anything that arrived with the handshake
+    (return-from start-read-loop p))
   "Clear the connect-time input timeout and spawn P's async read loop; return P.
    Call this from a LONG-LIVED thread: in SBCL a read loop spawned inside an
    ephemeral worker thread dies when that worker exits, so a parallel dialer must
@@ -229,6 +285,11 @@
    the peer closes).  Parallel dialers use this so the dialing thread BECOMES the
    peer's long-lived owner: a socket opened in a thread that then exits is torn down
    with it, so the connecting thread must live as long as the connection."
+  #+modus
+  (when (nl:netconn-p (peer-stream p))
+    (start-read-loop p)
+    (loop while (peer-alive p) do (pause-for 0.25))
+    (return-from run-read-loop nil))
   #+sbcl (ignore-errors (setf (sb-impl::fd-stream-timeout (peer-stream p)) nil))
   (setf (peer-thread p) (bt:current-thread))
   (read-loop p))
@@ -274,7 +335,11 @@
         ((and (not (eq transport :direct)) (%private-host-p host))
          (setf transport :direct)))       ; LAN/loopback peers can't route through Tor
   (multiple-value-bind (stream closer)
-      (tr:dial host port :transport transport :timeout timeout)
+      #+modus (if (eq transport :direct)
+                  (let ((c (nl:net-connect host port :timeout timeout)))
+                    (values c (lambda () (nl:net-close c))))
+                  (tr:dial host port :transport transport :timeout timeout))
+      #-modus (tr:dial host port :transport transport :timeout timeout)
     (let ((p (make-peer :host host :port port :stream stream :closer closer
                         :verbose verbose
                         :connected-at (get-universal-time)))
@@ -357,6 +422,50 @@
           ((string= command "sendaddrv2") (setf (peer-wants-addrv2 p) t))
           (t nil)))))                  ; ignore wtxidrelay/etc. during handshake
   p)
+
+#+modus
+(defun accept-netconn (conn on-ready &key (services *advertised-services*)
+                                          (start-height 0) (verbose nil))
+  "ACCEPT-PEER for an inbound NETCONN, driven by input rather than by a blocking
+   read: the owner thread may itself be the peer on the far end (a loopback dial
+   in progress), so it must not wait here.  The INBOUND handshake runs as messages
+   arrive; once both version and verack are in, ON-READY is called with the live
+   peer and the connection switches to ordinary dispatch."
+  (let* ((p (make-peer :host (nl:netconn-host conn) :port (nl:netconn-port conn)
+                       :stream conn :closer (lambda () (nl:net-close conn))
+                       :verbose verbose :connected-at (get-universal-time)))
+         (got-version nil) (got-verack nil))
+    (setf (nl:netconn-on-data conn)
+          (lambda (c)
+            (handler-case
+                (progn
+                  (loop while (and (not (and got-version got-verack)) (%frame-ready-p c)) do
+                    (multiple-value-bind (command payload) (read-message p)
+                      (peer-log p "<- ~a (~d bytes)" command (length payload))
+                      (cond
+                        ((string= command "version")
+                         (multiple-value-bind (v s sv h) (parse-version-payload payload)
+                           (setf (peer-version p) v (peer-services p) s
+                                 (peer-subver p) sv (peer-height p) h))
+                         (setf got-version t)
+                         (send p "version" (build-version-payload :services services
+                                                                  :start-height start-height))
+                         (send p "sendaddrv2" #())
+                         (send p "verack" #()))
+                        ((string= command "verack") (setf got-verack t))
+                        ((string= command "sendaddrv2") (setf (peer-wants-addrv2 p) t))
+                        (t nil))))
+                  (cond ((and got-version got-verack)
+                         (setf (nl:netconn-on-data c) (lambda (c) (declare (ignore c)) (%drain p)))
+                         (funcall on-ready p)
+                         (%drain p))
+                        ((nl:netconn-eof c) (setf (peer-alive p) nil))))
+              (serious-condition (e)
+                (format t "~&[peer ~a] inbound handshake failed: ~a~%" (peer-addr p) e)
+                (force-output)
+                (setf (peer-alive p) nil)
+                (nl:net-close c)))))
+    p))
 
 (defun %start-inbound-loop (p)
   (setf (peer-thread p)
