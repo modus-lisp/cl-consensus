@@ -90,7 +90,7 @@ signers take.  Test harness only: these keys are public by construction."
   (format t "~%ECDSA (secp256k1):~%")
   (let* ((priv (1+ (random (1- ec:*secp256k1-n*))))
          (pub (ec:secp-mul-point priv (ec:secp-generator)))
-         (hash (w:hash256 (ironclad:ascii-string-to-byte-array "benchmark message")))
+         (hash (w:hash256 (w:ascii->bytes "benchmark message")))
          (sig (multiple-value-list (ec:ecdsa-sign-raw (fk priv) hash)))
          (r (first sig)) (s (second sig)))
     (bench "ecdsa-verify" ecdsa-reps (lambda () (ec:ecdsa-verify pub hash r s)))
@@ -98,10 +98,10 @@ signers take.  Test harness only: these keys are public by construction."
 
   ;; ---- Schnorr (BIP340 / taproot) -------------------------------------------
   (format t "~%Schnorr (BIP340):~%")
-  (let* ((priv (sch:tagged-hash "x" (ironclad:ascii-string-to-byte-array "k")))
+  (let* ((priv (sch:tagged-hash "x" (w:ascii->bytes "k")))
          (d (1+ (mod (ec:bytes-to-int priv) (1- ec:*secp256k1-n*))))
          (px (ec:int-to-bytes32 (car (ec:secp-mul-point d (ec:secp-generator)))))
-         (msg (w:sha256 (ironclad:ascii-string-to-byte-array "schnorr bench")))
+         (msg (w:sha256 (w:ascii->bytes "schnorr bench")))
          (sig (sch:schnorr-sign (fk d) msg)))
     (bench "schnorr-verify" schnorr-reps (lambda () (sch:schnorr-verify px msg sig))))
 

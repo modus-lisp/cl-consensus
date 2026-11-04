@@ -13,7 +13,6 @@
 
 (defpackage #:cl-consensus.shamir
   (:use #:common-lisp)
-  (:local-nicknames (#:ic #:ironclad))
   (:export #:gf-mul #:gf-div #:interpolate
            #:split-secret #:recover-secret #:+digest-length+
            #:+digest-index+ #:+secret-index+ #:+max-share-count+
@@ -78,17 +77,16 @@
 (defparameter +max-share-count+ 16)
 
 (defun random-bytes (n)
-  "N cryptographically-random bytes: the OS CSPRNG, ironclad Fortuna as fallback."
+  "N cryptographically-random bytes: the OS CSPRNG, natrium's DRBG as fallback."
   (handler-case
       (with-open-file (f "/dev/urandom" :element-type 'u8 :if-does-not-exist :error)
         (let ((b (u8vec n))) (read-sequence b f) b))
-    (error () (ic:random-data n (ic:make-prng :fortuna)))))
+    (error () (natrium:random-bytes n))))
 
 (defun create-digest (random-data shared-secret)
   "First 4 bytes of HMAC-SHA256(key=RANDOM-DATA, msg=SHARED-SECRET)."
-  (let ((mac (ic:make-mac :hmac (as-u8vec random-data) :sha256)))
-    (ic:update-mac mac (as-u8vec shared-secret))
-    (subseq (ic:produce-mac mac) 0 +digest-length+)))
+  (subseq (natrium:hmac-sha256 (as-u8vec random-data) (as-u8vec shared-secret))
+          0 +digest-length+))
 
 (defun split-secret (threshold count secret)
   "Split SECRET (bytes) into COUNT shares, any THRESHOLD of which recover it.

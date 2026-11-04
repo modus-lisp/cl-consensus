@@ -19,7 +19,7 @@
 ;;;; Run:  sbcl --non-interactive --load inspect/pagetree-utxo-oracle.lisp
 
 (require :asdf)
-(asdf:load-system "ironclad")
+(asdf:load-system "natrium")
 (asdf:load-system "pagetree")
 
 (let ((src (merge-pathnames "../src/" *load-pathname*)))

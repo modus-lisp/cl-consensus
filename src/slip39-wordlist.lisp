@@ -5,7 +5,7 @@
 
 (defpackage #:cl-consensus.slip39
   (:use #:common-lisp)
-  (:local-nicknames (#:ic #:ironclad) (#:sh #:cl-consensus.shamir)
+  (:local-nicknames (#:sh #:cl-consensus.shamir)
                     (#:b39 #:cl-consensus.bip39) (#:wal #:cl-consensus.wallet))
   (:export #:generate-mnemonics #:combine-mnemonics #:split-secret #:recover-secret
            #:*wordlist* #:mnemonic-words #:slip39-error

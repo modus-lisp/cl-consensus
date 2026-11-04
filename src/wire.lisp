@@ -16,7 +16,7 @@
   (:nicknames #:btc-wire)
   (:export
    ;; hashing / hex
-   #:sha256 #:hash256 #:hash160 #:bytes->hex #:hex->bytes #:rev #:hash->hex #:hex->hash
+   #:sha256 #:hash256 #:hash160 #:bytes->hex #:hex->bytes #:ascii->bytes #:rev #:hash->hex #:hex->hash
    ;; writer
    #:make-writer #:writer-bytes #:w-u8 #:w-u16 #:w-u32 #:w-u64 #:w-i32 #:w-i64
    #:w-bytes #:w-varint #:w-varstr #:w-hash #:w-bool #:w-netaddr #:w-port-be
@@ -45,7 +45,7 @@
 
 (declaim (inline sha256 hash256))
 (defun sha256 (bytes)
-  (ironclad:digest-sequence :sha256 bytes))
+  (natrium:sha256 (coerce bytes '(simple-array (unsigned-byte 8) (*)))))
 
 (defun hash256 (bytes)
   "Bitcoin HASH256 — double SHA-256.  Used for txids, block hashes, merkle, checksums."
@@ -53,13 +53,27 @@
 
 (defun hash160 (bytes)
   "RIPEMD160(SHA256(x)) — used by P2PKH/P2WPKH."
-  (ironclad:digest-sequence :ripemd-160 (sha256 bytes)))
+  (natrium:ripemd160 (sha256 bytes)))
 
 (defun bytes->hex (b)
-  (string-downcase (ironclad:byte-array-to-hex-string b)))
+  "Lower-case hex of the byte sequence B."
+  (let ((out (make-string (* 2 (length b)))) (digits "0123456789abcdef"))
+    (dotimes (i (length b) out)
+      (let ((x (elt b i)))
+        (setf (char out (* 2 i)) (char digits (ash x -4))
+              (char out (1+ (* 2 i))) (char digits (logand x 15)))))))
 
 (defun hex->bytes (s)
-  (ironclad:hex-string-to-byte-array s))
+  "The byte vector a hex string spells.  Signals on odd length or a non-hex digit."
+  (let ((n (length s)))
+    (when (oddp n) (error "hex->bytes: odd-length hex string ~s" s))
+    (let ((out (make-array (floor n 2) :element-type '(unsigned-byte 8))))
+      (dotimes (i (length out) out)
+        (setf (aref out i) (parse-integer s :start (* 2 i) :end (+ 2 (* 2 i)) :radix 16))))))
+
+(defun ascii->bytes (s)
+  "The ASCII string S as a byte vector."
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code s))
 
 (defun rev (b)
   "Return a reversed copy of byte vector B (display-endianness flip)."
@@ -273,7 +287,7 @@
 
 (defun w-varstr (w s)
   "var_str: CompactSize length + UTF-8 bytes."
-  (let ((bytes (ironclad:ascii-string-to-byte-array s)))
+  (let ((bytes (ascii->bytes s)))
     (w-varint w (length bytes))
     (w-bytes w bytes))
   w)
@@ -388,7 +402,7 @@
         (w (make-writer)))
     (w-u32 w (net-magic *network*))
     ;; command: 12 bytes, ascii, null padded
-    (let ((cb (ironclad:ascii-string-to-byte-array command)))
+    (let ((cb (ascii->bytes command)))
       (dotimes (i 12)
         (w-u8 w (if (< i (length cb)) (aref cb i) 0))))
     (w-u32 w (length payload))

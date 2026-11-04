@@ -18,6 +18,6 @@ jobs:
           sbcl --non-interactive --load /tmp/ql.lisp \
             --eval '(quicklisp-quickstart:install)' \
             --eval '(ql-util:without-prompting (ql:add-to-init-file))' \
-            --eval '(ql:quickload (list :ironclad :usocket :bordeaux-threads :hunchentoot))'
-      - name: Offline gate suite (13 gates)
+            --eval '(ql:quickload (list :usocket :bordeaux-threads :hunchentoot))'
+      - name: Offline gate suite (15 gates)
         run: inspect/run-all.sh

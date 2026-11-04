@@ -90,7 +90,7 @@
         ((and (> (length tok) 2) (string= (subseq tok 0 2) "0x"))
          (w:w-bytes wr (w:hex->bytes (subseq tok 2))))
         ((and (>= (length tok) 2) (char= (char tok 0) #\') (char= (char tok (1- (length tok))) #\'))
-         (emit-push wr (ironclad:ascii-string-to-byte-array (subseq tok 1 (1- (length tok))))))
+         (emit-push wr (w:ascii->bytes (subseq tok 1 (1- (length tok))))))
         (t (let ((b (gethash (let ((u (string-upcase tok)))
                                (if (and (> (length u) 3) (string= (subseq u 0 3) "OP_"))
                                    (subseq u 3) u))

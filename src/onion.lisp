@@ -53,8 +53,7 @@
 ;;; --- v3 onion encode / decode / validate ------------------------------------
 
 (defun %v3-checksum (pubkey)
-  (subseq (ironclad:digest-sequence
-           :sha3/256
+  (subseq (natrium:sha3-256
            (concatenate '(simple-array (unsigned-byte 8) (*))
                         (map '(simple-array (unsigned-byte 8) (*)) #'char-code ".onion checksum")
                         pubkey #(3)))

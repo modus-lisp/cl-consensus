@@ -93,10 +93,10 @@
 
 (defun round-function (i passphrase e salt r)
   "F(i,R) = PBKDF2(HMAC-SHA256, i||passphrase, salt||R, (10000<<e)/4, dkLen=|R|)."
-  (let ((kdf (ic:make-kdf :pbkdf2 :digest :sha256))
-        (pass (concatenate 'u8vec (vector i) (string->bytes passphrase)))
-        (iters (ash (floor +base-iterations+ +round-count+) e)))   ; = 2500 << e
-    (ic:derive-key kdf pass (concatenate 'u8vec salt (as-u8vec r)) iters (length r))))
+  (let ((pass (concatenate 'u8vec (vector i) (string->bytes passphrase)))
+        (iters (ash (floor +base-iterations+ +round-count+) e))   ; = 2500 << e
+        (out (u8vec (length r))))
+    (natrium:pbkdf2-into :sha256 pass (concatenate 'u8vec salt (as-u8vec r)) iters out)))
 
 (defun encrypt-ms (master passphrase e id ext)
   (let* ((master (as-u8vec master)) (half (ash (length master) -1))

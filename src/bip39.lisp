@@ -9,8 +9,7 @@
 (defpackage #:cl-consensus.bip39
   (:use #:cl)
   (:nicknames #:btc-bip39)
-  (:local-nicknames (#:w #:cl-consensus.wire) (#:wal #:cl-consensus.wallet)
-                    (#:ic #:ironclad))
+  (:local-nicknames (#:w #:cl-consensus.wire) (#:wal #:cl-consensus.wallet))
   (:export
    #:*wordlist* #:mnemonic-from-entropy #:mnemonic->entropy #:mnemonic->seed
    #:validate-mnemonic #:make-wallet-from-mnemonic
@@ -148,14 +147,14 @@
 ;;; a non-cryptographic generator (typically a Mersenne-Twister-class algorithm)
 ;;; whose output is predictable from observed values — catastrophic for seed
 ;;; material that guards real funds.  We draw from the OS CSPRNG (/dev/urandom)
-;;; and fall back to ironclad's Fortuna PRNG (itself OS-seeded) only if the
+;;; and fall back to natrium's HMAC-DRBG (itself OS-seeded) only if the
 ;;; device is unavailable (e.g. a non-Unix host).
 
 (defun generate-entropy (bits)
   "Fresh cryptographically-strong entropy: a (BITS/8)-byte vector drawn from the
    OS CSPRNG.  BITS must be one of 128/160/192/224/256 (the BIP39 strengths).
-   Reads /dev/urandom; on hosts without it, falls back to ironclad's Fortuna
-   PRNG (which is itself seeded from OS randomness)."
+   Reads /dev/urandom; on hosts without it, falls back to natrium's HMAC-DRBG
+   (which is itself seeded from OS randomness)."
   (unless (member bits '(128 160 192 224 256))
     (error "BIP39 entropy strength must be 128/160/192/224/256 bits, got ~d" bits))
   (let* ((nbytes (/ bits 8))
@@ -166,8 +165,8 @@
             (when f
               (let ((n (read-sequence buf f)))
                 (when (= n nbytes) buf)))))
-        ;; Fallback: ironclad's strong PRNG (Fortuna), OS-seeded at make time.
-        (ic:random-data nbytes (ic:make-prng :fortuna)))))
+        ;; Fallback: natrium's HMAC-DRBG, OS-seeded.
+        (natrium:random-bytes nbytes))))
 
 (defun generate-mnemonic (&optional (bits 128))
   "A brand-new random BIP39 mnemonic of strength BITS (default 128 -> 12 words;

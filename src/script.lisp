@@ -755,8 +755,8 @@
         ((= op +op-max+) (let ((b (popi)) (a (popi))) (psh (num->bytes (max a b)))))
         ((= op +op-within+) (let ((mx (popi)) (mn (popi)) (x (popi))) (psh (bool->bytes (and (<= mn x) (< x mx))))))
         ;; crypto hashes
-        ((= op +op-ripemd160+) (req 1) (psh (ironclad:digest-sequence :ripemd-160 (pop!))))
-        ((= op +op-sha1+) (req 1) (psh (ironclad:digest-sequence :sha1 (pop!))))
+        ((= op +op-ripemd160+) (req 1) (psh (natrium:ripemd160 (coerce (pop!) '(simple-array (unsigned-byte 8) (*))))))
+        ((= op +op-sha1+) (req 1) (psh (natrium:sha1 (coerce (pop!) '(simple-array (unsigned-byte 8) (*))))))
         ((= op +op-sha256+) (req 1) (psh (w:sha256 (pop!))))
         ((= op +op-hash160+) (req 1) (psh (w:hash160 (pop!))))
         ((= op +op-hash256+) (req 1) (psh (w:hash256 (pop!))))

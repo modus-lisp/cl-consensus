@@ -303,7 +303,7 @@ signers take.  Test harness only: these keys are public by construction."
 
 (defun spend-tx-for (spk amount)
   (tx:make-tx :version 2 :locktime 0 :segwit-p t
-    :inputs (list (tx:make-txin :prev-hash (w:hash256 (ironclad:ascii-string-to-byte-array "tp"))
+    :inputs (list (tx:make-txin :prev-hash (w:hash256 (w:ascii->bytes "tp"))
                    :prev-index 0 :script (bvec) :sequence #xffffffff))
     :outputs (list (tx:make-txout :value (max 0 (- amount 1000)) :script (bvec #x6a)))))
 
